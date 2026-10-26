@@ -1,0 +1,78 @@
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch,AsyncMock
+
+import bridge
+
+class DeploymentTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.directory=Path(self.temp.name).resolve()
+        self.environment=patch.dict(os.environ,{'POCKET_STATE_DIR':str(self.directory/'state'),'POCKET_WORKSPACE':str(self.directory/'workspace'),'POCKET_PUBLIC_HOST':'pocket.example.com','POCKET_PUBLIC_PORT':'443'},clear=False)
+        self.environment.start()
+        self.p=bridge.Pocket(SimpleNamespace())
+        self.p.rpc=SimpleNamespace(process=SimpleNamespace(returncode=None),call=AsyncMock(),send=AsyncMock())
+
+    def tearDown(self):
+        self.environment.stop()
+        self.temp.cleanup()
+
+    def test_state_is_outside_source_and_keys_survive_restart(self):
+        self.assertEqual(self.p.runtime,self.directory/'state')
+        second=bridge.Pocket(SimpleNamespace())
+        self.assertEqual(self.p.config['device_token'],second.config['device_token'])
+        self.assertEqual(self.p.config['cwd'],str(self.directory/'workspace'))
+
+    async def test_public_health_is_minimal_and_tracks_server_exit(self):
+        from aiohttp.test_utils import TestClient,TestServer
+        async with TestClient(TestServer(self.p.app())) as client:
+            r=await client.get('/healthz')
+            self.assertEqual(r.status,200)
+            self.assertEqual(set((await r.json()).keys()),{'ok','deviceConnected'})
+            self.p.rpc.process.returncode=1
+            r=await client.get('/healthz')
+            self.assertEqual(r.status,503)
+
+    async def test_server_export_uses_public_domain_and_private_auth(self):
+        from aiohttp.test_utils import TestClient,TestServer
+        async with TestClient(TestServer(self.p.app())) as client:
+            r=await client.get('/api/connection',headers={'Authorization':'Bearer '+self.p.config['console_token']})
+            self.assertEqual(r.status,200)
+            config=await r.json()
+            self.assertEqual(config['host'],'pocket.example.com')
+            self.assertEqual(config['path'],'/device')
+            self.assertTrue(config['tls'])
+            self.assertEqual(config['token'],self.p.config['device_token'])
+            r=await client.get('/api/connection',headers={'Authorization':'Bearer '+self.p.config['console_token'],'Host':'public.example.com'})
+            self.assertEqual(r.status,403)
+
+    async def test_websocket_protocol_auth(self):
+        from aiohttp.test_utils import TestClient,TestServer
+        from aiohttp import WSMsgType
+        async with TestClient(TestServer(self.p.app())) as client:
+            ws=await client.ws_connect('/device',protocols=('arduino',))
+            await ws.send_json({'type':'hello','token':'wrong'})
+            msg=await ws.receive(timeout=2)
+            self.assertEqual(msg.type,WSMsgType.CLOSE)
+            self.assertEqual(msg.data,1008)
+            ws=await client.ws_connect('/device',protocols=('arduino',))
+            await ws.send_json({'type':'hello','token':self.p.config['device_token'],'wifiConnected':True})
+            # API state after the hello must report the authenticated Wi-Fi client.
+            import asyncio
+            await asyncio.sleep(0.05)
+            self.assertEqual(self.p.device['source'],'wifi')
+            self.assertTrue(self.p.device['wifiConnected'])
+            await ws.close()
+
+    def test_font_override_is_explicit(self):
+        test_font=self.directory/'font.ttc';test_font.touch()
+        with patch.dict(os.environ,{'POCKET_FONT':str(test_font)}):
+            self.assertEqual(bridge.font_path(),test_font)
+        with patch.dict(os.environ,{'POCKET_FONT':str(self.directory/'missing.ttc')}):
+            with self.assertRaises(RuntimeError):bridge.font_path()
+
+if __name__=='__main__':unittest.main()

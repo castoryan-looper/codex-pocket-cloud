@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ ${EUID} -ne 0 ]]; then echo 'Run with sudo.' >&2; exit 1; fi
+set -a
+source /etc/codex-pocket/pocket.env
+set +a
+cd /var/lib/codex-pocket/workspace
+PYTHON=/opt/codex-pocket/venv/bin/python
+APP=/opt/codex-pocket/app
+case "${1:-help}" in
+  login)
+    systemctl stop codex-pocket.service || true
+    runuser -u codex-pocket -- env HOME="$HOME" CODEX_HOME="$CODEX_HOME" PATH="$PATH" "$CODEX_BINARY" login --device-auth
+    systemctl restart codex-pocket.service
+    ;;
+  status) systemctl --no-pager status codex-pocket.service codex-pocket-tls.service ;;
+  logs) journalctl -u codex-pocket.service -u codex-pocket-tls.service -f ;;
+  restart) systemctl restart codex-pocket.service codex-pocket-tls.service ;;
+  console)
+    cat "$POCKET_STATE_DIR/console-url.txt"
+    echo
+    echo 'Open through SSH forwarding: ssh -L 8787:127.0.0.1:8787 USER@SERVER'
+    ;;
+  export)
+    destination="${2:-/var/lib/codex-pocket/connection.json}"
+    "$PYTHON" "$APP/deploy/export_connection.py" "$destination"
+    ;;
+  health) curl --fail --show-error --silent "https://${POCKET_PUBLIC_HOST}/healthz"; echo ;;
+  *) echo 'Usage: sudo pocketctl {login|status|logs|restart|console|export [FILE]|health}' ;;
+esac
