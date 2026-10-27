@@ -92,6 +92,10 @@ install -d -o codex-pocket-tls -g codex-pocket-tls -m 700 /var/lib/codex-pocket-
 TEMP=$(mktemp -d)
 trap 'rm -rf -- "$TEMP"' EXIT
 echo '[2/7] Installing checksum-verified Node.js 22 LTS and Codex'
+INSTALLED_NODE=$("$ROOT/tools/node/bin/node" --version 2>/dev/null || true)
+if [[ $INSTALLED_NODE =~ ^v22\. ]]; then
+  echo "Reusing installed Node.js $INSTALLED_NODE"
+else
 curl -fL --retry 3 https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt -o "$TEMP/node-checksums.txt"
 NODE_ARCHIVE=$(awk -v pattern="-linux-${NODE_ARCH}.tar.xz" 'index($2,pattern) && substr($2,length($2)-length(pattern)+1)==pattern {print $2;exit}' "$TEMP/node-checksums.txt")
 [[ $NODE_ARCHIVE =~ ^node-v22\.[0-9]+\.[0-9]+-linux-(x64|arm64)\.tar\.xz$ ]] || die 'Could not resolve official Node.js archive.'
@@ -100,10 +104,20 @@ curl -fL --retry 3 "https://nodejs.org/dist/latest-v22.x/$NODE_ARCHIVE" -o "$TEM
 NODE_DIRECTORY=${NODE_ARCHIVE%.tar.xz}
 tar -xJf "$TEMP/$NODE_ARCHIVE" -C "$ROOT/tools"
 ln -sfn "$ROOT/tools/$NODE_DIRECTORY" "$ROOT/tools/node"
+fi
 export PATH="$ROOT/tools/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-npm install --prefix "$ROOT/tools/codex" "@openai/codex@$CODEX_VERSION" --omit=dev --no-audit --no-fund
+INSTALLED_CODEX=$("$ROOT/tools/codex/node_modules/.bin/codex" --version 2>/dev/null || true)
+if [[ $INSTALLED_CODEX == "codex-cli $CODEX_VERSION" ]]; then
+  echo "Reusing installed Codex $CODEX_VERSION"
+else
+  npm install --prefix "$ROOT/tools/codex" "@openai/codex@$CODEX_VERSION" --omit=dev --no-audit --no-fund
+fi
 chmod -R a+rX "$ROOT/tools"
 echo '[3/7] Installing checksum-verified Caddy in a dedicated service'
+INSTALLED_CADDY=$("$ROOT/tools/caddy/caddy" version 2>/dev/null | awk '{sub(/^v/, "", $1); print $1}' || true)
+if [[ $INSTALLED_CADDY =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && ( -z $CADDY_VERSION || $CADDY_VERSION == "$INSTALLED_CADDY" ) ]]; then
+  echo "Reusing installed Caddy $INSTALLED_CADDY"
+else
 if [[ -z $CADDY_VERSION ]]; then
   curl -fL --retry 3 https://api.github.com/repos/caddyserver/caddy/releases/latest -o "$TEMP/caddy-release.json"
   CADDY_VERSION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"].removeprefix("v"))' "$TEMP/caddy-release.json")
@@ -123,6 +137,8 @@ esac
 install -d -m 755 "$ROOT/tools/caddy"
 tar -xzf "$TEMP/$CADDY_ARCHIVE" -C "$TEMP" caddy
 install -m 755 "$TEMP/caddy" "$ROOT/tools/caddy/caddy"
+fi
+
 echo '[4/7] Preparing application release and Python environment'
 RELEASE="$ROOT/releases/$(date -u +%Y%m%dT%H%M%S)-$$"
 install -d -m 755 "$RELEASE"
@@ -134,7 +150,11 @@ find "$RELEASE" -type d -exec chmod 755 {} +
 find "$RELEASE" -type f -exec chmod 644 {} +
 chmod 755 "$RELEASE/deploy/pocketctl" "$RELEASE/deploy/install.sh"
 python3 -m venv "$ROOT/venv"
-"$ROOT/venv/bin/pip" install -r "$RELEASE/bridge/requirements.txt"
+# Ignore machine-wide mirror settings for this process only; keep TLS/hash verification enabled.
+PIP_INDEX=${POCKET_PIP_INDEX_URL:-https://pypi.org/simple}
+[[ $PIP_INDEX == https://* ]] || die 'POCKET_PIP_INDEX_URL must use HTTPS.'
+env -u PIP_EXTRA_INDEX_URL -u PIP_FIND_LINKS -u PIP_NO_INDEX -u PIP_TRUSTED_HOST PIP_CONFIG_FILE=/dev/null \
+  "$ROOT/venv/bin/pip" install --index-url "$PIP_INDEX" --prefer-binary --timeout 60 --retries 5 -r "$RELEASE/bridge/requirements.txt"
 "$ROOT/venv/bin/python" -m py_compile "$RELEASE/bridge/bridge.py"
 chmod -R a+rX "$ROOT/venv" "$RELEASE"
 MODEL_DIR="$STATE/models/whisper-$MODEL"

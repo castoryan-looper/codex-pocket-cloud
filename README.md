@@ -179,3 +179,11 @@ bash -n deploy/pocketctl
 
 保留第三方源码的各自许可证，见 THIRD_PARTY.md。Waveshare 上游没有顶层许可证，公开分发前应核实相关授权；个人部署不应公开任何运行凭据。
 
+## 下载缓慢或 PyPI 镜像哈希错误
+
+Python 依赖默认显式使用官方 `https://pypi.org/simple`，仅对安装进程忽略系统预配置的镜像，不修改系统 pip 配置或关闭 TLS/哈希校验。内网镜像出现哈希不一致时，更新仓库并重跑即可改用官方源；具体提速效果取决于服务器网络。重跑会复用已安装的 Node.js 22、相同版本 Codex CLI、已有稳定版 Caddy，避免反复下载。可显式设置 CADDY_VERSION 选择新版本。
+
+若官方源仍慢，可以指定经过确认的 HTTPS PyPI 源：`sudo env POCKET_PIP_INDEX_URL=https://YOUR_TRUSTED_INDEX/simple bash deploy/install.sh ...`。该变量不包含账号凭据时才适合直接写入命令。不要用关闭哈希或证书校验的方法跳过失败。
+
+语音模型尚未下载时，`--model base` 可减少模型下载量和内存占用，但通常会降低中文识别准确度；默认仍为 small。
+
