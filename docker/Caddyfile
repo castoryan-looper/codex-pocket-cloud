@@ -1,0 +1,15 @@
+{
+  admin off
+  persist_config off
+  skip_install_trust
+  auto_https disable_redirects
+  default_sni {$POCKET_PUBLIC_HOST}
+}
+https://{$POCKET_PUBLIC_HOST}:8443 {
+  tls internal
+  @device path /device
+  reverse_proxy @device 127.0.0.1:8787
+  @health path /healthz
+  reverse_proxy @health 127.0.0.1:8787
+  respond 404
+}

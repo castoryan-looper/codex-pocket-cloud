@@ -348,7 +348,11 @@ class Pocket:
         if self.turn:
             raise ValueError('当前任务正在执行；请先停止或等待完成')
         self.changed('正在提交', text)
-        result = await self.rpc.call('turn/start', {'threadId': self.thread, 'input': [{'type': 'text', 'text': text}]})
+        params = {'threadId': self.thread, 'input': [{'type': 'text', 'text': text}]}
+        if os.environ.get('POCKET_EXTERNAL_SANDBOX') == 'docker':
+            # Docker supplies the outer boundary; do not require nested Linux namespaces.
+            params['sandboxPolicy'] = {'type': 'externalSandbox', 'networkAccess': 'enabled'}
+        result = await self.rpc.call('turn/start', params)
         if result['turn']['status'] == 'inProgress' and self.status == '正在提交':
             self.turn = result['turn']['id']
             self.changed('工作中', '任务已提交')

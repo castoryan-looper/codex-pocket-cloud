@@ -1,0 +1,41 @@
+name: Docker build and smoke checks
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - compose.yaml
+      - .dockerignore
+      - docker/**
+      - bridge/**
+      - deploy/docker.sh
+      - .github/workflows/docker-check.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose and shell scripts
+        env:
+          PUBLIC_HOST: 43.160.215.253
+        run: |
+          docker compose config --quiet
+          bash -n deploy/docker.sh
+          sh -n docker/gateway-entrypoint.sh
+          sh -n docker/caddy-entrypoint.sh
+      - name: Build gateway
+        run: docker build --target gateway -t pocket-gateway:check .
+      - name: Check non-root runtime dependencies
+        run: |
+          docker run --rm --entrypoint gosu pocket-gateway:check pocket:pocket sh -c 'id && node --version && npm --version && codex --version && python -c "import aiohttp, PIL, faster_whisper"'
+      - name: Run tests inside Linux image
+        run: |
+          docker run --rm --entrypoint env pocket-gateway:check -u POCKET_STATE_DIR -u POCKET_WORKSPACE -u POCKET_EXTERNAL_SANDBOX python -m unittest discover -s /app/bridge -p 'test_*.py' -v
+      - name: Build and validate ingress
+        run: |
+          docker build --target ingress -t pocket-ingress:check .
+          docker run --rm -e POCKET_PUBLIC_HOST=43.160.215.253 --entrypoint caddy pocket-ingress:check validate --config /etc/caddy/Caddyfile --adapter caddyfile

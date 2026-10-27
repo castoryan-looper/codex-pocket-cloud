@@ -28,4 +28,3 @@ case "${1:-help}" in
   health) curl --fail --show-error --silent --cacert "$POCKET_CA_FILE" "https://${POCKET_PUBLIC_HOST}:${POCKET_PUBLIC_PORT:-443}/healthz"; echo ;;
   *) echo 'Usage: sudo pocketctl {login|status|logs|restart|console|export [FILE]|health}' ;;
 esac
-

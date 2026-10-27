@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -50,6 +51,16 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.p.submit('new task')
         self.p.rpc.call.assert_not_awaited()
+
+    async def test_docker_uses_external_sandbox_only_when_configured(self):
+        self.p.rpc.call.return_value = {'turn': {'id': 'test-turn', 'status': 'completed'}}
+        with patch.dict(os.environ, {'POCKET_EXTERNAL_SANDBOX': 'docker'}):
+            await self.p.submit('task inside the container')
+        params = self.p.rpc.call.await_args.args[1]
+        self.assertEqual(params['sandboxPolicy'], {'type': 'externalSandbox', 'networkAccess': 'enabled'})
+        with patch.dict(os.environ, {'POCKET_EXTERNAL_SANDBOX': ''}):
+            await self.p.submit('task with native sandbox defaults')
+        self.assertNotIn('sandboxPolicy', self.p.rpc.call.await_args.args[1])
 
     async def test_stop_uses_actual_turn(self):
         self.p.turn='active-turn'

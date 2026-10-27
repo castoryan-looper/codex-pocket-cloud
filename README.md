@@ -13,6 +13,16 @@ ESP32（按键 / 麦克风 / 墨水屏）
 
 ## 一键部署
 
+推荐使用 **[Docker 部署](DOCKER.md)**，宿主机只需 Docker Engine + Compose v2，隔离 Node/Python/Caddy 依赖，保留现有 80/443 网站：
+
+```bash
+git pull
+bash deploy/docker.sh up --ip 43.160.215.253 --https-port 8448
+bash deploy/docker.sh export ./connection-private.json
+```
+
+以下为保留的原生 systemd 安装方式。
+
 支持 Ubuntu 22.04 / 24.04、Debian 12 / 13，x86_64 或 arm64。建议至少 2 核 4GB 内存、8GB 可用磁盘；小内存可选 `--model base`。Whisper small 模型约 484MB，需要服务器可访问 npm、GitHub、Hugging Face、OpenAI 和证书签发服务。
 
 先将一个域名的 A 记录指向服务器公网 IP，并在腾讯云安全组与现有主机防火墙放行 **TCP 80、443**。保留现有 SSH 端口；脚本不会修改 SSH 或防火墙规则。
@@ -186,4 +196,3 @@ Python 依赖默认显式使用官方 `https://pypi.org/simple`，仅对安装�
 若官方源仍慢，可以指定经过确认的 HTTPS PyPI 源：`sudo env POCKET_PIP_INDEX_URL=https://YOUR_TRUSTED_INDEX/simple bash deploy/install.sh ...`。该变量不包含账号凭据时才适合直接写入命令。不要用关闭哈希或证书校验的方法跳过失败。
 
 语音模型尚未下载时，`--model base` 可减少模型下载量和内存占用，但通常会降低中文识别准确度；默认仍为 small。
-

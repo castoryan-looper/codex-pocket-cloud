@@ -8,6 +8,9 @@ build/
 backup/
 *.log
 .env
+.env.docker
+connection-private.json
+*.tmp.*
 *.pem.key
 *.key
 auth.json

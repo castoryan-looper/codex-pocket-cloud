@@ -271,4 +271,3 @@ else
 fi
 echo 'Export connection configuration: sudo pocketctl export /path/to/connection.json'
 echo 'Existing export files are not overwritten; keep exported device keys private.'
-

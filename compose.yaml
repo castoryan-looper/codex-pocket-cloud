@@ -1,0 +1,59 @@
+name: codex-pocket
+services:
+  gateway:
+    build:
+      context: .
+      target: gateway
+    init: true
+    restart: unless-stopped
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    tmpfs: [/tmp:mode=1777,size=256m]
+    environment:
+      POCKET_PUBLIC_HOST: ${PUBLIC_HOST:?Run bash deploy/docker.sh up --ip YOUR_IP first}
+      POCKET_PUBLIC_PORT: ${HTTPS_PORT:-8448}
+      POCKET_MODEL_DIR: /models/whisper-${SPEECH_MODEL:-small}
+      POCKET_SPEECH_MODEL: ${SPEECH_MODEL:-small}
+      POCKET_CONSOLE_PORT: ${CONSOLE_PORT:-8787}
+    ports:
+      - "${HTTPS_PORT:-8448}:8443"
+      - "127.0.0.1:${CONSOLE_PORT:-8787}:8789"
+    volumes:
+      - gateway_state:/state
+      - workspace:/workspace
+      - models:/models
+      - public_ca:/trust:ro
+    healthcheck:
+      test: [CMD, python, /app/docker/runtime.py, local-health]
+      interval: 15s
+      timeout: 5s
+      start_period: 40s
+      retries: 5
+  ingress:
+    build:
+      context: .
+      target: ingress
+    network_mode: service:gateway
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    tmpfs: [/tmp:mode=1777,size=32m]
+    environment:
+      POCKET_PUBLIC_HOST: ${PUBLIC_HOST:?PUBLIC_HOST is required}
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+      - public_ca:/trust
+volumes:
+  gateway_state:
+  workspace:
+  models:
+  public_ca:
+  caddy_data:
+  caddy_config:

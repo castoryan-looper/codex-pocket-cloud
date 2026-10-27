@@ -18,3 +18,4 @@
 
 2026-10-27：下载恢复改动通过 Bash 语法及 21 项软件测试。用已安装版本的模拟命令运行实际安装脚本第 2/3 步，确认复用 Node/Codex/Caddy，未调用 curl 或 npm。官方 PyPI 在腾讯云的实际速度需现场验证。
 
+2026-10-27 Docker 版：本地 24 项软件测试通过，3 个入口脚本通过 Bash 语法检查。官方 Docker Compose 2.39.4 CLI（SHA-256 已校验）成功解析 compose.yaml，确认仅发布设备 8448 与回环管理端口、未挂载宿主机目录或 Docker socket，网关只读挂载公开 CA。Codex 0.163.0 生成的协议 schema 包含 externalSandbox 策略。本机无 Docker 引擎，不能声称本地镜像构建/容器联调已通过；新增 GitHub Actions 工作流构建镜像、检查非 root 依赖并在 Linux 镜像运行测试。真实账号登录、模型下载、任务执行和 ESP32 联调仍需服务器验证。
