@@ -22,3 +22,5 @@
 
 2026-10-27：修复 Compose tmpfs 流式列表中未引用逗号导致 size=256m 被解析为额外挂载项的问题。实际 Compose CLI 输出确认 gateway/ingress 各只有一个 /tmp 挂载。CI 增加真实 compose run 挂载与非 root /tmp 写入检查；尚未本地运行 Docker 引擎。
 
+2026-10-27：修复私有卷 chown 后受限 root 缺少 FOWNER 而无法 chmod 的初始化错误，改由卷所有者 UID 10001 执行 chmod，不增加容器 capability。24 项本地软件测试和入口脚本语法检查通过。CI 新增真实入口 self-test，连续两次验证已有命名卷初始化、700 权限与非 root 写入。
+

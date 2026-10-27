@@ -92,6 +92,19 @@ def main(command):
     if command == 'serve':
         return serve()
     initialize()
+    if command == 'self-test':
+        import stat
+        import tempfile
+        if os.geteuid() != 10001:
+            raise RuntimeError('Gateway must run as UID 10001')
+        for directory in ('/state', '/workspace', '/models'):
+            if stat.S_IMODE(Path(directory).stat().st_mode) != 0o700:
+                raise RuntimeError('Private volume permissions are incorrect: ' + directory)
+            with tempfile.TemporaryFile(dir=directory) as probe:
+                probe.write(b'volume-write-check')
+        subprocess.check_call(['codex', '--version'])
+        print('Container initialization and non-root private-volume writes passed.')
+        return 0
     if command in ('login', 'login-status'):
         args = ['--device-auth'] if command == 'login' else ['status']
         os.execvp('codex', ['codex', 'login', *args])
@@ -106,3 +119,4 @@ def main(command):
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else 'serve'))
+

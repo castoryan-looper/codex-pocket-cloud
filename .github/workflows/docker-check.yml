@@ -36,6 +36,12 @@ jobs:
           PUBLIC_HOST: 43.160.215.253
         run: |
           docker compose run --rm --no-deps --entrypoint gosu gateway pocket:pocket sh -c 'id && echo mount-ok > /tmp/pocket-mount-check && cat /tmp/pocket-mount-check'
+      - name: Check real entrypoint and repeat initialization on existing volumes
+        env:
+          PUBLIC_HOST: 43.160.215.253
+        run: |
+          docker compose run --rm --no-deps gateway self-test
+          docker compose run --rm --no-deps gateway self-test
       - name: Check non-root runtime dependencies
         run: |
           docker run --rm --entrypoint gosu pocket-gateway:check pocket:pocket sh -c 'id && node --version && npm --version && codex --version && python -c "import aiohttp, PIL, faster_whisper"'
