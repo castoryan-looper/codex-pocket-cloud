@@ -4,6 +4,16 @@
 
 ## 首次部署
 
+Ubuntu 24.04 如果出现 `docker: unknown command: docker compose`，说明缺少 Compose 插件。保留已有 Docker Engine，仅安装 Ubuntu 仓库中的插件：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker-compose-v2
+docker compose version
+```
+
+若使用的是 Docker 官方 APT 仓库，对应包名为 `docker-compose-plugin`。脚本也支持独立的 `docker-compose` v2+，但不支持旧 Python 版 v1。Compose 是宿主机必需的 Docker 管理工具；Node/Python/Caddy 仍只装在镜像内。
+
 ```bash
 git pull
 bash deploy/docker.sh up --ip 43.160.215.253 --https-port 8448
@@ -68,3 +78,4 @@ bash deploy/docker.sh up          # 复用 .env.docker 中的地址、端口、�
 Docker 版通过官方 `externalSandbox` 策略使用容器作为执行边界，避免依赖容器内嵌套 Linux 沙箱；任务可以使用容器网络、访问挂载给该容器的账号和工作数据。保留 `on-request` 审批处理，收到的审批不会自动同意。原生版本仍默认 `workspace-write`。参考 [Codex App Server](https://developers.openai.com/codex/app-server)。
 
 验证范围见 TESTING.md。构建镜像不等于已完成 Codex 账号授权、真实任务执行和 ESP32 联调。
+

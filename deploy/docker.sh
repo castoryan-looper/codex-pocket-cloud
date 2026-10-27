@@ -11,9 +11,26 @@ command=${1:-help}
 [[ $# == 0 ]] || shift
 if [[ $command == help || $command == --help || $command == -h ]]; then usage; exit 0; fi
 command -v docker >/dev/null || { echo 'Docker Engine and Docker Compose v2 must already be installed.' >&2; exit 1; }
-docker compose version >/dev/null
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  compose_version=$(docker-compose version --short 2>/dev/null || true)
+  compose_version=${compose_version#v}
+  compose_major=${compose_version%%.*}
+  if [[ $compose_major =~ ^[0-9]+$ ]] && (( compose_major >= 2 )); then
+    COMPOSE=(docker-compose)
+  else
+    echo 'Legacy docker-compose v1 is unsupported. On Ubuntu 24.04: sudo apt-get update && sudo apt-get install docker-compose-v2' >&2
+    exit 1
+  fi
+else
+  echo 'Docker is present but Compose is missing.' >&2
+  echo 'On Ubuntu 24.04: sudo apt-get update && sudo apt-get install -y docker-compose-v2' >&2
+  echo 'For Docker official APT repositories, the package is docker-compose-plugin.' >&2
+  exit 1
+fi
 docker info >/dev/null
-compose() { docker compose --project-directory "$REPO" --env-file "$ENV_FILE" -f "$REPO/compose.yaml" "$@"; }
+compose() { "${COMPOSE[@]}" --project-directory "$REPO" --env-file "$ENV_FILE" -f "$REPO/compose.yaml" "$@"; }
 if [[ $command == up ]]; then
   PUBLIC_HOST=''
   HTTPS_PORT=8448
@@ -91,3 +108,4 @@ case "$command" in
     ;;
   *) usage; exit 1 ;;
 esac
+
