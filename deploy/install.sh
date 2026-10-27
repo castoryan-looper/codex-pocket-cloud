@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 umask 077
 DOMAIN=''
+HTTPS_PORT=443
 MODEL=small
 CODEX_VERSION=${CODEX_VERSION:-0.163.0}
 CADDY_VERSION=${CADDY_VERSION:-}
@@ -11,10 +12,11 @@ STATE=/var/lib/codex-pocket
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd /
 die() { echo "ERROR: $*" >&2; exit 1; }
-usage() { echo 'Usage: sudo bash deploy/install.sh --domain pocket.example.com [--model small|base]'; }
+usage() { echo 'Usage: sudo bash deploy/install.sh --domain pocket.example.com [--model small|base] [--https-port 8443]'; }
 while (($#)); do
   case "$1" in
     --domain) [[ $# -ge 2 ]] || die 'Missing domain'; DOMAIN=$2; shift 2 ;;
+    --https-port) [[ $# -ge 2 ]] || die 'Missing HTTPS port'; HTTPS_PORT=$2; shift 2 ;;
     --model) [[ $# -ge 2 ]] || die 'Missing model'; MODEL=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "Unknown argument: $1" ;;
@@ -24,6 +26,9 @@ done
 [[ $DOMAIN =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,63}$ ]] || die 'Provide a DNS hostname (not a raw IP). Point its A record at this server first.'
 [[ $MODEL == small || $MODEL == base ]] || die 'Model must be small or base.'
 [[ $CODEX_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid CODEX_VERSION.'
+[[ $HTTPS_PORT =~ ^[0-9]{1,5}$ ]] || die 'HTTPS port must be an integer.'
+HTTPS_PORT=$((10#$HTTPS_PORT))
+(( HTTPS_PORT >= 1 && HTTPS_PORT <= 65535 && HTTPS_PORT != 80 && HTTPS_PORT != 8787 )) || die 'HTTPS port must be 1-65535, excluding 80 and 8787.'
 source /etc/os-release
 case "${ID:-}:${VERSION_ID:-}" in
   ubuntu:22.04|ubuntu:24.04|debian:12|debian:13) ;;
@@ -31,8 +36,8 @@ case "${ID:-}:${VERSION_ID:-}" in
 esac
 command -v systemctl >/dev/null || die 'systemd is required.'
 if [[ ! -f /etc/codex-pocket/managed ]]; then
-  if command -v ss >/dev/null && ss -H -ltn | awk '{print $4}' | grep -Eq ':(80|443|8787)$'; then
-    die 'Port 80, 443 or 8787 is occupied. Existing sites will not be overwritten.'
+  if command -v ss >/dev/null && ss -H -ltn | awk '{print $4}' | grep -Eq ":(80|${HTTPS_PORT}|8787)$"; then
+    die "Port 80, $HTTPS_PORT or 8787 is occupied. Existing sites will not be overwritten."
   fi
 fi
 case "$(uname -m)" in x86_64) NODE_ARCH=x64; CADDY_ARCH=amd64 ;; aarch64|arm64) NODE_ARCH=arm64; CADDY_ARCH=arm64 ;; *) die 'Supported CPU: x86_64 or arm64.' ;; esac
@@ -112,7 +117,7 @@ POCKET_MODEL_DIR=$MODEL_DIR
 POCKET_FONT=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
 POCKET_ASR_THREADS=4
 POCKET_PUBLIC_HOST=$DOMAIN
-POCKET_PUBLIC_PORT=443
+POCKET_PUBLIC_PORT=$HTTPS_PORT
 POCKET_CA_FILE=$ROOT/app/certificates/isrgrootx1.pem
 HF_HOME=$STATE/huggingface
 TOKENIZERS_PARALLELISM=false
@@ -123,10 +128,11 @@ cat > /etc/codex-pocket/Caddyfile <<CADDY
   admin off
   persist_config off
 }
-$DOMAIN {
+$DOMAIN:$HTTPS_PORT {
   tls {
     issuer acme {
       dir https://acme-v02.api.letsencrypt.org/directory
+      disable_tlsalpn_challenge
     }
   }
   @device path /device
@@ -170,11 +176,11 @@ for attempt in $(seq 1 30); do
   sleep 2
 done
 [[ $READY == true ]] || die 'Gateway did not become ready. Run: sudo pocketctl logs'
-echo "Gateway ready. Public device endpoint: wss://$DOMAIN/device"
-echo 'Allow TCP 80/443 in Tencent security groups and your existing host firewall.'
+echo "Gateway ready. Public device endpoint: wss://$DOMAIN:$HTTPS_PORT/device"
+echo "Allow TCP 80/$HTTPS_PORT in Tencent security groups and your existing host firewall."
 PUBLIC_READY=false
 for attempt in $(seq 1 12); do
-  if curl -fSs --connect-timeout 5 --max-time 10 "https://$DOMAIN/healthz"; then PUBLIC_READY=true; break; fi
+  if curl -fSs --connect-timeout 5 --max-time 10 "https://$DOMAIN:$HTTPS_PORT/healthz"; then PUBLIC_READY=true; break; fi
   sleep 5
 done
 if [[ $PUBLIC_READY == true ]]; then
@@ -185,3 +191,4 @@ else
 fi
 echo 'Export connection configuration: sudo pocketctl export /path/to/connection.json'
 echo 'Existing export files are not overwritten; keep exported device keys private.'
+

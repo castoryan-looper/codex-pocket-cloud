@@ -23,6 +23,14 @@ cd codex-pocket-cloud
 sudo bash deploy/install.sh --domain pocket.example.com
 ```
 
+可以把设备服务端口改为 8443，例如：
+
+```bash
+sudo bash deploy/install.sh --domain pocket.example.com --https-port 8443
+```
+
+此时放行 TCP **80 和 8443**，设备连接 `wss://pocket.example.com:8443/device`；导出的连接配置会包含所选端口。此模式通过 HTTP-01 自动申请与续期证书，公网 80 必须可达且可由此服务监听，443 可以留给已有服务。若 80 也被占用，需要复用现有反向代理或另行配置 DNS 验证；仅改设备端口无法解决证书验证端口问题。升级时继续传入相同的 `--https-port`。
+
 首次安装会显示官方 OpenAI 设备登录网址与一次性代码，由你在自己的浏览器登录。若账号尚未允许设备码登录，先在账号安全设置启用；也可按官方文档用 SSH 转发 `localhost:1455` 完成浏览器登录。不要把账号令牌、密码或 auth.json 提交到 Git。
 
 无交互安装会在等待登录时退出码 2，随后运行：
@@ -43,7 +51,7 @@ sudo pocketctl health
 - 将管理控制台保留在 `127.0.0.1:8787`，设备密钥单独生成并持久保存。
 - 检查本机与公网就绪状态。公网未验证时以退出码 3 报告，不会把“本机启动”冒充“外网可用”。
 
-如果 80/443/8787 已由其他服务占用，首次安装会停止，不覆盖已有网站。TencentOS/CentOS 不支持此 apt 安装脚本；请使用受支持系统，或自行迁移部署配置。
+如果 80、所选 HTTPS 端口或 8787 已由其他服务占用，首次安装会停止，不覆盖已有网站。TencentOS/CentOS 不支持此 apt 安装脚本；请使用受支持系统，或自行迁移部署配置。
 
 ## 将设备连到服务器
 
@@ -139,3 +147,4 @@ bash -n deploy/pocketctl
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
 
 保留第三方源码的各自许可证，见 THIRD_PARTY.md。Waveshare 上游没有顶层许可证，公开分发前应核实相关授权；个人部署不应公开任何运行凭据。
+

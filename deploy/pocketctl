@@ -25,6 +25,7 @@ case "${1:-help}" in
     destination="${2:-/var/lib/codex-pocket/connection.json}"
     "$PYTHON" "$APP/deploy/export_connection.py" "$destination"
     ;;
-  health) curl --fail --show-error --silent "https://${POCKET_PUBLIC_HOST}/healthz"; echo ;;
+  health) curl --fail --show-error --silent "https://${POCKET_PUBLIC_HOST}:${POCKET_PUBLIC_PORT:-443}/healthz"; echo ;;
   *) echo 'Usage: sudo pocketctl {login|status|logs|restart|console|export [FILE]|health}' ;;
 esac
+
