@@ -6,6 +6,7 @@ DOMAIN=''
 PUBLIC_IP=''
 HTTPS_PORT=443
 ACME_CHALLENGE=http-01
+TLS_MODE=public
 MODEL=small
 CODEX_VERSION=${CODEX_VERSION:-0.163.0}
 CADDY_VERSION=${CADDY_VERSION:-}
@@ -14,11 +15,12 @@ STATE=/var/lib/codex-pocket
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd /
 die() { echo "ERROR: $*" >&2; exit 1; }
-usage() { echo 'Usage: sudo bash deploy/install.sh (--domain pocket.example.com | --ip PUBLIC_IPV4) [--model small|base] [--https-port 8443] [--acme-challenge http-01|tls-alpn-01]'; }
+usage() { echo 'Usage: sudo bash deploy/install.sh (--domain pocket.example.com | --ip PUBLIC_IPV4) [--model small|base] [--https-port 8443] [--acme-challenge http-01|tls-alpn-01] [--tls-mode public|private-ca]'; }
 while (($#)); do
   case "$1" in
     --ip) [[ $# -ge 2 ]] || die 'Missing IP address'; PUBLIC_IP=$2; shift 2 ;;
     --domain) [[ $# -ge 2 ]] || die 'Missing domain'; DOMAIN=$2; shift 2 ;;
+    --tls-mode) [[ $# -ge 2 ]] || die 'Missing TLS mode'; TLS_MODE=$2; shift 2 ;;
     --acme-challenge) [[ $# -ge 2 ]] || die 'Missing challenge type'; ACME_CHALLENGE=$2; shift 2 ;;
     --https-port) [[ $# -ge 2 ]] || die 'Missing HTTPS port'; HTTPS_PORT=$2; shift 2 ;;
     --model) [[ $# -ge 2 ]] || die 'Missing model'; MODEL=$2; shift 2 ;;
@@ -54,6 +56,15 @@ case "$ACME_CHALLENGE" in
     if [[ $HTTPS_PORT != 443 ]]; then SITE_ADDRESSES="$SITE_ADDRESSES, $DOMAIN:443"; fi
     ;;
   *) die 'Challenge type must be http-01 or tls-alpn-01.' ;;
+esac
+case "$TLS_MODE" in
+  public) ;;
+  private-ca)
+    SITE_ADDRESSES="$DOMAIN:$HTTPS_PORT"
+    AUTO_HTTPS_OPTION='auto_https disable_redirects'
+    CHALLENGE_PORT=$HTTPS_PORT
+    ;;
+  *) die 'TLS mode must be public or private-ca.' ;;
 esac
 source /etc/os-release
 case "${ID:-}:${VERSION_ID:-}" in
@@ -134,6 +145,14 @@ if [[ ! -f "$STATE/workspace/AGENTS.md" ]]; then
   install -o codex-pocket -g codex-pocket -m 600 "$REPO/assistant-workspace/AGENTS.md" "$STATE/workspace/AGENTS.md"
 fi
 echo '[5/7] Configuring private state and HTTPS ingress'
+DEVICE_CA_FILE="$ROOT/app/certificates/isrgrootx1.pem"
+TLS_ISSUER=acme
+TLS_ISSUER_OPTIONS=$(printf '      dir https://acme-v02.api.letsencrypt.org/directory\n      %s\n      %s' "$CHALLENGE_OPTION" "$ACME_PROFILE")
+if [[ $TLS_MODE == private-ca ]]; then
+  DEVICE_CA_FILE=/etc/codex-pocket/device-ca.pem
+  TLS_ISSUER=internal
+  TLS_ISSUER_OPTIONS=''
+fi
 cat > /etc/codex-pocket/pocket.env <<ENV
 HOME=$STATE
 CODEX_HOME=$STATE/.codex
@@ -146,7 +165,8 @@ POCKET_FONT=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
 POCKET_ASR_THREADS=4
 POCKET_PUBLIC_HOST=$DOMAIN
 POCKET_PUBLIC_PORT=$HTTPS_PORT
-POCKET_CA_FILE=$ROOT/app/certificates/isrgrootx1.pem
+POCKET_CA_FILE=$DEVICE_CA_FILE
+POCKET_TLS_MODE=$TLS_MODE
 HF_HOME=$STATE/huggingface
 TOKENIZERS_PARALLELISM=false
 ENV
@@ -155,14 +175,14 @@ cat > /etc/codex-pocket/Caddyfile <<CADDY
 {
   admin off
   persist_config off
+  skip_install_trust
+  default_sni $DOMAIN
   $AUTO_HTTPS_OPTION
 }
 $SITE_ADDRESSES {
   tls {
-    issuer acme {
-      dir https://acme-v02.api.letsencrypt.org/directory
-      $CHALLENGE_OPTION
-      $ACME_PROFILE
+    issuer $TLS_ISSUER {
+$TLS_ISSUER_OPTIONS
     }
   }
   @device path /device
@@ -173,7 +193,12 @@ $SITE_ADDRESSES {
 }
 CADDY
 chmod 644 /etc/codex-pocket/Caddyfile
-"$ROOT/tools/caddy/caddy" validate --config /etc/codex-pocket/Caddyfile --adapter caddyfile
+runuser -u codex-pocket-tls -- env HOME=/var/lib/codex-pocket-tls XDG_DATA_HOME=/var/lib/codex-pocket-tls/data XDG_CONFIG_HOME=/var/lib/codex-pocket-tls/config "$ROOT/tools/caddy/caddy" validate --config /etc/codex-pocket/Caddyfile --adapter caddyfile
+if [[ $TLS_MODE == private-ca ]]; then
+  GENERATED_CA=/var/lib/codex-pocket-tls/data/caddy/pki/authorities/local/root.crt
+  [[ -s $GENERATED_CA ]] || die 'Private CA was not generated. Check Caddy validation output.'
+  install -o root -g root -m 644 "$GENERATED_CA" "$DEVICE_CA_FILE"
+fi
 if [[ ! -f "$STATE/.codex/config.toml" ]]; then
   printf 'cli_auth_credentials_store = "file"\n' > "$STATE/.codex/config.toml"
   chown codex-pocket:codex-pocket "$STATE/.codex/config.toml"
@@ -207,10 +232,15 @@ for attempt in $(seq 1 30); do
 done
 [[ $READY == true ]] || die 'Gateway did not become ready. Run: sudo pocketctl logs'
 echo "Gateway ready. Public device endpoint: wss://$DOMAIN:$HTTPS_PORT/device"
-echo "Allow TCP $CHALLENGE_PORT/$HTTPS_PORT in Tencent security groups and your existing host firewall."
+if [[ $TLS_MODE == private-ca ]]; then
+  echo "Allow TCP $HTTPS_PORT in Tencent security groups and your existing host firewall. Ports 80/443 are not required."
+  echo 'Import the exported CA into your ESP32 through the protected setup page. The system/browser trust store was not modified.'
+else
+  echo "Allow TCP $CHALLENGE_PORT/$HTTPS_PORT in Tencent security groups and your existing host firewall."
+fi
 PUBLIC_READY=false
 for attempt in $(seq 1 12); do
-  if curl -fSs --connect-timeout 5 --max-time 10 "https://$DOMAIN:$HTTPS_PORT/healthz"; then PUBLIC_READY=true; break; fi
+  if curl -fSs --cacert "$DEVICE_CA_FILE" --connect-timeout 5 --max-time 10 "https://$DOMAIN:$HTTPS_PORT/healthz"; then PUBLIC_READY=true; break; fi
   sleep 5
 done
 if [[ $PUBLIC_READY == true ]]; then

@@ -49,6 +49,19 @@ sudo bash deploy/install.sh --ip YOUR_PUBLIC_IP --https-port 8448 --acme-challen
 
 此模式需要 **443 与 8448** 空闲并对公网开放，以及本机内部 8787 空闲。Caddy 会监听 443 与 8448，不监听 80；证书验证和续期使用 443，设备导出配置仍使用 8448。443 也会提供相同的已鉴权设备接口。若 443 也被其他服务占用，不要终止现有服务：需要先配置现有反向代理或提供自己的证书。升级时保留 `--acme-challenge tls-alpn-01` 和端口参数。
 
+### 80 和 443 均被现有网站占用
+
+可以使用私有 CA 模式，只占用指定的设备端口（以及本机内部 8787）：
+
+```bash
+sudo bash deploy/install.sh --ip YOUR_PUBLIC_IP --https-port 8448 --tls-mode private-ca
+sudo pocketctl export /root/connection-private.json
+```
+
+只需放行 TCP **8448**。Caddy 在服务器生成私有 CA 并自动续期设备服务证书；安装程序只复制公开根证书，CA 私钥保留在服务私有目录。将 connection-private.json 通过可信的 SSH/SCP 下载并导入 ESP32 的受保护配网页面，其中包含公开根证书和设备密钥。设备按该根证书验证服务器，不关闭 TLS 校验。不要删除 `/var/lib/codex-pocket-tls`，否则根证书改变后需重新导入。升级时保留 `--tls-mode private-ca` 和端口参数。
+
+私有证书不会自动被普通浏览器信任；使用 `sudo pocketctl health` 验证，它会显式加载本服务根证书。管理网页继续使用 SSH 转发到 127.0.0.1:8787，不需要在系统或浏览器安装 CA，也无需绕过浏览器证书警告。服务器上的 Node 网站继续使用原来的 80/443。
+
 首次安装会显示官方 OpenAI 设备登录网址与一次性代码，由你在自己的浏览器登录。若账号尚未允许设备码登录，先在账号安全设置启用；也可按官方文档用 SSH 转发 `localhost:1455` 完成浏览器登录。不要把账号令牌、密码或 auth.json 提交到 Git。
 
 无交互安装会在等待登录时退出码 2，随后运行：
