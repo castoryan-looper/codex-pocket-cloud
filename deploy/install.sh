@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 umask 077
 DOMAIN=''
+PUBLIC_IP=''
 HTTPS_PORT=443
 MODEL=small
 CODEX_VERSION=${CODEX_VERSION:-0.163.0}
@@ -12,9 +13,10 @@ STATE=/var/lib/codex-pocket
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd /
 die() { echo "ERROR: $*" >&2; exit 1; }
-usage() { echo 'Usage: sudo bash deploy/install.sh --domain pocket.example.com [--model small|base] [--https-port 8443]'; }
+usage() { echo 'Usage: sudo bash deploy/install.sh (--domain pocket.example.com | --ip PUBLIC_IPV4) [--model small|base] [--https-port 8443]'; }
 while (($#)); do
   case "$1" in
+    --ip) [[ $# -ge 2 ]] || die 'Missing IP address'; PUBLIC_IP=$2; shift 2 ;;
     --domain) [[ $# -ge 2 ]] || die 'Missing domain'; DOMAIN=$2; shift 2 ;;
     --https-port) [[ $# -ge 2 ]] || die 'Missing HTTPS port'; HTTPS_PORT=$2; shift 2 ;;
     --model) [[ $# -ge 2 ]] || die 'Missing model'; MODEL=$2; shift 2 ;;
@@ -23,7 +25,15 @@ while (($#)); do
   esac
 done
 [[ ${EUID} -eq 0 ]] || die 'Run with sudo.'
-[[ $DOMAIN =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,63}$ ]] || die 'Provide a DNS hostname (not a raw IP). Point its A record at this server first.'
+ACME_PROFILE=''
+if [[ -n $PUBLIC_IP ]]; then
+  [[ -z $DOMAIN ]] || die 'Choose either --domain or --ip.'
+  python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); sys.exit(0 if a.version==4 and a.is_global else 1)' "$PUBLIC_IP" || die 'Provide a public IPv4 address.'
+  DOMAIN=$PUBLIC_IP
+  ACME_PROFILE='profile shortlived'
+else
+  [[ $DOMAIN =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,63}$ ]] || die 'Provide --domain HOSTNAME or --ip PUBLIC_IPV4.'
+fi
 [[ $MODEL == small || $MODEL == base ]] || die 'Model must be small or base.'
 [[ $CODEX_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Invalid CODEX_VERSION.'
 [[ $HTTPS_PORT =~ ^[0-9]{1,5}$ ]] || die 'HTTPS port must be an integer.'
@@ -133,6 +143,7 @@ $DOMAIN:$HTTPS_PORT {
     issuer acme {
       dir https://acme-v02.api.letsencrypt.org/directory
       disable_tlsalpn_challenge
+      $ACME_PROFILE
     }
   }
   @device path /device
@@ -191,4 +202,3 @@ else
 fi
 echo 'Export connection configuration: sudo pocketctl export /path/to/connection.json'
 echo 'Existing export files are not overwritten; keep exported device keys private.'
-

@@ -7,7 +7,7 @@ import sys
 def connection():
     state=Path(os.environ['POCKET_STATE_DIR'])
     config=json.loads((state/'settings.json').read_text('utf-8'))
-    return {'host':os.environ['POCKET_PUBLIC_HOST'],'port':443,'tls':True,'path':'/device',
+    return {'host':os.environ['POCKET_PUBLIC_HOST'],'port':int(os.environ.get('POCKET_PUBLIC_PORT','443')),'tls':True,'path':'/device',
             'token':config['device_token'],'ca':Path(os.environ['POCKET_CA_FILE']).read_text('utf-8')}
 
 def main():

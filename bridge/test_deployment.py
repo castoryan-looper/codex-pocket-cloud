@@ -76,3 +76,15 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):bridge.font_path()
 
 if __name__=='__main__':unittest.main()
+
+class ConnectionExportTests(unittest.TestCase):
+    def test_ip_export_preserves_custom_port_and_tls(self):
+        import runpy
+        module=runpy.run_path(str(Path(__file__).resolve().parents[1]/'deploy/export_connection.py'))
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/'settings.json').write_text(json.dumps({'device_token':'test-token'}))
+            (root/'ca.pem').write_text('test-ca')
+            with patch.dict(os.environ,{'POCKET_STATE_DIR':str(root),'POCKET_CA_FILE':str(root/'ca.pem'),'POCKET_PUBLIC_HOST':'43.160.215.253','POCKET_PUBLIC_PORT':'8443'}):
+                package=module['connection']()
+            self.assertEqual(package,{'host':'43.160.215.253','port':8443,'tls':True,'path':'/device','token':'test-token','ca':'test-ca'})
