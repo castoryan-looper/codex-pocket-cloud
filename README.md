@@ -39,6 +39,16 @@ sudo bash deploy/install.sh --ip YOUR_PUBLIC_IP --https-port 8443
 
 IP 模式使用 Let's Encrypt `shortlived` 公网证书，Caddy 自动续期；仍需放行 TCP **80 和 8443**，且 80 可由此服务监听。无需 DNS 解析。设备使用 `wss://YOUR_PUBLIC_IP:8443/device`，部署后导入新的连接配置。证书签发与 ESP32 的 IP 证书握手需要在实际部署后验证，配置校验通过不代表已经连通。公网只开放设备接口和健康检查；完整管理控制台仍通过 SSH 转发访问。
 
+### 已有服务占用 80 端口
+
+可选择 TLS-ALPN-01 证书验证，保留原有 Node / Nginx 网站：
+
+```bash
+sudo bash deploy/install.sh --ip YOUR_PUBLIC_IP --https-port 8448 --acme-challenge tls-alpn-01
+```
+
+此模式需要 **443 与 8448** 空闲并对公网开放，以及本机内部 8787 空闲。Caddy 会监听 443 与 8448，不监听 80；证书验证和续期使用 443，设备导出配置仍使用 8448。443 也会提供相同的已鉴权设备接口。若 443 也被其他服务占用，不要终止现有服务：需要先配置现有反向代理或提供自己的证书。升级时保留 `--acme-challenge tls-alpn-01` 和端口参数。
+
 首次安装会显示官方 OpenAI 设备登录网址与一次性代码，由你在自己的浏览器登录。若账号尚未允许设备码登录，先在账号安全设置启用；也可按官方文档用 SSH 转发 `localhost:1455` 完成浏览器登录。不要把账号令牌、密码或 auth.json 提交到 Git。
 
 无交互安装会在等待登录时退出码 2，随后运行：
@@ -155,3 +165,4 @@ bash -n deploy/pocketctl
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
 
 保留第三方源码的各自许可证，见 THIRD_PARTY.md。Waveshare 上游没有顶层许可证，公开分发前应核实相关授权；个人部署不应公开任何运行凭据。
+

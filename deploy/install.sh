@@ -5,6 +5,7 @@ umask 077
 DOMAIN=''
 PUBLIC_IP=''
 HTTPS_PORT=443
+ACME_CHALLENGE=http-01
 MODEL=small
 CODEX_VERSION=${CODEX_VERSION:-0.163.0}
 CADDY_VERSION=${CADDY_VERSION:-}
@@ -13,11 +14,12 @@ STATE=/var/lib/codex-pocket
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd /
 die() { echo "ERROR: $*" >&2; exit 1; }
-usage() { echo 'Usage: sudo bash deploy/install.sh (--domain pocket.example.com | --ip PUBLIC_IPV4) [--model small|base] [--https-port 8443]'; }
+usage() { echo 'Usage: sudo bash deploy/install.sh (--domain pocket.example.com | --ip PUBLIC_IPV4) [--model small|base] [--https-port 8443] [--acme-challenge http-01|tls-alpn-01]'; }
 while (($#)); do
   case "$1" in
     --ip) [[ $# -ge 2 ]] || die 'Missing IP address'; PUBLIC_IP=$2; shift 2 ;;
     --domain) [[ $# -ge 2 ]] || die 'Missing domain'; DOMAIN=$2; shift 2 ;;
+    --acme-challenge) [[ $# -ge 2 ]] || die 'Missing challenge type'; ACME_CHALLENGE=$2; shift 2 ;;
     --https-port) [[ $# -ge 2 ]] || die 'Missing HTTPS port'; HTTPS_PORT=$2; shift 2 ;;
     --model) [[ $# -ge 2 ]] || die 'Missing model'; MODEL=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -39,6 +41,20 @@ fi
 [[ $HTTPS_PORT =~ ^[0-9]{1,5}$ ]] || die 'HTTPS port must be an integer.'
 HTTPS_PORT=$((10#$HTTPS_PORT))
 (( HTTPS_PORT >= 1 && HTTPS_PORT <= 65535 && HTTPS_PORT != 80 && HTTPS_PORT != 8787 )) || die 'HTTPS port must be 1-65535, excluding 80 and 8787.'
+SITE_ADDRESSES="$DOMAIN:$HTTPS_PORT"
+AUTO_HTTPS_OPTION=''
+CHALLENGE_OPTION=disable_tlsalpn_challenge
+CHALLENGE_PORT=80
+case "$ACME_CHALLENGE" in
+  http-01) ;;
+  tls-alpn-01)
+    CHALLENGE_PORT=443
+    CHALLENGE_OPTION=disable_http_challenge
+    AUTO_HTTPS_OPTION='auto_https disable_redirects'
+    if [[ $HTTPS_PORT != 443 ]]; then SITE_ADDRESSES="$SITE_ADDRESSES, $DOMAIN:443"; fi
+    ;;
+  *) die 'Challenge type must be http-01 or tls-alpn-01.' ;;
+esac
 source /etc/os-release
 case "${ID:-}:${VERSION_ID:-}" in
   ubuntu:22.04|ubuntu:24.04|debian:12|debian:13) ;;
@@ -46,8 +62,10 @@ case "${ID:-}:${VERSION_ID:-}" in
 esac
 command -v systemctl >/dev/null || die 'systemd is required.'
 if [[ ! -f /etc/codex-pocket/managed ]]; then
-  if command -v ss >/dev/null && ss -H -ltn | awk '{print $4}' | grep -Eq ":(80|${HTTPS_PORT}|8787)$"; then
-    die "Port 80, $HTTPS_PORT or 8787 is occupied. Existing sites will not be overwritten."
+  if command -v ss >/dev/null && ss -H -ltn | awk '{print $4}' | grep -Eq ":(${CHALLENGE_PORT}|${HTTPS_PORT}|8787)$"; then
+    echo 'Conflicting listeners:' >&2
+    ss -ltnp | awk -v ports=":(${CHALLENGE_PORT}|${HTTPS_PORT}|8787)$" 'NR==1 || $4 ~ ports' >&2
+    die "Required ports: certificate=$CHALLENGE_PORT, device=$HTTPS_PORT, internal=8787. Existing sites will not be overwritten."
   fi
 fi
 case "$(uname -m)" in x86_64) NODE_ARCH=x64; CADDY_ARCH=amd64 ;; aarch64|arm64) NODE_ARCH=arm64; CADDY_ARCH=arm64 ;; *) die 'Supported CPU: x86_64 or arm64.' ;; esac
@@ -137,12 +155,13 @@ cat > /etc/codex-pocket/Caddyfile <<CADDY
 {
   admin off
   persist_config off
+  $AUTO_HTTPS_OPTION
 }
-$DOMAIN:$HTTPS_PORT {
+$SITE_ADDRESSES {
   tls {
     issuer acme {
       dir https://acme-v02.api.letsencrypt.org/directory
-      disable_tlsalpn_challenge
+      $CHALLENGE_OPTION
       $ACME_PROFILE
     }
   }
@@ -188,7 +207,7 @@ for attempt in $(seq 1 30); do
 done
 [[ $READY == true ]] || die 'Gateway did not become ready. Run: sudo pocketctl logs'
 echo "Gateway ready. Public device endpoint: wss://$DOMAIN:$HTTPS_PORT/device"
-echo "Allow TCP 80/$HTTPS_PORT in Tencent security groups and your existing host firewall."
+echo "Allow TCP $CHALLENGE_PORT/$HTTPS_PORT in Tencent security groups and your existing host firewall."
 PUBLIC_READY=false
 for attempt in $(seq 1 12); do
   if curl -fSs --connect-timeout 5 --max-time 10 "https://$DOMAIN:$HTTPS_PORT/healthz"; then PUBLIC_READY=true; break; fi
@@ -202,3 +221,4 @@ else
 fi
 echo 'Export connection configuration: sudo pocketctl export /path/to/connection.json'
 echo 'Existing export files are not overwritten; keep exported device keys private.'
+
