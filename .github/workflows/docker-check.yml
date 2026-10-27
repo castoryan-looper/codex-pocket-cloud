@@ -24,11 +24,18 @@ jobs:
           PUBLIC_HOST: 43.160.215.253
         run: |
           docker compose config --quiet
+          docker compose config --format json > /tmp/pocket-compose.json
+          python3 -c 'import json; c=json.load(open("/tmp/pocket-compose.json")); assert all(len(s["tmpfs"]) == 1 and s["tmpfs"][0].startswith("/tmp:") for s in c["services"].values())'
           bash -n deploy/docker.sh
           sh -n docker/gateway-entrypoint.sh
           sh -n docker/caddy-entrypoint.sh
       - name: Build gateway
-        run: docker build --target gateway -t pocket-gateway:check .
+        run: docker build --target gateway -t pocket-gateway:check -t codex-pocket-gateway:latest .
+      - name: Check actual Compose mounts and non-root temporary writes
+        env:
+          PUBLIC_HOST: 43.160.215.253
+        run: |
+          docker compose run --rm --no-deps --entrypoint gosu gateway pocket:pocket sh -c 'id && echo mount-ok > /tmp/pocket-mount-check && cat /tmp/pocket-mount-check'
       - name: Check non-root runtime dependencies
         run: |
           docker run --rm --entrypoint gosu pocket-gateway:check pocket:pocket sh -c 'id && node --version && npm --version && codex --version && python -c "import aiohttp, PIL, faster_whisper"'
@@ -39,3 +46,4 @@ jobs:
         run: |
           docker build --target ingress -t pocket-ingress:check .
           docker run --rm -e POCKET_PUBLIC_HOST=43.160.215.253 --entrypoint caddy pocket-ingress:check validate --config /etc/caddy/Caddyfile --adapter caddyfile
+

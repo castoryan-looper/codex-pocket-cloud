@@ -10,7 +10,7 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [CHOWN, SETUID, SETGID]
-    tmpfs: [/tmp:mode=1777,size=256m]
+    tmpfs: ["/tmp:mode=1777,size=256m"]
     environment:
       POCKET_PUBLIC_HOST: ${PUBLIC_HOST:?Run bash deploy/docker.sh up --ip YOUR_IP first}
       POCKET_PUBLIC_PORT: ${HTTPS_PORT:-8448}
@@ -43,7 +43,7 @@ services:
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
-    tmpfs: [/tmp:mode=1777,size=32m]
+    tmpfs: ["/tmp:mode=1777,size=32m"]
     environment:
       POCKET_PUBLIC_HOST: ${PUBLIC_HOST:?PUBLIC_HOST is required}
     volumes:
@@ -57,3 +57,4 @@ volumes:
   public_ca:
   caddy_data:
   caddy_config:
+
