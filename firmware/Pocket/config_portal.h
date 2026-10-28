@@ -1,6 +1,17 @@
 #pragma once
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <mbedtls/x509_crt.h>
+
+static String normalizeRootCa(String ca) {
+  ca.replace("\\r\\n", "\n");
+  ca.replace("\\n", "\n");
+  ca.replace("\\r", "\n");
+  ca.replace("\r\n", "\n");
+  ca.trim();
+  if (ca.length()) ca += '\n';
+  return ca;
+}
 
 // Included after Pocket.ino's shared state. HTTP is local/AP only; every config
 // operation requires the random key shown physically on the device.
@@ -78,12 +89,18 @@ static void initConfigPortal() {
     if(!portalAuthorized())return;
     String body=configWeb.arg("plain");if(body.length()>12000){portalError(413,"配置内容过大");return;}
     JsonDocument doc;if(deserializeJson(doc,body)){portalError(400,"配置格式错误");return;}
-    String ssid=doc["ssid"]|"",password=doc["password"]|"",host=doc["host"]|"",key=doc["token"]|"",ca=doc["ca"]|"";
+    String ssid=doc["ssid"]|"",password=doc["password"]|"",host=doc["host"]|"",key=doc["token"]|"",ca=normalizeRootCa(String(doc["ca"]|""));
     int port=doc["port"]|443,h=doc["holdMs"]|1200,r=doc["recordSeconds"]|20,m=doc["refreshMinutes"]|15;bool tls=doc["tls"]|true;
     bool validHost=host.length()<=253;
     for(unsigned i=0;i<host.length();i++)if(!isalnum((unsigned char)host[i]) && host[i]!='.' && host[i]!='-')validHost=false;
     if(!ssid.length()||ssid.length()>32||password.length()>63||!validHost||port<1||port>65535||h<800||h>2500||r<2||r>20||m<5||m>60||key.length()>256||ca.length()>8192){portalError(400,"请检查热点、主机、端口和功能参数的范围");return;}
     if(host.length() && tls && ca.indexOf("-----BEGIN CERTIFICATE-----")<0){portalError(400,"TLS 需要正确的 PEM 根 CA 证书");return;}
+    if(host.length() && tls){
+      mbedtls_x509_crt certificate;mbedtls_x509_crt_init(&certificate);
+      int result=mbedtls_x509_crt_parse(&certificate,(const unsigned char*)ca.c_str(),ca.length()+1);
+      mbedtls_x509_crt_free(&certificate);
+      if(result!=0){portalError(400,"根 CA 证书无法解析，请重新导入原始连接 JSON 文件");return;}
+    }
     if(host.length() && !key.length() && !remoteToken.length()){portalError(400,"请导入电脑连接配置，或填写设备连接密钥");return;}
     prefs.begin("pocket",false);
     if(password.length()||ssid!=wifiSsid)prefs.putString("pass",password);
@@ -104,4 +121,5 @@ static void loopConfigPortal() {
   if(portalCloseAt && (int32_t)(millis()-portalCloseAt)>=0){portalCloseAt=0;portalActive=false;configDns.stop();WiFi.softAPdisconnect(true);offlineStage=-1;imageDirty=true;}
   if(!portalActive && WiFi.status()!=WL_CONNECTED && millis()-portalBootAt>30000)startConfigPortal();
 }
+
 

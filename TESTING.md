@@ -27,3 +27,6 @@
 2026-10-28：服务器日志确认 gateway 正常，ingress 在执行 Caddy 二进制时报 EPERM。核对官方 2.11.7-alpine Dockerfile，二进制带 cap_net_bind_service=ep，与运行时 cap_drop=ALL 冲突。派生镜像在构建时删除不需要的文件 capability，保留运行时全部 cap_drop 和 no-new-privileges。CI 增加在相同限制下执行版本、配置校验、真实入口私有 CA/TLS 404 握手检查。本地没有 Docker 引擎，尚未声称此容器运行测试已通过。
 
 2026-10-28：修复 Caddy 默认指令排序使兜底 respond 404 提前遮蔽 reverse_proxy 的错误，Docker 与原生配置均改为互斥 handle 路由。使用实际 Caddy 2.11.7 与实际 aiohttp 网关应用进行本地集成测试：可信 CA/IP SAN 校验开启，/healthz 返回 200 与真实 JSON，/device WebSocket 返回 101 并成功传入带设备 token 的 hello，/api/state、/api/connection、根路径与未知路径均保持 404。CI 增加可区分健康、设备与兜底路径的真实上游夹具，避免只检查 404 就误判路由正确。本地集成不等于已验证服务器 Docker 与 ESP32。
+
+2026-10-28：从实体 ESP32 只读诊断确认地址/8448/TLS/密钥均存在，但根证书保存了字面反斜杠 n 而非换行，无法作为 PEM 解析。仅修正换行后，用设备保存的同一根证书开启完整 TLS/IP 校验，云端 /healthz 返回 200。固件增加读取/保存时换行归一化及保存前 mbedTLS 证书解析检查；Arduino ESP32 3.3.0 实际编译通过（应用约 1.40MB）。本次未刷写固件；实体配置修正和最终上线仍待通过设备配置页完成。日志和仓库不包含设备密钥或 NVS 备份。
+

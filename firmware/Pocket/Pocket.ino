@@ -223,7 +223,7 @@ void setupNetwork() {
   prefs.begin("pocket", true);
   wifiSsid=prefs.getString("ssid", ""); wifiPass=prefs.getString("pass", "");
   remoteHost=prefs.getString("host", ""); remotePath=prefs.getString("path", "/device");
-  remoteToken=prefs.getString("token", ""); rootCa=prefs.getString("ca", "");
+  remoteToken=prefs.getString("token", ""); rootCa=normalizeRootCa(prefs.getString("ca", ""));
   tlsEnabled=prefs.getBool("tls", true); remotePort=prefs.getUInt("port", 443);
   prefs.end();
   wifiConfigured = wifiSsid.length()>0;
@@ -355,3 +355,4 @@ void loop() {
   if (!online) disconnectedImage();
   delay(2);
 }
+
