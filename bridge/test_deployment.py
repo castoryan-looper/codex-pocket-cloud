@@ -116,6 +116,28 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
                 recognize.assert_awaited_once_with(bytes(16000))
                 await ws.close()
 
+    async def test_voice_upload_recognizes_and_submits_without_confirmation(self):
+        import asyncio, base64
+        from aiohttp.test_utils import TestClient,TestServer
+        self.p.thread='hardware-thread'
+        self.p.rpc.call.return_value={'turn':{'id':'new-turn','status':'inProgress'}}
+        async with TestClient(TestServer(self.p.app())) as client:
+            with patch.object(self.p,'whisper_transcribe',return_value='检查项目'):
+                ws=await client.ws_connect('/device',protocols=('arduino',))
+                await ws.send_json({'type':'hello','token':self.p.config['device_token']})
+                await ws.send_json({'type':'audio_start','codec':'mulaw8k'})
+                await ws.send_json({'type':'audio_chunk','data':base64.b64encode(bytes([255])*4000).decode()})
+                await ws.send_json({'type':'audio_end','bytes':16000})
+                for _ in range(100):
+                    if self.p.rpc.call.await_count:break
+                    await asyncio.sleep(.01)
+                self.p.rpc.call.assert_awaited_once()
+                method,params=self.p.rpc.call.await_args.args
+                self.assertEqual(method,'turn/start')
+                self.assertEqual(params['input'],[{'type':'text','text':'检查项目'}])
+                self.assertEqual(self.p.draft,'')
+                await ws.close()
+
     def test_font_override_is_explicit(self):
         test_font=self.directory/'font.ttc';test_font.touch()
         with patch.dict(os.environ,{'POCKET_FONT':str(test_font)}):
