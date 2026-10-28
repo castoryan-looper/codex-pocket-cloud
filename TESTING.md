@@ -24,3 +24,4 @@
 
 2026-10-27：修复私有卷 chown 后受限 root 缺少 FOWNER 而无法 chmod 的初始化错误，改由卷所有者 UID 10001 执行 chmod，不增加容器 capability。24 项本地软件测试和入口脚本语法检查通过。CI 新增真实入口 self-test，连续两次验证已有命名卷初始化、700 权限与非 root 写入。
 
+2026-10-28：服务器日志确认 gateway 正常，ingress 在执行 Caddy 二进制时报 EPERM。核对官方 2.11.7-alpine Dockerfile，二进制带 cap_net_bind_service=ep，与运行时 cap_drop=ALL 冲突。派生镜像在构建时删除不需要的文件 capability，保留运行时全部 cap_drop 和 no-new-privileges。CI 增加在相同限制下执行版本、配置校验、真实入口私有 CA/TLS 404 握手检查。本地没有 Docker 引擎，尚未声称此容器运行测试已通过。

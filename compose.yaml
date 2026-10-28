@@ -57,4 +57,3 @@ volumes:
   public_ca:
   caddy_data:
   caddy_config:
-

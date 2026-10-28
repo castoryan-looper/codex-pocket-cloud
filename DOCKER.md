@@ -78,4 +78,3 @@ bash deploy/docker.sh up          # 复用 .env.docker 中的地址、端口、�
 Docker 版通过官方 `externalSandbox` 策略使用容器作为执行边界，避免依赖容器内嵌套 Linux 沙箱；任务可以使用容器网络、访问挂载给该容器的账号和工作数据。保留 `on-request` 审批处理，收到的审批不会自动同意。原生版本仍默认 `workspace-write`。参考 [Codex App Server](https://developers.openai.com/codex/app-server)。
 
 验证范围见 TESTING.md。构建镜像不等于已完成 Codex 账号授权、真实任务执行和 ESP32 联调。
-

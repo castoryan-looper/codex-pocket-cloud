@@ -34,6 +34,9 @@ ENTRYPOINT ["/app/docker/gateway-entrypoint.sh"]
 CMD ["serve"]
 
 FROM caddy:2.11.7-alpine AS ingress
+# The official binary requests NET_BIND_SERVICE through file capabilities.
+# We only listen on 8443, and keep cap_drop=ALL at runtime.
+RUN setcap -r /usr/bin/caddy && test -z "$(getcap /usr/bin/caddy)" && caddy version
 COPY docker/Caddyfile /etc/caddy/Caddyfile
 COPY docker/caddy-entrypoint.sh /etc/caddy/pocket-entrypoint.sh
 ENTRYPOINT ["/bin/sh", "/etc/caddy/pocket-entrypoint.sh"]
