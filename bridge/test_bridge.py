@@ -206,6 +206,115 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.p.rate_at=time.time()-400
         self.assertEqual(self.p.remaining(),[])
 
+    def test_dashboard_context_is_real_context_not_subscription_tokens(self):
+        self.assertEqual(bridge.dashboard_context(None), '上下文剩余：未知')
+        self.assertEqual(bridge.dashboard_context({'used': 1000, 'max': 10000}), '上下文剩余：9.0k')
+        self.assertEqual(bridge.dashboard_context({'used': 100, 'max': 500}), '上下文剩余：400')
+        self.assertEqual(bridge.dashboard_context({'used': -1, 'max': 100}), '上下文剩余：未知')
+
+    def test_dashboard_suggestions_use_measured_state(self):
+        self.assertEqual(bridge.dashboard_advice(9, None, 10, []), '让AI整理待办，记得充电')
+        self.assertEqual(bridge.dashboard_advice(9, None, 90, [{'remaining': 10}]), '让AI合并零散任务')
+        self.assertEqual(bridge.dashboard_advice(14, {'temperature': 32, 'code': 0}, 90, []), '让AI安排室内任务')
+        self.assertEqual(bridge.dashboard_advice(14, {'temperature': 20, 'code': 61}, 90, []), '让AI规划雨天安排')
+        self.assertEqual(bridge.dashboard_advice(23, None, None, []), '让AI复盘并安排明日')
+
+    def test_weather_expires_and_idle_dashboard_preserves_action_states(self):
+        import time
+        self.p.weather = {'temperature': 21.5, 'code': 0}
+        self.p.weather_at = time.monotonic()-5401
+        self.assertIsNone(self.p.current_weather())
+        self.p.weather_at = time.monotonic()
+        self.assertEqual(self.p.current_weather()['temperature'], 21.5)
+        self.p.status='待命'
+        self.p.device['battery']=80
+        dashboard=self.p.render().tobytes()
+        self.assertEqual(len(dashboard),5000)
+        self.p.draft='需要保留的草稿'
+        self.assertNotEqual(dashboard,self.p.render().tobytes())
+        self.p.draft=''
+        self.p.turn='running'
+        self.p.status='工作中'
+        self.assertNotEqual(dashboard,self.p.render().tobytes())
+
+    async def test_weather_is_opt_in_without_coordinates(self):
+        with patch.dict(os.environ, {'POCKET_WEATHER_LAT':'','POCKET_WEATHER_LON':''}), patch('bridge.ClientSession') as session:
+            await self.p.refresh_weather()
+            session.assert_not_called()
+        self.assertIsNone(self.p.weather)
+
+    async def test_weather_fetch_uses_explicit_coordinates(self):
+        response=AsyncMock()
+        response.raise_for_status=__import__('unittest.mock',fromlist=['Mock']).Mock()
+        response.json.return_value={'current':{'temperature_2m':22.3,'weather_code':61}}
+        session=__import__('unittest.mock',fromlist=['MagicMock']).MagicMock()
+        session.get.return_value.__aenter__=AsyncMock(return_value=response)
+        session.get.return_value.__aexit__=AsyncMock(return_value=False)
+        factory=__import__('unittest.mock',fromlist=['MagicMock']).MagicMock()
+        factory.return_value.__aenter__=AsyncMock(return_value=session)
+        factory.return_value.__aexit__=AsyncMock(return_value=False)
+        with patch.dict(os.environ, {'POCKET_WEATHER_LAT':'31.2','POCKET_WEATHER_LON':'121.4'}), patch('bridge.ClientSession',factory):
+            await self.p.refresh_weather()
+        self.assertEqual(self.p.weather,{'temperature':22.3,'code':61})
+        self.assertEqual(session.get.call_args.kwargs['params']['latitude'],31.2)
+
+    def test_chat_advice_uses_only_recent_device_thread_user_messages(self):
+        now=1700000000
+        def turn(age,text,kind='userMessage'):
+            return {'startedAt':now-age,'items':[{'type':kind,'content':[{'type':'text','text':text}]}]}
+        self.assertEqual(bridge.chat_history_advice([turn(60,'帮我优化ESP32语音')],now),('聊天建议','让AI梳理设备项目进展'))
+        self.assertEqual(bridge.chat_history_advice([turn(60,'整理今天的待办')],now),('聊天建议','让AI梳理聊天中的待办'))
+        self.assertIsNone(bridge.chat_history_advice([turn(259201,'帮我优化ESP32')],now))
+        self.assertIsNone(bridge.chat_history_advice([turn(60,'待办','agentMessage')],now))
+        self.assertIsNone(bridge.chat_history_advice([{'items':[]}],now))
+
+    async def test_chat_read_is_bounded_and_uses_device_thread_only(self):
+        import time
+        self.p.rpc.call.return_value={'data':[{'startedAt':time.time(),'items':[{'type':'userMessage','content':[{'type':'text','text':'聊聊我的项目'}]}]}]}
+        await self.p.refresh_chat_advice()
+        method,params=self.p.rpc.call.await_args.args
+        self.assertEqual(method,'thread/turns/list')
+        self.assertEqual(params['threadId'],'test-thread')
+        self.assertEqual(params['limit'],8)
+        self.assertEqual(params['sortDirection'],'desc')
+        self.assertIsNone(self.p.current_chat_advice())
+
+    def test_personal_advice_requires_fresh_explicit_data(self):
+        now=1700000000
+        self.assertIsNone(bridge.personal_advice({},now))
+        self.assertIsNone(bridge.personal_advice({'updatedAt':now-21601,'todos':[{'title':'过期待办'}]},now))
+        self.assertIsNone(bridge.personal_advice({'updatedAt':now+301,'todos':[{'title':'未来数据'}]},now))
+        data={'updatedAt':now,'calendar':[{'title':'项目会议','startAt':now+1800}],
+              'todos':[{'title':'待办一'}],'projects':[{'title':'项目一'}],'interests':[{'title':'话题一'}]}
+        self.assertEqual(bridge.personal_advice(data,now),('日程建议','让AI准备项目会议'))
+        data['recommendation']={'text':'让AI整理会前材料','basedOn':['calendar','projects']}
+        self.assertEqual(bridge.personal_advice(data,now),('综合建议','让AI整理会前材料'))
+        data.pop('recommendation')
+        data['calendar'][0]['startAt']=now+10000
+        self.assertEqual(bridge.personal_advice(data,now),('待办建议','让AI推进待办一'))
+        data['todos']=[]
+        self.assertEqual(bridge.personal_advice(data,now),('项目建议','让AI梳理项目一'))
+        data['projects']=[]
+        self.assertEqual(bridge.personal_advice(data,now),('兴趣建议','让AI调研话题一'))
+
+    async def test_dashboard_context_requires_auth_and_never_starts_task(self):
+        from aiohttp.test_utils import TestClient,TestServer
+        async with TestClient(TestServer(self.p.app())) as client:
+            data={'todos':[{'title':'准备发布'}], 'recommendation':{'text':'让AI整理发布清单','basedOn':['todos']}}
+            response=await client.post('/api/dashboard-context',json=data)
+            self.assertEqual(response.status,401)
+            headers={'Authorization':'Bearer '+self.p.config['console_token']}
+            response=await client.post('/api/dashboard-context',headers=headers,json=data)
+            self.assertEqual(response.status,200)
+            self.assertEqual((await response.json())['counts']['todos'],1)
+            stored=self.p.read_personal_context()
+            self.assertEqual(stored['todos'],[{'title':'准备发布'}])
+            self.assertEqual(stored['recommendation']['text'],'让AI整理发布清单')
+            self.p.rpc.call.assert_not_awaited()
+            response=await client.post('/api/dashboard-context',headers=headers,json={'calendar':[{'title':'bad','startAt':True}]})
+            self.assertEqual(response.status,400)
+            self.assertEqual(self.p.read_personal_context()['todos'],[{'title':'准备发布'}])
+
     def test_screen_wire_layout(self):
         image=self.p.render()
         self.assertEqual(image.size,(200,200))

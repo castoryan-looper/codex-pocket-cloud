@@ -4,7 +4,7 @@ umask 077
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 ENV_FILE="$REPO/.env.docker"
 usage() {
-  echo 'Usage: bash deploy/docker.sh up --ip PUBLIC_IPV4 [--https-port 8448] [--console-port 8787] [--model small|base]'
+  echo 'Usage: bash deploy/docker.sh up --ip PUBLIC_IPV4 [--https-port 8448] [--console-port 8787] [--model small|base] [--weather-lat LAT --weather-lon LON]'
   echo '       bash deploy/docker.sh {login|status|logs|health|console|stop|export FILE}'
 }
 command=${1:-help}
@@ -36,6 +36,8 @@ if [[ $command == up ]]; then
   HTTPS_PORT=8448
   CONSOLE_PORT=8787
   SPEECH_MODEL=small
+  WEATHER_LAT=''
+  WEATHER_LON=''
   if [[ -f $ENV_FILE ]]; then source "$ENV_FILE"; fi
   while (($#)); do
     [[ $# -ge 2 ]] || { usage; exit 1; }
@@ -44,6 +46,8 @@ if [[ $command == up ]]; then
       --https-port) HTTPS_PORT=$2 ;;
       --console-port) CONSOLE_PORT=$2 ;;
       --model) SPEECH_MODEL=$2 ;;
+      --weather-lat) WEATHER_LAT=$2 ;;
+      --weather-lon) WEATHER_LON=$2 ;;
       *) usage; exit 1 ;;
     esac
     shift 2
@@ -57,7 +61,11 @@ if [[ $command == up ]]; then
   HTTPS_PORT=$((10#$HTTPS_PORT)); CONSOLE_PORT=$((10#$CONSOLE_PORT))
   [[ $HTTPS_PORT != "$CONSOLE_PORT" ]] || { echo 'Device and console ports must differ.' >&2; exit 1; }
   [[ $SPEECH_MODEL == small || $SPEECH_MODEL == base ]] || { echo 'Model must be small or base.' >&2; exit 1; }
-  printf 'PUBLIC_HOST=%s\nHTTPS_PORT=%s\nCONSOLE_PORT=%s\nSPEECH_MODEL=%s\n' "$PUBLIC_HOST" "$HTTPS_PORT" "$CONSOLE_PORT" "$SPEECH_MODEL" > "$ENV_FILE"
+  if [[ -n $WEATHER_LAT || -n $WEATHER_LON ]]; then
+    [[ $WEATHER_LAT =~ ^-?[0-9]{1,3}([.][0-9]{1,6})?$ && $WEATHER_LON =~ ^-?[0-9]{1,3}([.][0-9]{1,6})?$ ]] || { echo 'Provide both numeric weather coordinates.' >&2; exit 1; }
+    awk -v lat="$WEATHER_LAT" -v lon="$WEATHER_LON" 'BEGIN { exit !(lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) }' || { echo 'Weather coordinates are out of range.' >&2; exit 1; }
+  fi
+  printf 'PUBLIC_HOST=%s\nHTTPS_PORT=%s\nCONSOLE_PORT=%s\nSPEECH_MODEL=%s\nWEATHER_LAT=%s\nWEATHER_LON=%s\n' "$PUBLIC_HOST" "$HTTPS_PORT" "$CONSOLE_PORT" "$SPEECH_MODEL" "$WEATHER_LAT" "$WEATHER_LON" > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   compose config --quiet
   compose build

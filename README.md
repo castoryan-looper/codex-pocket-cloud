@@ -134,6 +134,14 @@ sudo bash deploy/install.sh --domain pocket.example.com
 
 运行数据在 `/var/lib/codex-pocket`，与源码发布目录分离。重跑部署保留登录、设备密钥、会话、模型和工作目录。旧发布保留在 `/opt/codex-pocket/releases` 便于人工回退；升级 Python 依赖后，回退代码时也需检查依赖兼容性。
 
+## 默认待机仪表台
+
+待命页显示当前时间、Codex 订阅窗口的真实剩余百分比、可获取时的当前会话上下文剩余 token、天气温度和一条简短的规则建议。订阅额度不能准确换算为固定 token 数；未知或过期数据显示未知，不虚构数值。任务进行中、待确认或有未发送草稿时不会切走重要状态；任务完成或停止 3 分钟后返回待机页。
+
+默认使用 UTC+8，`POCKET_UTC_OFFSET` 可调整；未提供位置时天气显示未知。要显示天气，需明确提供经纬度：Docker 部署首次使用 `bash deploy/docker.sh up --weather-lat LAT --weather-lon LON`，坐标保存在服务器私有 `.env.docker` 并在后续更新时保留；非 Docker 模式可设置 `POCKET_WEATHER_LAT`、`POCKET_WEATHER_LON`。天气使用 Open-Meteo 当前气温，后台约 30 分钟更新一次，超过 90 分钟的数据不再显示；提供坐标意味着将坐标发送给该天气服务。建议由本地规则生成，不额外调用模型，也不会自动执行任务。
+
+仪表台支持由已授权的本地采集器向仅限 loopback 且需要控制台 Bearer token 的 `POST /api/dashboard-context` 提交日程、待办、项目和兴趣摘要，也可提供基于这些来源生成的一条建议。数据保存在私有 runtime 目录，6 小时后失效；未提供时只显示通用建议。设备空闲时还会以只读方式检查最近 3 天内本设备独立 Codex 会话的最多 8 轮用户消息，按关键词给出简短建议；不会读取其他电脑上的桌面会话。尚未自动连接飞书或其他日程、待办、兴趣来源；外部聊天记录须单独安全同步。
+
 ## 设备功能
 
 - PWR 短按选菜单，BOOT 短按执行。

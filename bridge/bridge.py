@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import io
@@ -23,7 +24,7 @@ import time
 import wave
 from functools import lru_cache
 
-from aiohttp import web, WSMsgType
+from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent
@@ -69,6 +70,108 @@ def codex_binary():
         if 'vendor' in path.parts:
             return str(path)
     return shutil.which('codex.exe') or shutil.which('codex.cmd') or shutil.which('codex') or 'codex'
+
+
+def dashboard_time():
+    """Shanghai time by default; configurable without assuming the server's zone."""
+    try:
+        hours = float(os.environ.get('POCKET_UTC_OFFSET', '8'))
+        if not -12 <= hours <= 14:
+            raise ValueError('offset out of range')
+        zone = timezone(timedelta(hours=hours))
+    except (ValueError, OverflowError):
+        zone = timezone(timedelta(hours=8))
+    return datetime.now(zone)
+
+
+def dashboard_advice(hour, weather, battery, windows):
+    """Small, deterministic suggestions; no LLM request or private data needed."""
+    if battery is not None and battery <= 20:
+        return '让AI整理待办，记得充电'
+    if windows and min(w['remaining'] for w in windows) <= 15:
+        return '让AI合并零散任务'
+    if weather and weather.get('temperature') is not None and weather['temperature'] >= 30:
+        return '让AI安排室内任务'
+    if weather and weather.get('code') in (51,53,55,56,57,61,63,65,66,67,71,73,75,77,80,81,82,85,86,95,96,99):
+        return '让AI规划雨天安排'
+    if hour >= 22 or hour < 6:
+        return '让AI复盘并安排明日'
+    if hour < 12:
+        return '让AI规划今日重点'
+    if hour < 18:
+        return '让AI整理项目进展'
+    return '让AI总结今日收获'
+
+
+def personal_advice(context, now):
+    """Use only fresh, explicit data; never invent meetings or project facts."""
+    if not isinstance(context, dict):
+        return None
+    updated = context.get('updatedAt')
+    if isinstance(updated, bool) or not isinstance(updated, (int, float)) or not -300 <= now-updated <= 21600:
+        return None
+    recommendation = context.get('recommendation')
+    if isinstance(recommendation,dict) and isinstance(recommendation.get('text'),str):
+        message = ' '.join(recommendation['text'].split())[:80]
+        sources = recommendation.get('basedOn')
+        allowed = {'calendar':'日程建议','todos':'待办建议','projects':'项目建议','interests':'兴趣建议'}
+        if message and isinstance(sources,list) and sources and all(isinstance(source,str) and source in allowed for source in sources):
+            return (allowed[sources[0]] if len(set(sources)) == 1 else '综合建议', message)
+    def title(item):
+        if not isinstance(item, dict) or not isinstance(item.get('title'), str):
+            return ''
+        return ' '.join(item['title'].split())[:40]
+    events = context.get('calendar') if isinstance(context.get('calendar'), list) else []
+    due_events = [x for x in events[:16] if isinstance(x,dict) and title(x)
+                  and isinstance(x.get('startAt'), (int,float)) and not isinstance(x.get('startAt'), bool)
+                  and -600 <= x['startAt']-now <= 7200]
+    if due_events:
+        return ('日程建议', '让AI准备'+title(min(due_events,key=lambda x:x['startAt'])))
+    for key, label, verb in (('todos','待办建议','让AI推进'), ('projects','项目建议','让AI梳理'), ('interests','兴趣建议','让AI调研')):
+        entries = context.get(key)
+        if isinstance(entries,list):
+            for entry in entries[:16]:
+                if title(entry):
+                    return (label, verb+title(entry))
+    return None
+
+
+def chat_history_advice(turns, now):
+    """Only classify recent user text in this device's own Codex thread."""
+    if not isinstance(turns,list):
+        return None
+    for turn in turns[:8]:
+        if not isinstance(turn,dict):
+            continue
+        started = turn.get('startedAt')
+        if isinstance(started,bool) or not isinstance(started,(int,float)) or not -300 <= now-started <= 259200:
+            continue
+        for item in turn.get('items',[]):
+            if not isinstance(item,dict) or item.get('type') != 'userMessage':
+                continue
+            parts = item.get('content')
+            if not isinstance(parts,list):
+                continue
+            text = ' '.join(part.get('text','') for part in parts if isinstance(part,dict) and part.get('type') == 'text' and isinstance(part.get('text'),str)).lower()[:4000]
+            if any(word in text for word in ('esp32','codex-pocket','开源项目','github')):
+                if 'esp32' in text or 'codex-pocket' in text:
+                    return ('聊天建议','让AI梳理设备项目进展')
+                return ('聊天建议','让AI整理最近讨论的话题')
+            if any(word in text for word in ('待办','日程','计划','会议','安排')):
+                return ('聊天建议','让AI梳理聊天中的待办')
+            if any(word in text for word in ('研究','调研','感兴趣','关注','探索')):
+                return ('聊天建议','让AI继续调研近期话题')
+    return None
+
+
+def dashboard_context(context):
+    if not isinstance(context, dict):
+        return '上下文剩余：未知'
+    used, maximum = context.get('used'), context.get('max')
+    if not isinstance(used, (int, float)) or not isinstance(maximum, (int, float)) or isinstance(used, bool) or isinstance(maximum, bool) or maximum <= 0 or used < 0:
+        return '上下文剩余：未知'
+    left = max(0, int(maximum - used))
+    return f'上下文剩余：{left / 1000:.1f}k' if left >= 1000 else f'上下文剩余：{left}'
 
 
 class Rpc:
@@ -182,6 +285,14 @@ class Pocket:
         self.last_frame = None
         self.dirty = True
         self.display_battery = None
+        self.weather = None
+        self.weather_at = 0
+        self.weather_last_attempt = -1800
+        self.weather_task = None
+        self.chat_advice = None
+        self.chat_advice_at = 0
+        self.chat_last_attempt = -900
+        self.chat_task = None
 
     def save(self):
         tmp = self.config_path.with_suffix('.tmp')
@@ -538,6 +649,118 @@ class Pocket:
                     windows.append({'bucket': name, 'label': label, 'remaining': max(0, min(100, 100-window['usedPercent'])), 'resetsAt': window.get('resetsAt')})
         return windows
 
+    async def refresh_weather(self):
+        """Opt in only with explicit coordinates; cache observations and fail closed."""
+        try:
+            lat = float(os.environ.get('POCKET_WEATHER_LAT', ''))
+            lon = float(os.environ.get('POCKET_WEATHER_LON', ''))
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                return
+        except (ValueError, TypeError):
+            return
+        try:
+            timeout = ClientTimeout(total=5)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.get('https://api.open-meteo.com/v1/forecast', params={
+                    'latitude': lat, 'longitude': lon,
+                    'current': 'temperature_2m,weather_code', 'timezone': 'auto',
+                }) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+            current = data.get('current') or {}
+            temperature = current.get('temperature_2m')
+            code = current.get('weather_code')
+            if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not -90 <= temperature <= 70:
+                return
+            self.weather = {'temperature': temperature, 'code': code}
+            self.weather_at = time.monotonic()
+            self.dirty = True
+        except Exception:
+            # No stale reading is displayed as current; no coordinates are logged.
+            return
+
+    def current_weather(self):
+        if self.weather and time.monotonic() - self.weather_at < 5400:
+            return self.weather
+        return None
+
+    async def refresh_chat_advice(self):
+        if not self.thread:
+            return
+        try:
+            result = await self.rpc.call('thread/turns/list', {
+                'threadId': self.thread, 'limit': 8, 'sortDirection': 'desc', 'itemsView': 'full'
+            })
+            self.chat_advice = chat_history_advice(result.get('data'),time.time())
+            self.chat_advice_at = time.monotonic()
+            self.dirty = True
+        except Exception:
+            # A failed read is not evidence of a task or a valid recommendation.
+            self.chat_advice = None
+            self.chat_advice_at = 0
+
+    def current_chat_advice(self):
+        if self.chat_advice and time.monotonic()-self.chat_advice_at < 1800:
+            return self.chat_advice
+        return None
+
+    def read_personal_context(self):
+        path = self.runtime / 'dashboard-context.json'
+        try:
+            if path.stat().st_size > 16000:
+                return None
+            data = json.loads(path.read_text('utf-8'))
+            return data if isinstance(data,dict) else None
+        except (OSError, ValueError):
+            return None
+
+    async def update_dashboard_context(self, request):
+        # Same loopback + bearer-token policy as the private management console.
+        self.check_console(request)
+        try:
+            source = await request.json()
+            if not isinstance(source,dict):
+                raise ValueError('context must be an object')
+            result = {'updatedAt': time.time()}
+            for key in ('calendar','todos','projects','interests'):
+                values = source.get(key, [])
+                if not isinstance(values,list) or len(values) > 16:
+                    raise ValueError('invalid context list')
+                output = []
+                for value in values:
+                    if not isinstance(value,dict) or not isinstance(value.get('title'),str):
+                        raise ValueError('invalid context item')
+                    title = ' '.join(value['title'].split())[:80]
+                    if not title:
+                        continue
+                    item = {'title': title}
+                    if key == 'calendar':
+                        start = value.get('startAt')
+                        if isinstance(start,bool) or not isinstance(start,(int,float)) or not 0 < start < 4102444800:
+                            raise ValueError('invalid calendar time')
+                        item['startAt'] = start
+                    output.append(item)
+                result[key] = output
+            recommendation = source.get('recommendation')
+            if recommendation is not None:
+                if not isinstance(recommendation,dict) or not isinstance(recommendation.get('text'),str):
+                    raise ValueError('invalid recommendation')
+                text = ' '.join(recommendation['text'].split())[:80]
+                based = recommendation.get('basedOn')
+                if not text or not isinstance(based,list) or not based or len(based)>4 or any(item not in ('calendar','todos','projects','interests') for item in based):
+                    raise ValueError('invalid recommendation sources')
+                result['recommendation'] = {'text':text, 'basedOn':based}
+            path = self.runtime / 'dashboard-context.json'
+            tmp = self.runtime / 'dashboard-context.tmp'
+            with os.fdopen(os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600),'w',encoding='utf-8') as f:
+                json.dump(result,f,ensure_ascii=False)
+            tmp.chmod(0o600)
+            tmp.replace(path)
+            self.dirty = True
+            return web.json_response({'ok':True,'counts':{key:len(result[key]) for key in ('calendar','todos','projects','interests')}},headers={'Cache-Control':'no-store'})
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return web.json_response({'error':'invalid dashboard context'},status=400)
+
     def snapshot(self):
         host_path = self.runtime/'mobile-host.txt'
         roots = ROOT.parent/'certificates'
@@ -557,6 +780,11 @@ class Pocket:
         font = ui_font
         def text(x, y, value, size=14):
             d.text((x,y), str(value), font=font(size), fill=0)
+        def fit(value, size, width=184):
+            value = str(value)
+            while value and d.textlength(value, font=font(size)) > width:
+                value = value[:-1]
+            return value
         def lines(value, y, count=4):
             row = ''
             number = 0
@@ -588,21 +816,40 @@ class Pocket:
                 text(84+i*28,3,'?',12)
         text(145,4,f'{battery}%' if battery is not None else '--%',12)
         d.line((6,25,194,25),fill=0)
-        text(8,29,self.status[:10],20)
         age = int(time.monotonic()-self.last_event)
-        if self.turn and age > 120:
-            text(8,58,f'{age}s 无新事件',13)
-        elif self.draft:
-            text(8,58,'语音草稿：确认后发送',12)
-        else:
+        idle = (self.page == 0 and not self.turn and not self.draft and not self.approvals
+                and (self.status == '待命' or (self.status in ('已完成', '已停止') and age >= 180)))
+        if idle:
+            now = dashboard_time()
             windows = self.remaining()
-            text(8,58,'  '.join(f'{q["label"]}余{q["remaining"]:g}%' for q in windows[:2]) or '订阅额度：未知',12)
-        if self.page == 1:
-            lines(f'累计 token: {self.tokens if self.tokens is not None else "未知"}\n电池: {self.device.get("millivolts", "--")}mV（估算）\n工作目录: {Path(self.config["cwd"]).name}',81)
-        elif self.page == 2:
-            lines('BOOT短按：执行\nBOOT按住1秒：录音\n松开BOOT：结束录音\n双键长按：网页配置',81)
+            weather = self.current_weather()
+            text(8,29,now.strftime('%H:%M'),24)
+            text(116,35,'待命',15)
+            quota = '  '.join(f'{q["label"]}余{q["remaining"]:g}%' for q in windows[:2])
+            text(8,63,quota or '订阅额度：未知',13)
+            text(8,84,dashboard_context(self.context),13)
+            temperature = f'{weather["temperature"]:.0f}°C' if weather else '未配置/未知'
+            text(8,104,'天气：'+temperature,13)
+            personal = personal_advice(self.read_personal_context(), time.time())
+            label, advice = personal or self.current_chat_advice() or ('通用建议', dashboard_advice(now.hour, weather, battery, windows))
+            text(8,126,label,12)
+            text(8,145,fit(advice,13),13)
         else:
-            lines(self.draft or self.detail,81)
+            text(8,29,self.status[:10],20)
+            age = int(time.monotonic()-self.last_event)
+            if self.turn and age > 120:
+                text(8,58,f'{age}s 无新事件',13)
+            elif self.draft:
+                text(8,58,'语音草稿：确认后发送',12)
+            else:
+                windows = self.remaining()
+                text(8,58,'  '.join(f'{q["label"]}余{q["remaining"]:g}%' for q in windows[:2]) or '订阅额度：未知',12)
+            if self.page == 1:
+                lines(f'累计 token: {self.tokens if self.tokens is not None else "未知"}\n电池: {self.device.get("millivolts", "--")}mV（估算）\n工作目录: {Path(self.config["cwd"]).name}',81)
+            elif self.page == 2:
+                lines('BOOT短按：执行\nBOOT按住1秒：录音\n松开BOOT：结束录音\n双键长按：网页配置',81)
+            else:
+                lines(self.draft or self.detail,81)
         d.line((6,166,194,166),fill=0)
         selected = self.menu_items()[self.menu % len(self.menu_items())][0]
         text(8,170,'> '+selected,13)
@@ -615,6 +862,14 @@ class Pocket:
         while True:
             try:
                 now = time.monotonic()
+                if now-self.weather_last_attempt >= 1800:
+                    self.weather_last_attempt = now
+                    if self.weather_task is None or self.weather_task.done():
+                        self.weather_task = asyncio.create_task(self.refresh_weather())
+                if now-self.chat_last_attempt >= 900 and not self.turn and not self.voice_busy:
+                    self.chat_last_attempt = now
+                    if self.chat_task is None or self.chat_task.done():
+                        self.chat_task = asyncio.create_task(self.refresh_chat_advice())
                 if now-last_limits > 120:
                     last_limits = now
                     await self.refresh_limits()
@@ -712,7 +967,8 @@ class Pocket:
         app = web.Application(client_max_size=16000)
         app.add_routes([web.get('/',self.console),web.get('/device',self.websocket),web.get('/healthz',self.health),
                         web.get('/api/state',self.state),web.get('/api/screen',self.preview),
-                        web.post('/api/action',self.command),web.get('/api/connection',self.connection_package)])
+                        web.post('/api/action',self.command),web.get('/api/connection',self.connection_package),
+                        web.post('/api/dashboard-context',self.update_dashboard_context)])
         return app
 
 
