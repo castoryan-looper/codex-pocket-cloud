@@ -101,7 +101,7 @@ static bool portalAuthorized() {
 }
 static int configFailure(JsonDocument &out,int code,const char *error){out["error"]=error;return code;}
 static void deviceConfig(JsonDocument &d){
- d["firmware"]="codex-pocket-0.7.0";d["ssid"]=wifiSsid;d["host"]=remoteHost;d["port"]=remotePort;d["tls"]=tlsEnabled;d["ca"]=rootCa;
+ d["firmware"]="codex-pocket-0.8.0";d["ssid"]=wifiSsid;d["host"]=remoteHost;d["port"]=remotePort;d["tls"]=tlsEnabled;d["ca"]=rootCa;
  d["tokenConfigured"]=remoteToken.length()>0;d["holdMs"]=holdMs;d["recordSeconds"]=recordSeconds;d["refreshMinutes"]=refreshMinutes;
 }
 // Scans run asynchronously. Disconnect STA briefly to avoid driver busy errors,
@@ -140,10 +140,11 @@ static void wifiScanResult(JsonDocument &out){
 }
 static void deviceStatus(JsonDocument &d){
  bool wifi=WiFi.status()==WL_CONNECTED;
+ d["recommendationView"]=remoteRecommendationReader?"reader":remoteRecommendationUi?"home":"";
  d["configurationTransport"]=HWCDC::isPlugged()?"usb":portalActive?"hotspot":wifi?"lan":"none";
  d["configurationHotspotActive"]=(bool)portalActive;d["configurationMode"]=(bool)configModeActive;
  deviceLocationStatus(d);
- d["firmware"]="codex-pocket-0.7.0";d["wifiScanning"]=(wifiScanPhase==1 || wifiScanPhase==2);d["usbConnected"]=HWCDC::isPlugged();d["wifiConnected"]=wifi;d["wifiReason"]=(int)lastWifiDisconnectReason;d["configuredSsid"]=wifiSsid;
+ d["firmware"]="codex-pocket-0.8.0";d["wifiScanning"]=(wifiScanPhase==1 || wifiScanPhase==2);d["usbConnected"]=HWCDC::isPlugged();d["wifiConnected"]=wifi;d["wifiReason"]=(int)lastWifiDisconnectReason;d["configuredSsid"]=wifiSsid;
  d["connectedSsid"]=wifi?WiFi.SSID():"";d["ssidImageReady"]=ssidBitmapValid;d["ip"]=WiFi.localIP().toString();d["gateway"]=WiFi.gatewayIP().toString();
  if(wifi)d["rssi"]=WiFi.RSSI();else d["rssi"]=nullptr;
  if(wifi && netConnected)d["internetReachable"]=true;else d["internetReachable"]=nullptr;

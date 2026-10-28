@@ -275,7 +275,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         method,params=self.p.rpc.call.await_args.args
         self.assertEqual(method,'thread/turns/list')
         self.assertEqual(params['threadId'],'test-thread')
-        self.assertEqual(params['limit'],8)
+        self.assertEqual(params['limit'],12)
         self.assertEqual(params['sortDirection'],'desc')
         self.assertIsNone(self.p.current_chat_advice())
 

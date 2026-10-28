@@ -78,6 +78,7 @@ static volatile uint32_t networkProgressAt=0,networkPackets=0;
 static bool audioStoreReady=false;
 static volatile bool uploadPending=false;
 static volatile bool remoteMulaw8k=false,remoteAutoVoice=false;
+static volatile bool remoteRecommendationUi=false,remoteRecommendationReader=false;
 static uint8_t ssidBitmap[350];
 static bool ssidBitmapValid=false;
 static volatile unsigned uploadRetries=0;
@@ -180,7 +181,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.7.0";
+  doc["firmware"] = "codex-pocket-0.8.0";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -239,6 +240,8 @@ void packet(const String &line) {
     remoteVoiceBusy=doc["voiceBusy"]|false;
     remoteDraftReady=doc["draftReady"]|false;
     remoteAutoVoice=doc["voiceAutoSubmit"]|false;
+    String recommendationView=doc["recommendationView"]|"";
+    remoteRecommendationUi=recommendationView.length()>0;remoteRecommendationReader=recommendationView=="reader";
     remoteMulaw8k=false;
     for(JsonVariant codec : doc["audioCodecs"].as<JsonArray>())
       if(String(codec.as<const char*>())=="mulaw8k")remoteMulaw8k=true;
@@ -289,7 +292,7 @@ void screenTask(void *) {
       previousPortal=configModeActive;previousCloud=cloud;previousUi=ui;previousSecond=second;previousProgress=progress;previousKey=key;previousSsid=connectedSsid;
       if(!configModeActive) {
         if(ui>=0 && ui<12) memcpy(image,ui==UiRecognizing && remoteAutoVoice ? localAutoRecognizing : localScreens[ui],5000);
-        else memcpy(image+186*25,key==1?localFooterBoot:key==2?localFooterPower:localFooter,sizeof(localFooter));
+        else if(!remoteRecommendationUi) memcpy(image+186*25,key==1?localFooterBoot:key==2?localFooterPower:localFooter,sizeof(localFooter));
         if(ui==UiHold) {
           for(int y=148;y<154;y++) for(int x=14;x<14+progress*43;x++) image[y*25+x/8]&=~(0x80>>(x%8));
         }
@@ -313,7 +316,7 @@ void screenTask(void *) {
         for(int y=0;y<24;y++) for(int x=139;x<200;x++) image[y*25+x/8]|=0x80>>(x%8);
         imageAscii(image,145,5,localBattery<0 ? "--%" : String(localBattery)+"%");
       }
-      if(!configModeActive && wifiConnected && (ui==UiIdle || ui==9 || ui==11)) {
+      if(!configModeActive && wifiConnected && ((ui==UiIdle && !remoteRecommendationUi) || ui==9 || ui==11)) {
         // Show the actual SSID even while waiting for the cloud to reconnect.
         int top=ui==UiIdle?186:145;
         for(int y=top;y<top+14;y++)memset(image+y*25,0xff,25);
@@ -577,7 +580,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.7.0";
+      hello["firmware"]="codex-pocket-0.8.0";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       deviceLocationStatus(hello);
@@ -671,7 +674,7 @@ void setup() {
   bootButton.setClickMs(180);powerButton.setClickMs(180);
   bootButton.setPressMs(1000);
   powerButton.setPressMs(1200);
-  bootButton.attachPress([](){if(!configModeActive && !remoteVoiceBusy && localUi!=UiRecognizing && localUi!=UiSending){pressStartedAt=millis();if(netConnected&&online)setLocalUi(UiHold);}});
+  bootButton.attachPress([](){if(!configModeActive && !remoteVoiceBusy && localUi!=UiRecognizing && localUi!=UiSending){pressStartedAt=millis();if(netConnected&&online&&!remoteRecommendationUi)setLocalUi(UiHold);}});
   bootButton.attachClick([](){ if(!configModeActive && !recording){if(localUi==UiHold)setLocalUi(UiIdle);event("b1_click");} });
   bootButton.attachLongPressStart([](){
     if(configModeActive || uploadPending || remoteVoiceBusy || localUi==UiRecognizing || localUi==UiSending)return;
@@ -685,7 +688,7 @@ void setup() {
     else if(localUi==UiLimit)setLocalUi((remoteDraftReady||remoteVoiceBusy)?UiIdle:(audioEndSent?UiRecognizing:UiSending));
   });
   powerButton.attachClick([](){ if(!configModeActive)event("b2_click"); });
-  powerButton.attachLongPressStart([](){ if(configModeActive){portalCloseAt=millis()+100;return;}captureCancelled=true;recording=false;captureRequested=false;setLocalUi(UiCancelled);event("b2_long"); });
+  powerButton.attachLongPressStart([](){ if(configModeActive){portalCloseAt=millis()+100;return;}if(remoteRecommendationReader&&!recording&&!uploadPending){event("b2_long");return;}captureCancelled=true;recording=false;captureRequested=false;setLocalUi(UiCancelled);event("b2_long"); });
   // Do not interpret a held power-on button as a stop command.
   while (digitalRead(PWR_BUTTON_PIN)==LOW) delay(10);
   disconnectedImage();
@@ -708,6 +711,7 @@ void loop() {
   if(buttonGuard){if(!bootDown&&!powerDown){buttonGuard=false;bootButton.reset();powerButton.reset();}}
   else {bootButton.tick();powerButton.tick();}
   loopConfigPortal();
+  if(bootDown&&!powerDown&&!configModeActive&&remoteRecommendationUi&&localUi==UiIdle&&!recording&&!uploadPending&&netConnected&&online&&millis()-pressStartedAt>=250)setLocalUi(UiHold);
   // Short feedback expires locally even when the server is slow.
   if((localUi==UiTooShort || localUi==UiCancelled) && millis()-localUiAt>3000) setLocalUi(UiIdle);
   if(localUi==UiRecognizing && millis()-localUiAt>95000) setLocalUi(UiAudioError);

@@ -28,6 +28,7 @@ from functools import lru_cache
 
 from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
 from PIL import Image, ImageDraw, ImageFont
+from recommendations import Feed, paginate
 
 ROOT = Path(__file__).resolve().parent
 ICONS = json.loads((ROOT/'icons.json').read_text('utf-8'))
@@ -321,6 +322,10 @@ class Pocket:
         self.chat_advice = None
         self.chat_advice_at = 0
         self.chat_last_attempt = -900
+        self.recommendations = Feed(self.runtime / "recommendation-feedback.json")
+        self.recommendation_cards = self.recommendations.pair()
+        self.recommendation_reader = None
+        self.recommendation_generation = 0
         self.chat_task = None
 
     def save(self):
@@ -335,6 +340,8 @@ class Pocket:
             self.status = status
         if detail is not None:
             self.detail = detail[:1000]
+        if self.turn or self.draft or self.approvals or self.voice_busy or self.status not in ('待命','已完成','已停止'):
+            self.recommendation_reader = None
         self.last_event = time.monotonic()
         self.dirty = True
 
@@ -431,6 +438,21 @@ class Pocket:
             return [('查看确认', 'review'), ('拒绝请求', 'decline'), ('停止任务', 'stop')]
         if self.draft:
             return [('发送语音文字', 'send_draft'), ('取消草稿', 'discard'), ('切换页面', 'page')]
+        if self.recommendation_reading():
+            pages = self.recommendation_pages()
+            reader = self.recommendation_reader
+            actions = []
+            last = reader['page'] == len(pages)-1
+            if not last: actions.append(('下一页', 'rec_next'))
+            if last and not reader['context']: actions.append(('执行这条', 'rec_run'))
+            if reader['page'] > 0: actions.append(('上一页', 'rec_prev'))
+            if not last and not reader['context']: actions.append(('执行这条', 'rec_run'))
+            actions += [('返回任务详情' if reader['context'] else '查看话题摘录', 'rec_context'), ('换看 B' if reader['card']==0 else '换看 A', 'rec_other'), ('返回推荐', 'rec_back')]
+            return actions
+        if self.is_idle_dashboard():
+            return [('打开 A', 'rec_a'), ('打开 B', 'rec_b'), ('换一组', 'rec_skip'), ('设备状态', 'rec_status')]
+        if self.page and not self.turn and not self.draft:
+            return [('返回推荐', 'rec_back'), ('切换页面', 'page'), ('刷新额度', 'refresh')]
         return [('切换页面', 'page'), ('继续未完成工作', 'continue'), ('停止任务', 'stop'), ('刷新额度', 'refresh')]
 
     async def action(self, action, payload=None):
@@ -446,7 +468,11 @@ class Pocket:
                 await self.execute(action, payload)
 
     async def execute(self, action, payload):
-        if action in ('stop', 'b2_long'):
+        if action.startswith('rec_'):
+            await self.recommendation_action(action)
+        elif action == 'b2_long' and self.recommendation_reading():
+            self.recommendation_reader = None; self.menu = 0; self.dirty = True
+        elif action in ('stop', 'b2_long'):
             if self.turn:
                 await self.rpc.call('turn/interrupt', {'threadId': self.thread, 'turnId': self.turn})
                 self.changed('正在停止', '等待 Codex 确认停止')
@@ -769,15 +795,71 @@ class Pocket:
             return
         try:
             result = await self.rpc.call('thread/turns/list', {
-                'threadId': self.thread, 'limit': 8, 'sortDirection': 'desc', 'itemsView': 'full'
+                'threadId': self.thread, 'limit': 12, 'sortDirection': 'desc', 'itemsView': 'full'
             })
             self.chat_advice = chat_history_advice(result.get('data'),time.time())
+            before = self.recommendations.topics
+            self.recommendations.update(result.get('data'))
+            if before != self.recommendations.topics and self.recommendation_reader is None:
+                self.recommendation_cards = self.recommendations.pair()
+                self.menu = 0
             self.chat_advice_at = time.monotonic()
             self.dirty = True
         except Exception:
             # A failed read is not evidence of a task or a valid recommendation.
             self.chat_advice = None
             self.chat_advice_at = 0
+
+    def recommendation_reading(self):
+        return self.recommendation_reader is not None and self.status in ('待命','已完成','已停止') and not (self.turn or self.draft or self.approvals or self.voice_busy)
+
+    def recommendation_pages(self):
+        reader = self.recommendation_reader
+        card = self.recommendation_cards[reader['card']]
+        value = (card.context or '这是一条起步建议，目前没有可引用的近期聊天。') if reader['context'] else card.detail
+        font = ui_font(13)
+        return paginate(value, lambda text: font.getlength(text), width=184, rows=5)
+
+    async def recommendation_action(self, action):
+        if self.turn or self.draft or self.approvals or self.voice_busy:
+            raise ValueError('请先处理当前任务、语音或审批')
+        if action in ('rec_a', 'rec_b'):
+            if not self.is_idle_dashboard(): raise ValueError('请先返回待机推荐页')
+            self.recommendation_reader = {'card': int(action=='rec_b'), 'page': 0, 'context': False}
+        elif action == 'rec_back':
+            self.recommendation_reader = None; self.page = 0
+        elif action == 'rec_status':
+            self.recommendation_reader = None; self.page = 1
+        elif action == 'rec_skip':
+            self.recommendations.record(self.recommendation_cards)
+            self.recommendation_cards = self.recommendations.pair()
+            self.recommendation_generation += 1
+        elif not self.recommendation_reading():
+            raise ValueError('请先打开 A 或 B 的任务详情')
+        elif action == 'rec_next':
+            self.recommendation_reader['page'] = min(len(self.recommendation_pages())-1, self.recommendation_reader['page']+1)
+        elif action == 'rec_prev':
+            self.recommendation_reader['page'] = max(0, self.recommendation_reader['page']-1)
+        elif action == 'rec_context':
+            self.recommendation_reader['context'] = not self.recommendation_reader['context']; self.recommendation_reader['page'] = 0
+        elif action == 'rec_other':
+            self.recommendation_reader = {'card': 1-self.recommendation_reader['card'], 'page': 0, 'context': False}
+        elif action == 'rec_run':
+            if self.recommendation_reader['context']: raise ValueError('请返回任务详情再执行')
+            card = self.recommendation_cards[self.recommendation_reader['card']]
+            self.recommendation_reader = None
+            self.recommendations.record(self.recommendation_cards, chosen=card)
+            self.recommendation_cards = self.recommendations.pair()
+            try:
+                await self.submit(card.prompt)
+            except Exception:
+                # Delivery may be uncertain: preserve the exact task for explicit retry, never auto-send twice.
+                self.draft = card.prompt
+                self.changed('待发送', '推荐任务未确认送达，文字已保留；请核对后再发送。')
+                raise
+        else:
+            raise ValueError('未知推荐操作')
+        self.menu = 0; self.dirty = True
 
     def current_chat_advice(self):
         if self.chat_advice and time.monotonic()-self.chat_advice_at < 1800:
@@ -867,9 +949,10 @@ class Pocket:
             d.text((x,y), str(value), font=font(size), fill=0)
         def fit(value, size, width=184):
             value = str(value)
-            while value and d.textlength(value, font=font(size)) > width:
+            if d.textlength(value, font=font(size)) <= width: return value
+            while value and d.textlength(value+'…', font=font(size)) > width:
                 value = value[:-1]
-            return value
+            return value+'…'
         def lines(value, y, count=4):
             row = ''
             number = 0
@@ -903,7 +986,16 @@ class Pocket:
         d.line((6,25,194,25),fill=0)
         age = int(time.monotonic()-self.last_event)
         idle = self.is_idle_dashboard()
-        if idle:
+        if self.recommendation_reading():
+            reader = self.recommendation_reader
+            card = self.recommendation_cards[reader['card']]
+            text(8,30,('A' if reader['card']==0 else 'B')+' · '+('聊天摘录' if reader['context'] else '任务详情'),16)
+            pages = self.recommendation_pages()
+            reader['page'] = min(reader['page'], len(pages)-1)
+            for row, line in enumerate(pages[reader['page']]): text(8,56+row*18,line,13)
+            text(8,149,f"{reader['page']+1}/{len(pages)} 页",11)
+            text(82,149,'PWR 长按返回',11)
+        elif idle:
             location = self.current_location()
             automatic = (self.device.get('location') or {}).get('source') == 'wifi-ip'
             now = dashboard_time(location)
@@ -913,17 +1005,16 @@ class Pocket:
             text(115,37,'待命',13)
             draw_codex_mark(d, 164, 30, 28)
             quota = '  '.join(f'{q["label"]}余{q["remaining"]:g}%' for q in windows[:2])
-            text(8,63,quota or '订阅额度：未知',13)
-            text(8,84,dashboard_context(self.context),13)
+            text(8,78,fit(quota or '订阅额度：未知',11),11)
             temperature = f'{weather["temperature"]:.0f}°C' if weather else '未配置/未知'
             city = location['city'] if location else ('定位中/未知' if automatic else '天气')
-            text(8,104,fit(city,13,110),13)
-            text(124,104,temperature if weather else '--°C',13)
-            text(8,124,weather_description(weather['code']) if weather else '天气暂不可用',12)
-            personal = personal_advice(self.read_personal_context(), time.time())
-            label, advice = personal or self.current_chat_advice() or ('通用建议', dashboard_advice(now.hour, weather, battery, windows))
-            # The source label remains available in the console; city gets its own row.
-            text(8,145,fit(advice,13),13)
+            text(8,58,fit(city,11,100),11)
+            text(110,58,(temperature if weather else '--°C')+' '+(weather_description(weather['code']) if weather else ''),11)
+            for index, card in enumerate(self.recommendation_cards):
+                y = 98+index*33
+                d.rounded_rectangle((6,y,194,y+30),radius=4,outline=0)
+                text(11,y,('A ' if index==0 else 'B ')+fit(card.title.split('：',1)[0],11,164),11)
+                text(12,y+14,fit(card.topic,11,176),11)
         else:
             text(8,29,self.status[:10],20)
             age = int(time.monotonic()-self.last_event)
@@ -935,7 +1026,7 @@ class Pocket:
                 windows = self.remaining()
                 text(8,58,'  '.join(f'{q["label"]}余{q["remaining"]:g}%' for q in windows[:2]) or '订阅额度：未知',12)
             if self.page == 1:
-                lines(f'累计 token: {self.tokens if self.tokens is not None else "未知"}\n电池: {self.device.get("millivolts", "--")}mV（估算）\n工作目录: {Path(self.config["cwd"]).name}',81)
+                lines(f'累计 token: {self.tokens if self.tokens is not None else "未知"}\n{dashboard_context(self.context)}\n电池: {self.device.get("millivolts", "--")}mV（估算）\n工作目录: {Path(self.config["cwd"]).name}',81)
             elif self.page == 2:
                 lines('BOOT短按：执行\nBOOT按住1秒：录音\n松开BOOT：结束录音\n双键长按：网页配置',81)
             else:
@@ -943,7 +1034,7 @@ class Pocket:
         d.line((6,166,194,166),fill=0)
         selected = self.menu_items()[self.menu % len(self.menu_items())][0]
         text(8,170,'> '+selected,13)
-        text(8,188,'PWR 选择   BOOT 执行',10)
+        text(8,188,'PWR 选择 / BOOT 确认' if idle or self.recommendation_reading() else 'PWR 选择   BOOT 执行',10)
         return im
 
     async def tick(self):
@@ -968,7 +1059,7 @@ class Pocket:
                     # Even identical screens carry heartbeat. E-paper only refreshes changed pixels.
                     packet = {'type':'frame', 'data':base64.b64encode(frame).decode(), 'hash':hashlib.sha256(frame).hexdigest()[:12],
                               'state':self.status,'voiceBusy':self.voice_busy,'draftReady':bool(self.draft),
-                              'audioCodecs':['pcm16','mulaw8k'],'voiceAutoSubmit':True,'idleDashboard':self.is_idle_dashboard()}
+                              'audioCodecs':['pcm16','mulaw8k'],'voiceAutoSubmit':True,'idleDashboard':self.is_idle_dashboard(),'recommendationView':'reader' if self.recommendation_reading() else 'home' if self.is_idle_dashboard() else ''}
                     for peer in list(self.peers.values()):
                         with contextlib.suppress(Exception):
                             await peer.send_json(packet)
