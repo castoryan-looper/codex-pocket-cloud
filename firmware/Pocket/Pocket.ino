@@ -241,7 +241,7 @@ void packet(const String &line) {
     String state=doc["state"]|"";
     // Ignore delayed cloud "recording" screens until local capture/upload is over.
     if(audioEndSent && localUi==UiRecognizing) {
-      bool finalState=remoteVoiceBusy || remoteDraftReady || state=="ʶ������" || state=="������" || state=="����ʧ��" || state=="¼��ʧ��" || state=="¼��̫��";
+      bool finalState=remoteVoiceBusy || remoteDraftReady || state=="识别语音" || state=="待发送" || state=="语音失败" || state=="录音失败" || state=="录音太短";
       bool oldGateway=state.length()==0 && millis()-localUiAt>1500;
       if(finalState || oldGateway) setLocalUi(UiIdle);
     }

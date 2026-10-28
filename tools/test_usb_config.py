@@ -14,12 +14,12 @@ class FakeDevice:
     def rpc(self, method, body=None):
         self.calls.append((method, body))
         if self.offline:
-            raise OSError('USB �ѶϿ�')
+            raise OSError('USB 已断开')
         if method == 'scan_start':
             return 200, {'state': 'scanning'}
         if method == 'scan_results':
-            return 200, {'state': 'done', 'networks': [{'ssid': '��������', 'rssi': -45, 'channel': 1, 'secure': True}]}
-        return 200, {'firmware': 'test', 'wifiConnected': True, 'connectedSsid': '��������'}
+            return 200, {'state': 'done', 'networks': [{'ssid': '测试网络', 'rssi': -45, 'channel': 1, 'secure': True}]}
+        return 200, {'firmware': 'test', 'wifiConnected': True, 'connectedSsid': '测试网络'}
 
 
 class UsbWebTests(unittest.TestCase):
@@ -48,7 +48,7 @@ class UsbWebTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(data['deviceConnected'])
         self.assertTrue(data['usbProxy'])
-        self.assertEqual(data['connectedSsid'], '��������')
+        self.assertEqual(data['connectedSsid'], '测试网络')
         self.assertEqual(self.device.calls, [('status', None)])
 
     def test_access_key_required(self):
@@ -81,7 +81,7 @@ class UsbWebTests(unittest.TestCase):
         self.assertEqual(json.loads(body)['state'], 'scanning')
         status, body = self.request('/api/wifi/scan')
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)['networks'][0]['ssid'], '��������')
+        self.assertEqual(json.loads(body)['networks'][0]['ssid'], '测试网络')
         self.assertEqual(self.device.calls, [('scan_start', None), ('scan_results', None)])
 
     def test_bad_or_oversize_body_never_reaches_device(self):
@@ -109,7 +109,7 @@ class FragmentedSerial:
         if not data.endswith(b'\n'):
             return len(data)
         request = json.loads(self.received)
-        response = 'POCKET_USB ' + json.dumps({'id': request['id'], 'status': 200, 'data': {'ssid': '����'}}, ensure_ascii=False) + '\n'
+        response = 'POCKET_USB ' + json.dumps({'id': request['id'], 'status': 200, 'data': {'ssid': '测试'}}, ensure_ascii=False) + '\n'
         raw = response.encode()
         self.parts = [b'boot log\n', raw[:8], raw[8:21], raw[21:]]
 
@@ -121,16 +121,16 @@ class SerialTests(unittest.TestCase):
     def test_partial_serial_response_and_boot_noise(self):
         link = DeviceLink()
         link.connection = FragmentedSerial()
-        self.assertEqual(link.rpc('get'), (200, {'ssid': '����'}))
+        self.assertEqual(link.rpc('get'), (200, {'ssid': '测试'}))
 
     def test_long_config_is_sent_in_bounded_chunks(self):
         link = DeviceLink()
         fake = FragmentedSerial()
         link.connection = fake
-        self.assertEqual(link.rpc('save', {'ssid':'����', 'ca':'x'*2000}), (200, {'ssid':'����'}))
+        self.assertEqual(link.rpc('save', {'ssid':'测试', 'ca':'x'*2000}), (200, {'ssid':'测试'}))
         self.assertGreater(len(fake.chunks), 1)
         self.assertLessEqual(max(fake.chunks), 64)
-        self.assertEqual(json.loads(fake.received)['body']['ssid'], '����')
+        self.assertEqual(json.loads(fake.received)['body']['ssid'], '测试')
 
 
 if __name__ == '__main__':

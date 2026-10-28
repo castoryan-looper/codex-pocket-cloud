@@ -55,17 +55,17 @@ class Tests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_audio_codec_is_rejected(self):
         await self.p.device_packet({'type':'audio_start','codec':'unsupported'},'wifi')
         self.assertNotIn('wifi',self.p.audio)
-        self.assertEqual(self.p.status,'¼��ʧ��')
+        self.assertEqual(self.p.status,'录音失败')
 
     async def test_real_event_lifecycle(self):
         p = self.p
         await p.notification({'method':'turn/started','params':{'threadId':p.thread,'turn':{'id':'turn-1'}}})
         self.assertEqual(p.turn,'turn-1')
-        await p.notification({'method':'item/agentMessage/delta','params':{'threadId':p.thread,'delta':'���'}})
+        await p.notification({'method':'item/agentMessage/delta','params':{'threadId':p.thread,'delta':'完成'}})
         await p.notification({'method':'turn/completed','params':{'threadId':p.thread,'turn':{'id':'turn-1','status':'completed'}}})
         self.assertIsNone(p.turn)
-        self.assertEqual(p.status,'�����')
-        self.assertEqual(p.detail,'���')
+        self.assertEqual(p.status,'已完成')
+        self.assertEqual(p.detail,'完成')
 
     async def test_foreign_thread_ignored(self):
         await self.p.notification({'method':'turn/started','params':{'threadId':'another','turn':{'id':'wrong'}}})
@@ -75,7 +75,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         request={'id':99,'method':'item/commandExecution/requestApproval','params':{'threadId':self.p.thread,'command':'test command'}}
         await self.p.notification(request)
         self.p.rpc.send.assert_not_awaited()
-        self.assertEqual(self.p.status,'�ȴ�ȷ��')
+        self.assertEqual(self.p.status,'等待确认')
         await self.p.action('decline')
         self.p.rpc.send.assert_awaited_once_with({'id':99,'result':{'decision':'decline'}})
 
@@ -106,9 +106,9 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         p.audio['usb']=bytearray(640000)
         await p.device_packet({'type':'audio_chunk','data':base64.b64encode(b'xx').decode()},'usb')
         self.assertNotIn('usb',p.audio)
-        self.assertEqual(p.status,'¼��ʧ��')
-        await p.action('draft',{'text':'�޸�һ���ļ�'})
-        self.assertEqual(p.draft,'�޸�һ���ļ�')
+        self.assertEqual(p.status,'录音失败')
+        await p.action('draft',{'text':'修改一个文件'})
+        self.assertEqual(p.draft,'修改一个文件')
         p.rpc.call.assert_not_awaited()
 
     async def test_cancelled_push_to_talk_never_starts_transcription(self):
@@ -119,7 +119,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             recognize.assert_not_awaited()
         self.assertNotIn('wifi-test', self.p.audio)
-        self.assertEqual(self.p.status, '��ȡ��')
+        self.assertEqual(self.p.status, '已取消')
 
     async def test_new_recording_does_not_mix_with_pending_transcription(self):
         self.p.voice_busy = True
@@ -135,14 +135,14 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         peer = SimpleNamespace(send_json=AsyncMock())
         self.p.peers = {'wifi-test': peer}
         self.p.voice_busy = True
-        self.p.status = 'ʶ������'
+        self.p.status = '识别语音'
         with patch('bridge.asyncio.sleep', side_effect=asyncio.CancelledError):
             with self.assertRaises(asyncio.CancelledError):
                 await self.p.tick()
         frame = peer.send_json.await_args.args[0]
         self.assertEqual(frame['type'], 'frame')
         self.assertEqual(len(base64.b64decode(frame['data'])), 5000)
-        self.assertEqual(frame['state'], 'ʶ������')
+        self.assertEqual(frame['state'], '识别语音')
         self.assertTrue(frame['voiceBusy'])
         self.assertIn('mulaw8k',frame['audioCodecs'])
 
@@ -183,17 +183,17 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('error',msg)
 
     async def test_short_recording_leaves_recording_state(self):
-        self.p.status='¼����'
+        self.p.status='录音中'
         await self.p.transcribe(b'\0'*1000)
-        self.assertEqual(self.p.status,'¼��̫��')
+        self.assertEqual(self.p.status,'录音太短')
         self.assertFalse(self.p.voice_busy)
 
     async def test_incomplete_audio_is_rejected(self):
         await self.p.device_packet({'type':'audio_start'},'usb')
         self.p.audio['usb'].extend(b'\0'*1024)
         await self.p.device_packet({'type':'audio_end','bytes':2048},'usb')
-        self.assertEqual(self.p.status,'¼��ʧ��')
-        self.assertIn('���䲻����',self.p.detail)
+        self.assertEqual(self.p.status,'录音失败')
+        self.assertIn('传输不完整',self.p.detail)
 
     def test_battery_noise_does_not_change_screen(self):
         self.p.device['battery']=90

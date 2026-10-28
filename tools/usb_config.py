@@ -39,7 +39,7 @@ class DeviceLink:
                     ports = [p.device for p in list_ports.comports() if p.vid == 0x303A]
                     selected = self.port or (ports[0] if len(ports) == 1 else None)
                     if not selected:
-                        raise OSError('����� ESP32 USB �����ߣ���⵽����ʱ��ָ������')
+                        raise OSError('请插入 ESP32 USB 数据线；检测到多块板时请指定串口')
                     connection = serial.Serial()
                     connection.port = selected
                     connection.baudrate = 115200
@@ -79,7 +79,7 @@ class DeviceLink:
                         continue
                     if response.get('id') == request_id:
                         return response['status'], response['data']
-                raise OSError('�豸δ��Ӧ����ȷ����ˢ��֧�� USB ���õĹ̼������ر��������ڹ���')
+                raise OSError('设备未响应，请确认已刷入支持 USB 配置的固件，并关闭其他串口工具')
             except (OSError, serial.SerialException):
                 self.close()
                 raise
@@ -113,14 +113,14 @@ class ConfigHandler(BaseHTTPRequestHandler):
         port = self.server.server_port
         hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
         if self.headers.get('Host') not in hosts:
-            self.reply(403, {'error': '��ͨ���������õ�ַ����'})
+            self.reply(403, {'error': '请通过本机配置地址访问'})
             return False
         origin = self.headers.get('Origin')
         if origin and origin not in {'http://' + host for host in hosts}:
-            self.reply(403, {'error': '��������վ�����豸����'})
+            self.reply(403, {'error': '不允许跨站访问设备配置'})
             return False
         if authentication and not hmac.compare_digest(self.headers.get('X-Setup-Key', ''), self.server.key):
-            self.reply(401, {'error': '���������� USB ���ù��ߴ�ҳ��'})
+            self.reply(401, {'error': '请重新运行 USB 配置工具打开页面'})
             return False
         return True
 
@@ -155,7 +155,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
         elif path == '/api/wifi/scan':
             self.dispatch('scan_results')
         else:
-            self.reply(404, {'error': 'û�����ҳ��'})
+            self.reply(404, {'error': '没有这个页面'})
 
     def do_POST(self):
         if not self.trusted_request():
@@ -163,13 +163,13 @@ class ConfigHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get('Content-Length', '0'))
             if length <= 0 or length > 12000:
-                self.reply(413, {'error': '�������ݴ�С����ȷ'})
+                self.reply(413, {'error': '配置内容大小不正确'})
                 return
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise ValueError()
         except (ValueError, UnicodeError):
-            self.reply(400, {'error': '���ø�ʽ����'})
+            self.reply(400, {'error': '配置格式错误'})
             return
         if self.path == '/api/config':
             self.dispatch('save', body)
@@ -180,11 +180,11 @@ class ConfigHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/test-upload':
             self.dispatch('test_upload')
         else:
-            self.reply(404, {'error': 'USB ��֧���豸���ú�״̬��ѯ'})
+            self.reply(404, {'error': 'USB 仅支持设备配置和状态查询'})
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Codex Pocket USB ������ҳ')
+    parser = argparse.ArgumentParser(description='Codex Pocket USB 配置网页')
     parser.add_argument('--port', type=int, default=8788)
     parser.add_argument('--serial-port')
     parser.add_argument('--open', action='store_true')
