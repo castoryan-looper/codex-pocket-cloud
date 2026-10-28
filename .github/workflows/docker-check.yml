@@ -10,6 +10,7 @@ on:
       - bridge/**
       - deploy/docker.sh
       - .github/workflows/docker-check.yml
+      - .github/fixtures/**
   workflow_dispatch:
 permissions:
   contents: read
@@ -56,11 +57,19 @@ jobs:
       - name: Check real ingress entrypoint with runtime restrictions
         run: |
           docker run -d --name pocket-ingress-smoke --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /data --tmpfs /config --tmpfs /trust --tmpfs /tmp -e POCKET_PUBLIC_HOST=43.160.215.253 pocket-ingress:check
-          trap 'docker logs pocket-ingress-smoke; docker rm -f pocket-ingress-smoke' EXIT
+          trap 'docker logs pocket-ingress-smoke; docker rm -f pocket-route-upstream pocket-ingress-smoke' EXIT
+          docker run -d --name pocket-route-upstream --network container:pocket-ingress-smoke --user 10001:10001 --cap-drop ALL --security-opt no-new-privileges --read-only -v "$PWD/.github/fixtures/route-upstream.py:/fixture.py:ro" --entrypoint python pocket-gateway:check -B /fixture.py
+          status() {
+            docker exec pocket-ingress-smoke curl --silent --show-error --noproxy '*' --cacert /trust/root.crt --resolve 43.160.215.253:8443:127.0.0.1 --output /dev/null --write-out '%{http_code}' "https://43.160.215.253:8443$1"
+          }
           ready=false
           for attempt in $(seq 1 30); do
-            code=$(docker exec pocket-ingress-smoke curl --silent --show-error --noproxy '*' --cacert /trust/root.crt --resolve 43.160.215.253:8443:127.0.0.1 --output /dev/null --write-out '%{http_code}' https://43.160.215.253:8443/not-a-route || true)
-            if [ "$code" = 404 ]; then ready=true; break; fi
+            code=$(status /healthz || true)
+            if [ "$code" = 200 ]; then ready=true; break; fi
             sleep 1
           done
           [ "$ready" = true ]
+          [ "$(status /device)" = 418 ]
+          [ "$(status /not-a-route)" = 404 ]
+          [ "$(status /api/connection)" = 404 ]
+          [ "$(status /api/state)" = 404 ]

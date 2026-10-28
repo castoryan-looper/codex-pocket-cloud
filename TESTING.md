@@ -25,3 +25,5 @@
 2026-10-27：修复私有卷 chown 后受限 root 缺少 FOWNER 而无法 chmod 的初始化错误，改由卷所有者 UID 10001 执行 chmod，不增加容器 capability。24 项本地软件测试和入口脚本语法检查通过。CI 新增真实入口 self-test，连续两次验证已有命名卷初始化、700 权限与非 root 写入。
 
 2026-10-28：服务器日志确认 gateway 正常，ingress 在执行 Caddy 二进制时报 EPERM。核对官方 2.11.7-alpine Dockerfile，二进制带 cap_net_bind_service=ep，与运行时 cap_drop=ALL 冲突。派生镜像在构建时删除不需要的文件 capability，保留运行时全部 cap_drop 和 no-new-privileges。CI 增加在相同限制下执行版本、配置校验、真实入口私有 CA/TLS 404 握手检查。本地没有 Docker 引擎，尚未声称此容器运行测试已通过。
+
+2026-10-28：修复 Caddy 默认指令排序使兜底 respond 404 提前遮蔽 reverse_proxy 的错误，Docker 与原生配置均改为互斥 handle 路由。使用实际 Caddy 2.11.7 与实际 aiohttp 网关应用进行本地集成测试：可信 CA/IP SAN 校验开启，/healthz 返回 200 与真实 JSON，/device WebSocket 返回 101 并成功传入带设备 token 的 hello，/api/state、/api/connection、根路径与未知路径均保持 404。CI 增加可区分健康、设备与兜底路径的真实上游夹具，避免只检查 404 就误判路由正确。本地集成不等于已验证服务器 Docker 与 ESP32。

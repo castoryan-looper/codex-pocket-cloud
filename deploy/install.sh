@@ -206,10 +206,16 @@ $TLS_ISSUER_OPTIONS
     }
   }
   @device path /device
-  reverse_proxy @device 127.0.0.1:8787
+  handle @device {
+    reverse_proxy 127.0.0.1:8787
+  }
   @health path /healthz
-  reverse_proxy @health 127.0.0.1:8787
-  respond 404
+  handle @health {
+    reverse_proxy 127.0.0.1:8787
+  }
+  handle {
+    respond 404
+  }
 }
 CADDY
 chmod 644 /etc/codex-pocket/Caddyfile
