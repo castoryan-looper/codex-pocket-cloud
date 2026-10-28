@@ -221,7 +221,7 @@ class Pocket:
         if 'id' in msg:
             if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput'):
                 self.approvals.append(msg)
-                self.changed('等待确认', p.get('command') or p.get('reason') or '请在电脑查看完整请求')
+                self.changed('等待确认', p.get('command') or p.get('reason') or '请在管理网页查看完整请求')
             else:
                 # Unsupported permission/auth/tool requests must never be silently accepted.
                 await self.rpc.send({'id': msg['id'], 'error': {'code': -32601, 'message': 'Unsupported by hardware client'}})
@@ -313,7 +313,7 @@ class Pocket:
         elif action == 'refresh':
             await self.refresh_limits()
         elif action == 'review':
-            self.changed('等待电脑确认', '完整命令在电脑控制台；设备可拒绝或停止')
+            self.changed('等待操作确认', '完整命令在管理网页；设备可拒绝或停止')
         elif action in ('accept', 'decline'):
             await self.decide(action, payload.get('answers'))
         elif action == 'draft':
@@ -372,6 +372,10 @@ class Pocket:
             except Exception as exc:
                 self.changed(detail=str(exc))
         elif kind == 'audio_start':
+            if self.voice_busy:
+                self.changed(detail='上一段语音仍在识别，请稍候')
+                return
+            self.draft = ''
             self.audio[source] = bytearray()
             self.changed('录音中', f'松开 BOOT 结束，最长 {msg.get("maxSeconds",20)} 秒')
         elif kind == 'audio_chunk':
@@ -386,8 +390,10 @@ class Pocket:
         elif kind == 'audio_end':
             data = self.audio.pop(source, None)
             if data is not None:
-                if msg.get('error'):
-                    self.changed('录音失败','麦克风采集失败，请重试')
+                if msg.get('cancelled'):
+                    self.changed('已取消', '录音已取消，未提交识别')
+                elif msg.get('error'):
+                    self.changed('录音失败','麦克风采集或上传队列中断，请重试')
                 elif msg.get('bytes') is not None and msg['bytes'] != len(data):
                     self.changed('录音失败','音频传输不完整，请重试')
                 else:
@@ -538,7 +544,7 @@ class Pocket:
         if self.page == 1:
             lines(f'累计 token: {self.tokens if self.tokens is not None else "未知"}\n电池: {self.device.get("millivolts", "--")}mV（估算）\n工作目录: {Path(self.config["cwd"]).name}',81)
         elif self.page == 2:
-            lines('BOOT短按：执行\nBOOT长按：进入录音\n松开BOOT：结束录音\n双键长按：网页配置',81)
+            lines('BOOT短按：执行\nBOOT按住1秒：录音\n松开BOOT：结束录音\n双键长按：网页配置',81)
         else:
             lines(self.draft or self.detail,81)
         d.line((6,166,194,166),fill=0)
@@ -559,7 +565,8 @@ class Pocket:
                 if now-last_frame_at > (0.35 if self.dirty else 4):
                     frame = self.render().tobytes()
                     # Even identical screens carry heartbeat. E-paper only refreshes changed pixels.
-                    packet = {'type':'frame', 'data':base64.b64encode(frame).decode(), 'hash':hashlib.sha256(frame).hexdigest()[:12]}
+                    packet = {'type':'frame', 'data':base64.b64encode(frame).decode(), 'hash':hashlib.sha256(frame).hexdigest()[:12],
+                              'state':self.status,'voiceBusy':self.voice_busy,'draftReady':bool(self.draft)}
                     for peer in list(self.peers.values()):
                         with contextlib.suppress(Exception):
                             await peer.send_json(packet)

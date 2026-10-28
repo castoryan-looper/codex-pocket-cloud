@@ -78,6 +78,40 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.draft,'修改一个文件')
         p.rpc.call.assert_not_awaited()
 
+    async def test_cancelled_push_to_talk_never_starts_transcription(self):
+        await self.p.device_packet({'type': 'audio_start'}, 'wifi-test')
+        self.p.audio['wifi-test'].extend(b'\0' * 9600)
+        with patch.object(self.p, 'transcribe', new_callable=AsyncMock) as recognize:
+            await self.p.device_packet({'type': 'audio_end', 'bytes': 9600, 'cancelled': True, 'error': 'cancelled'}, 'wifi-test')
+            await asyncio.sleep(0)
+            recognize.assert_not_awaited()
+        self.assertNotIn('wifi-test', self.p.audio)
+        self.assertEqual(self.p.status, '已取消')
+
+    async def test_new_recording_does_not_mix_with_pending_transcription(self):
+        self.p.voice_busy = True
+        await self.p.device_packet({'type': 'audio_start'}, 'wifi-test')
+        self.assertNotIn('wifi-test', self.p.audio)
+        self.p.voice_busy = False
+        self.p.draft = 'previous draft'
+        await self.p.device_packet({'type': 'audio_start'}, 'wifi-test')
+        self.assertEqual(self.p.draft, '')
+        self.assertEqual(self.p.audio['wifi-test'], bytearray())
+
+    async def test_frames_expose_voice_state_without_changing_bitmap_protocol(self):
+        peer = SimpleNamespace(send_json=AsyncMock())
+        self.p.peers = {'wifi-test': peer}
+        self.p.voice_busy = True
+        self.p.status = '识别语音'
+        with patch('bridge.asyncio.sleep', side_effect=asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.p.tick()
+        frame = peer.send_json.await_args.args[0]
+        self.assertEqual(frame['type'], 'frame')
+        self.assertEqual(len(base64.b64decode(frame['data'])), 5000)
+        self.assertEqual(frame['state'], '识别语音')
+        self.assertTrue(frame['voiceBusy'])
+
     def test_unknown_quota_not_zero_and_no_fake_tokens(self):
         self.assertEqual(self.p.remaining(),[])
         self.assertIsNone(self.p.tokens)
