@@ -68,6 +68,54 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(self.p.device['wifiConnected'])
             await ws.close()
 
+    async def test_websocket_compressed_audio_is_decoded_before_recognition(self):
+        import asyncio, base64
+        from unittest.mock import AsyncMock
+        from aiohttp.test_utils import TestClient,TestServer
+        async with TestClient(TestServer(self.p.app())) as client:
+            with patch.object(self.p,'transcribe',new_callable=AsyncMock) as recognize:
+                ws=await client.ws_connect('/device',protocols=('arduino',))
+                await ws.send_json({'type':'hello','token':self.p.config['device_token']})
+                await ws.send_json({'type':'audio_start','codec':'mulaw8k'})
+                await ws.send_json({'type':'audio_chunk','data':base64.b64encode(bytes([255])*4000).decode()})
+                await ws.send_json({'type':'audio_end','bytes':16000})
+                for _ in range(20):
+                    if recognize.await_count:break
+                    await asyncio.sleep(.02)
+                recognize.assert_awaited_once_with(bytes(16000))
+                await ws.close()
+
+    async def test_disconnect_discards_partial_audio_before_retry(self):
+        import asyncio, base64
+        from unittest.mock import AsyncMock
+        from aiohttp.test_utils import TestClient,TestServer
+        async with TestClient(TestServer(self.p.app())) as client:
+            with patch.object(self.p,'transcribe',new_callable=AsyncMock) as recognize:
+                ws=await client.ws_connect('/device',protocols=('arduino',))
+                await ws.send_json({'type':'hello','token':self.p.config['device_token']})
+                await ws.send_json({'type':'audio_start','codec':'mulaw8k'})
+                await ws.send_json({'type':'audio_chunk','data':base64.b64encode(bytes([255])*1000).decode()})
+                for _ in range(20):
+                    if self.p.audio and len(next(iter(self.p.audio.values())))==1000:break
+                    await asyncio.sleep(.02)
+                self.assertTrue(self.p.audio)
+                await ws.close()
+                for _ in range(20):
+                    if not self.p.audio:break
+                    await asyncio.sleep(.02)
+                self.assertFalse(self.p.audio)
+                self.assertFalse(self.p.audio_codecs)
+                ws=await client.ws_connect('/device',protocols=('arduino',))
+                await ws.send_json({'type':'hello','token':self.p.config['device_token']})
+                await ws.send_json({'type':'audio_start','codec':'mulaw8k'})
+                await ws.send_json({'type':'audio_chunk','data':base64.b64encode(bytes([255])*4000).decode()})
+                await ws.send_json({'type':'audio_end','bytes':16000})
+                for _ in range(20):
+                    if recognize.await_count:break
+                    await asyncio.sleep(.02)
+                recognize.assert_awaited_once_with(bytes(16000))
+                await ws.close()
+
     def test_font_override_is_explicit(self):
         test_font=self.directory/'font.ttc';test_font.touch()
         with patch.dict(os.environ,{'POCKET_FONT':str(test_font)}):

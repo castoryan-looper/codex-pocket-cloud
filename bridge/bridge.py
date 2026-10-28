@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import struct
 import time
 import wave
 from functools import lru_cache
@@ -27,6 +28,18 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parent
 ICONS = json.loads((ROOT/'icons.json').read_text('utf-8'))
 LOG = logging.getLogger('pocket')
+
+
+def _ulaw_sample(value):
+    value = (~value) & 0xff
+    magnitude = (((value & 15) << 3) + 132) << ((value >> 4) & 7)
+    return 132 - magnitude if value & 128 else magnitude - 132
+
+# The device sends 8 kHz G.711 mu-law. Duplicate samples to restore 16 kHz PCM
+# expected by the existing speech pipeline; each byte represents four PCM bytes.
+_MULAW_16K = tuple(struct.pack('<hh', _ulaw_sample(i), _ulaw_sample(i)) for i in range(256))
+def decode_mulaw8k(data):
+    return b''.join(_MULAW_16K[byte] for byte in data)
 
 
 def font_path():
@@ -77,7 +90,7 @@ class Rpc:
 
     async def send(self, msg):
         if self.process.returncode is not None:
-            raise RuntimeError('Codex app-server 已退出，请重启桥接')
+            raise RuntimeError('Codex app-server ���˳����������Ž�')
         self.process.stdin.write((json.dumps(msg, ensure_ascii=False) + '\n').encode())
         await self.process.stdin.drain()
 
@@ -115,7 +128,7 @@ class Rpc:
         finally:
             for future in list(self.pending.values()):
                 if not future.done():
-                    future.set_exception(RuntimeError('Codex app-server 连接断开'))
+                    future.set_exception(RuntimeError('Codex app-server ���ӶϿ�'))
             await self.notify({'method': 'pocket/disconnected'})
 
     async def drain_errors(self):
@@ -145,8 +158,8 @@ class Pocket:
         self.rpc = Rpc(self.notification)
         self.thread = self.config.get('thread_id')
         self.turn = None
-        self.status = '启动中'
-        self.detail = '正在连接 Codex'
+        self.status = '������'
+        self.detail = '�������� Codex'
         self.last_event = time.monotonic()
         self.rate = None
         self.rate_at = 0
@@ -160,6 +173,7 @@ class Pocket:
         self.device = {}
         self.peers = {}
         self.audio = {}
+        self.audio_codecs = {}
         self.voice_busy = False
         self.whisper_model = None
         self.action_lock = asyncio.Lock()
@@ -186,7 +200,7 @@ class Pocket:
         await self.rpc.start()
         account = await self.rpc.call('account/read', {'refreshToken': False})
         if not account.get('account'):
-            raise RuntimeError('Codex CLI 未登录。请运行 codex login 后重启。')
+            raise RuntimeError('Codex CLI δ��¼�������� codex login ��������')
         params = {'cwd': self.config['cwd'], 'approvalPolicy': 'on-request', 'sandbox': 'workspace-write'}
         if self.thread:
             try:
@@ -194,13 +208,13 @@ class Pocket:
                 self.thread = result['thread']['id']
             except Exception:
                 LOG.exception('Cannot resume hardware session')
-                raise RuntimeError('保存的硬件会话恢复失败；保留记录，请检查 CLI 登录与权限。')
+                raise RuntimeError('�����Ӳ���Ự�ָ�ʧ�ܣ�������¼������ CLI ��¼��Ȩ�ޡ�')
         else:
             result = await self.rpc.call('thread/start', params)
             self.thread = result['thread']['id']
             self.config['thread_id'] = self.thread
             self.save()
-        self.changed('待命', '按住 BOOT 说话；短按执行菜单')
+        self.changed('����', '��ס BOOT ˵�����̰�ִ�в˵�')
         await self.refresh_limits()
         self.tasks = [asyncio.create_task(self.tick())]
         LOG.info('Hardware session: %s', self.thread)
@@ -221,7 +235,7 @@ class Pocket:
         if 'id' in msg:
             if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput'):
                 self.approvals.append(msg)
-                self.changed('等待确认', p.get('command') or p.get('reason') or '请在管理网页查看完整请求')
+                self.changed('�ȴ�ȷ��', p.get('command') or p.get('reason') or '���ڹ�����ҳ�鿴��������')
             else:
                 # Unsupported permission/auth/tool requests must never be silently accepted.
                 await self.rpc.send({'id': msg['id'], 'error': {'code': -32601, 'message': 'Unsupported by hardware client'}})
@@ -229,19 +243,19 @@ class Pocket:
         if method == 'turn/started':
             self.turn = p['turn']['id']
             self.reply = ''
-            self.changed('工作中', 'Codex 已开始执行')
+            self.changed('������', 'Codex �ѿ�ʼִ��')
         elif method == 'turn/completed':
             self.turn = None
             self.approvals.clear()
             turn = p.get('turn', {})
             state = turn.get('status')
-            self.changed({'completed': '已完成', 'interrupted': '已停止', 'failed': '出错'}.get(state, state),
-                         (turn.get('error') or {}).get('message') or self.reply[-400:] or '本轮已结束')
+            self.changed({'completed': '�����', 'interrupted': '��ֹͣ', 'failed': '����'}.get(state, state),
+                         (turn.get('error') or {}).get('message') or self.reply[-400:] or '�����ѽ���')
         elif method == 'item/started':
             item = p.get('item', {})
-            names = {'commandExecution': '执行命令', 'fileChange': '修改文件', 'webSearch': '搜索资料',
-                     'mcpToolCall': '调用工具', 'reasoning': '思考中', 'agentMessage': '生成回复'}
-            self.changed('工作中', item.get('command') or names.get(item.get('type'), item.get('type', '处理任务')))
+            names = {'commandExecution': 'ִ������', 'fileChange': '�޸��ļ�', 'webSearch': '��������',
+                     'mcpToolCall': '���ù���', 'reasoning': '˼����', 'agentMessage': '���ɻظ�'}
+            self.changed('������', item.get('command') or names.get(item.get('type'), item.get('type', '��������')))
         elif method == 'item/agentMessage/delta':
             self.reply = (self.reply + p.get('delta', ''))[-12000:]
             self.changed(detail=self.reply[-400:])
@@ -264,16 +278,16 @@ class Pocket:
             self.approvals = [a for a in self.approvals if a['id'] != p.get('requestId')]
             self.dirty = True
         elif method == 'error':
-            self.changed('出错', (p.get('error') or {}).get('message', 'Codex 请求失败'))
+            self.changed('����', (p.get('error') or {}).get('message', 'Codex ����ʧ��'))
         elif method == 'pocket/disconnected':
-            self.changed('连接断开', 'Codex 服务退出，请重启桥接')
+            self.changed('���ӶϿ�', 'Codex �����˳����������Ž�')
 
     def menu_items(self):
         if self.approvals:
-            return [('查看确认', 'review'), ('拒绝请求', 'decline'), ('停止任务', 'stop')]
+            return [('�鿴ȷ��', 'review'), ('�ܾ�����', 'decline'), ('ֹͣ����', 'stop')]
         if self.draft:
-            return [('发送语音文字', 'send_draft'), ('取消草稿', 'discard'), ('切换页面', 'page')]
-        return [('切换页面', 'page'), ('继续未完成工作', 'continue'), ('停止任务', 'stop'), ('刷新额度', 'refresh')]
+            return [('������������', 'send_draft'), ('ȡ���ݸ�', 'discard'), ('�л�ҳ��', 'page')]
+        return [('�л�ҳ��', 'page'), ('����δ��ɹ���', 'continue'), ('ֹͣ����', 'stop'), ('ˢ�¶��', 'refresh')]
 
     async def action(self, action, payload=None):
         payload = payload or {}
@@ -291,11 +305,11 @@ class Pocket:
         if action in ('stop', 'b2_long'):
             if self.turn:
                 await self.rpc.call('turn/interrupt', {'threadId': self.thread, 'turnId': self.turn})
-                self.changed('正在停止', '等待 Codex 确认停止')
+                self.changed('����ֹͣ', '�ȴ� Codex ȷ��ֹͣ')
             elif self.approvals:
                 await self.decide('decline')
         elif action == 'continue':
-            await self.submit('请继续本会话中尚未完成的工作。先核对完成情况；如果已经全部完成，直接说明结果，不要重复执行或制造新任务。遇到阻塞请明确说明。')
+            await self.submit('��������Ự����δ��ɵĹ������Ⱥ˶�������������Ѿ�ȫ����ɣ�ֱ��˵���������Ҫ�ظ�ִ�л�����������������������ȷ˵����')
         elif action == 'send':
             await self.submit(str(payload.get('text', '')).strip())
         elif action == 'send_draft':
@@ -306,26 +320,26 @@ class Pocket:
         elif action == 'discard':
             self.draft = ''
             self.menu = 0
-            self.changed(detail='已取消语音草稿')
+            self.changed(detail='��ȡ�������ݸ�')
         elif action == 'page':
             self.page = (self.page + 1) % 3
             self.dirty = True
         elif action == 'refresh':
             await self.refresh_limits()
         elif action == 'review':
-            self.changed('等待操作确认', '完整命令在管理网页；设备可拒绝或停止')
+            self.changed('�ȴ�����ȷ��', '���������ڹ�����ҳ���豸�ɾܾ���ֹͣ')
         elif action in ('accept', 'decline'):
             await self.decide(action, payload.get('answers'))
         elif action == 'draft':
             self.draft = str(payload.get('text', ''))[:4000]
             self.menu = 0
-            self.changed('待发送', self.draft)
+            self.changed('������', self.draft)
         else:
-            raise ValueError('未知操作')
+            raise ValueError('δ֪����')
 
     async def decide(self, decision, answers=None):
         if not self.approvals:
-            raise ValueError('没有待确认请求')
+            raise ValueError('û�д�ȷ������')
         request = self.approvals[0]
         if request['method'] == 'item/tool/requestUserInput':
             if decision == 'decline':
@@ -333,29 +347,29 @@ class Pocket:
                     await self.rpc.call('turn/interrupt', {'threadId': self.thread, 'turnId': self.turn})
                 return
             if not isinstance(answers, dict):
-                raise ValueError('需要填写问题答案')
+                raise ValueError('��Ҫ��д�����')
             result = {'answers': answers}
         else:
             result = {'decision': decision}
         await self.rpc.send({'id': request['id'], 'result': result})
         self.approvals.pop(0)
         self.menu = 0
-        self.changed('工作中', '已提交确认结果')
+        self.changed('������', '���ύȷ�Ͻ��')
 
     async def submit(self, text):
         if not text:
-            raise ValueError('任务不能为空')
+            raise ValueError('������Ϊ��')
         if self.turn:
-            raise ValueError('当前任务正在执行；请先停止或等待完成')
-        self.changed('正在提交', text)
+            raise ValueError('��ǰ��������ִ�У�����ֹͣ��ȴ����')
+        self.changed('�����ύ', text)
         params = {'threadId': self.thread, 'input': [{'type': 'text', 'text': text}]}
         if os.environ.get('POCKET_EXTERNAL_SANDBOX') == 'docker':
             # Docker supplies the outer boundary; do not require nested Linux namespaces.
             params['sandboxPolicy'] = {'type': 'externalSandbox', 'networkAccess': 'enabled'}
         result = await self.rpc.call('turn/start', params)
-        if result['turn']['status'] == 'inProgress' and self.status == '正在提交':
+        if result['turn']['status'] == 'inProgress' and self.status == '�����ύ':
             self.turn = result['turn']['id']
-            self.changed('工作中', '任务已提交')
+            self.changed('������', '�������ύ')
 
     async def device_packet(self, msg, source):
         kind = msg.get('type')
@@ -373,31 +387,39 @@ class Pocket:
                 self.changed(detail=str(exc))
         elif kind == 'audio_start':
             if self.voice_busy:
-                self.changed(detail='上一段语音仍在识别，请稍候')
+                self.changed(detail='��һ����������ʶ�����Ժ�')
+                return
+            codec = msg.get('codec', 'pcm16')
+            if codec not in ('pcm16', 'mulaw8k'):
+                self.changed('¼��ʧ��', '�豸��Ƶ��ʽ����֧��')
                 return
             self.draft = ''
             self.audio[source] = bytearray()
-            self.changed('录音中', f'松开 BOOT 结束，最长 {msg.get("maxSeconds",20)} 秒')
+            self.audio_codecs[source] = codec
+            self.changed('¼����', f'�ɿ� BOOT ������� {msg.get("maxSeconds",20)} ��')
         elif kind == 'audio_chunk':
             data = self.audio.get(source)
             if data is not None:
                 chunk = base64.b64decode(msg.get('data', ''), validate=True)
-                if len(data) + len(chunk) <= 640000:
+                max_bytes = 160000 if self.audio_codecs.get(source) == 'mulaw8k' else 640000
+                if len(data) + len(chunk) <= max_bytes:
                     data.extend(chunk)
                 else:
                     self.audio.pop(source, None)
-                    self.changed('录音失败', '录音超出 20 秒上限，请重试')
+                    self.audio_codecs.pop(source, None)
+                    self.changed('¼��ʧ��', '¼������ 20 �����ޣ�������')
         elif kind == 'audio_end':
             data = self.audio.pop(source, None)
+            codec = self.audio_codecs.pop(source, 'pcm16')
             if data is not None:
                 if msg.get('cancelled'):
-                    self.changed('已取消', '录音已取消，未提交识别')
+                    self.changed('��ȡ��', '¼����ȡ����δ�ύʶ��')
                 elif msg.get('error'):
-                    self.changed('录音失败','麦克风采集或上传队列中断，请重试')
-                elif msg.get('bytes') is not None and msg['bytes'] != len(data):
-                    self.changed('录音失败','音频传输不完整，请重试')
+                    self.changed('¼��ʧ��','��˷�ɼ����ϴ������жϣ�������')
+                elif msg.get('bytes') is not None and msg['bytes'] != len(data) * (4 if codec == 'mulaw8k' else 1):
+                    self.changed('¼��ʧ��','��Ƶ���䲻������������')
                 else:
-                    asyncio.create_task(self.transcribe(bytes(data)))
+                    asyncio.create_task(self.transcribe(decode_mulaw8k(data) if codec == 'mulaw8k' else bytes(data)))
         elif kind == 'frame_ack':
             self.device['frameAck'] = time.time()
             self.device['frameHash'] = msg.get('hash')
@@ -407,10 +429,10 @@ class Pocket:
 
     async def transcribe(self, data):
         if self.voice_busy:
-            self.changed(detail='上一段语音仍在识别，请稍候')
+            self.changed(detail='��һ����������ʶ�����Ժ�')
             return
         if len(data) < 6400:
-            self.changed('录音太短','按住 BOOT，看到录音中后说话，松开结束')
+            self.changed('¼��̫��','��ס BOOT������¼���к�˵�����ɿ�����')
             return
         self.voice_busy = True
         import array, math
@@ -426,7 +448,7 @@ class Pocket:
                 wav.setframerate(16000)
                 wav.writeframes(data)
             if self.config.get('speech_backend') == 'windows':
-                self.changed('识别语音', '正在使用 Windows 离线听写')
+                self.changed('ʶ������', '����ʹ�� Windows ������д')
                 process = await asyncio.create_subprocess_exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                     '-File', str(ROOT / 'speech.ps1'), '-WavePath', str(path),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, creationflags=0x08000000)
@@ -435,20 +457,20 @@ class Pocket:
                 except asyncio.TimeoutError:
                     process.kill()
                     await process.wait()
-                    raise RuntimeError('语音识别超时，请重录')
+                    raise RuntimeError('����ʶ��ʱ������¼')
                 if process.returncode:
-                    raise RuntimeError('Windows 中文语音识别失败，请检查 zh-CN 语音组件')
+                    raise RuntimeError('Windows ��������ʶ��ʧ�ܣ����� zh-CN �������')
                 text = stdout.decode('utf-8-sig').strip()
             else:
-                self.changed('识别语音', 'Whisper 正在本机识别中文')
+                self.changed('ʶ������', 'Whisper ���ڱ���ʶ������')
                 text = await asyncio.wait_for(asyncio.to_thread(self.whisper_transcribe, data),90)
             if not text:
-                raise ValueError(f'录到 {len(data)/32000:.1f} 秒，但未识别出文字。请在“录音中”出现后说话，松开结束')
+                raise ValueError(f'¼�� {len(data)/32000:.1f} �룬��δʶ������֡����ڡ�¼���С����ֺ�˵�����ɿ�����')
             self.draft = text[:4000]
             self.menu = 0
-            self.changed('待发送', self.draft)
+            self.changed('������', self.draft)
         except Exception as exc:
-            self.changed('语音失败', str(exc))
+            self.changed('����ʧ��', str(exc))
         finally:
             self.voice_busy = False
             path.unlink(missing_ok=True)
@@ -458,7 +480,7 @@ class Pocket:
         from faster_whisper import WhisperModel
         model_path = Path(os.environ.get('POCKET_MODEL_DIR',str(ROOT.parent/'models/whisper-small')))
         if not (model_path/'model.bin').exists():
-            raise RuntimeError('本地语音模型未安装，请先运行 setup-speech.py')
+            raise RuntimeError('��������ģ��δ��װ���������� setup-speech.py')
         if self.whisper_model is None:
             self.whisper_model = WhisperModel(str(model_path),device='cpu',compute_type='int8',cpu_threads=int(os.environ.get('POCKET_ASR_THREADS','4')),local_files_only=True)
         pcm = np.frombuffer(data,dtype='<i2').astype(np.float32)/32768.0
@@ -535,22 +557,22 @@ class Pocket:
         text(8,29,self.status[:10],20)
         age = int(time.monotonic()-self.last_event)
         if self.turn and age > 120:
-            text(8,58,f'{age}s 无新事件',13)
+            text(8,58,f'{age}s �����¼�',13)
         elif self.draft:
-            text(8,58,'语音草稿：确认后发送',12)
+            text(8,58,'�����ݸ壺ȷ�Ϻ���',12)
         else:
             windows = self.remaining()
-            text(8,58,'  '.join(f'{q["label"]}余{q["remaining"]:g}%' for q in windows[:2]) or '订阅额度：未知',12)
+            text(8,58,'  '.join(f'{q["label"]}��{q["remaining"]:g}%' for q in windows[:2]) or '���Ķ�ȣ�δ֪',12)
         if self.page == 1:
-            lines(f'累计 token: {self.tokens if self.tokens is not None else "未知"}\n电池: {self.device.get("millivolts", "--")}mV（估算）\n工作目录: {Path(self.config["cwd"]).name}',81)
+            lines(f'�ۼ� token: {self.tokens if self.tokens is not None else "δ֪"}\n���: {self.device.get("millivolts", "--")}mV�����㣩\n����Ŀ¼: {Path(self.config["cwd"]).name}',81)
         elif self.page == 2:
-            lines('BOOT短按：执行\nBOOT按住1秒：录音\n松开BOOT：结束录音\n双键长按：网页配置',81)
+            lines('BOOT�̰���ִ��\nBOOT��ס1�룺¼��\n�ɿ�BOOT������¼��\n˫����������ҳ����',81)
         else:
             lines(self.draft or self.detail,81)
         d.line((6,166,194,166),fill=0)
         selected = self.menu_items()[self.menu % len(self.menu_items())][0]
         text(8,170,'> '+selected,13)
-        text(8,188,'PWR 选择   BOOT 执行',10)
+        text(8,188,'PWR ѡ��   BOOT ִ��',10)
         return im
 
     async def tick(self):
@@ -566,7 +588,8 @@ class Pocket:
                     frame = self.render().tobytes()
                     # Even identical screens carry heartbeat. E-paper only refreshes changed pixels.
                     packet = {'type':'frame', 'data':base64.b64encode(frame).decode(), 'hash':hashlib.sha256(frame).hexdigest()[:12],
-                              'state':self.status,'voiceBusy':self.voice_busy,'draftReady':bool(self.draft)}
+                              'state':self.status,'voiceBusy':self.voice_busy,'draftReady':bool(self.draft),
+                              'audioCodecs':['pcm16','mulaw8k']}
                     for peer in list(self.peers.values()):
                         with contextlib.suppress(Exception):
                             await peer.send_json(packet)
@@ -596,8 +619,9 @@ class Pocket:
             await ws.close(code=1008)
         finally:
             self.peers.pop(source, None)
+            self.audio_codecs.pop(source, None)
             if self.audio.pop(source, None) is not None:
-                self.changed('录音中断','Wi-Fi 连接断开，请重新录音')
+                self.changed('¼���ж�','Wi-Fi ���ӶϿ���������¼��')
         return ws
 
     async def console(self, request):
@@ -676,7 +700,7 @@ async def main():
             import webbrowser
             webbrowser.open((pocket.runtime/'console-url.txt').read_text('utf-8'))
             return
-        raise RuntimeError(f'端口 {args.http_port} 已在使用。已有桥接时请打开 open-console.ps1。')
+        raise RuntimeError(f'�˿� {args.http_port} ����ʹ�á������Ž�ʱ��� open-console.ps1��')
     runner = web.AppRunner(pocket.app(),access_log=None)
     try:
         await pocket.start()
