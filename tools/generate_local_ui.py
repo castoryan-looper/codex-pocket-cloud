@@ -51,6 +51,11 @@ def main():
         assert len(data) == 5000
         lines.append('{' + ','.join(f'0x{x:02x}' for x in data) + '},')
     lines.append('};')
+    auto = images[3].copy()
+    draw = ImageDraw.Draw(auto)
+    draw.rectangle((0, 169, 199, 199), fill=1)
+    label(draw, (8, 175), '识别后自动发送', 12)
+    lines.append('static const uint8_t localAutoRecognizing[5000] = {' + ','.join(f'0x{x:02x}' for x in auto.tobytes()) + '};')
     for name, title in [('Online', '云端在线'), ('Offline', '云端离线'), ('Connecting', '连接云端中')]:
         im = Image.new('1', (80, 25), 1)
         label(ImageDraw.Draw(im), (5, 4), title, 13)

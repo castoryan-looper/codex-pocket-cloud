@@ -77,7 +77,7 @@ static const char * volatile enqueueFailure="";
 static volatile uint32_t networkProgressAt=0,networkPackets=0;
 static bool audioStoreReady=false;
 static volatile bool uploadPending=false;
-static volatile bool remoteMulaw8k=false;
+static volatile bool remoteMulaw8k=false,remoteAutoVoice=false;
 static uint8_t ssidBitmap[350];
 static bool ssidBitmapValid=false;
 static volatile unsigned uploadRetries=0;
@@ -178,7 +178,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.5.2";
+  doc["firmware"] = "codex-pocket-0.6.0";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -235,13 +235,14 @@ void packet(const String &line) {
     online = true;
     remoteVoiceBusy=doc["voiceBusy"]|false;
     remoteDraftReady=doc["draftReady"]|false;
+    remoteAutoVoice=doc["voiceAutoSubmit"]|false;
     remoteMulaw8k=false;
     for(JsonVariant codec : doc["audioCodecs"].as<JsonArray>())
       if(String(codec.as<const char*>())=="mulaw8k")remoteMulaw8k=true;
     String state=doc["state"]|"";
     // Ignore delayed cloud "recording" screens until local capture/upload is over.
     if(audioEndSent && localUi==UiRecognizing) {
-      bool finalState=remoteVoiceBusy || remoteDraftReady || state=="识别语音" || state=="待发送" || state=="语音失败" || state=="录音失败" || state=="录音太短";
+      bool finalState=remoteVoiceBusy || remoteDraftReady || (remoteAutoVoice && (state=="正在提交" || state=="工作中" || state=="已完成")) || state=="识别语音" || state=="待发送" || state=="语音失败" || state=="录音失败" || state=="录音太短";
       bool oldGateway=state.length()==0 && millis()-localUiAt>1500;
       if(finalState || oldGateway) setLocalUi(UiIdle);
     }
@@ -284,7 +285,7 @@ void screenTask(void *) {
       previousWifi=wifiConnected; previousUsb=usbConnected;
       previousPortal=portalActive;previousCloud=cloud;previousUi=ui;previousSecond=second;previousProgress=progress;previousKey=key;previousSsid=connectedSsid;
       if(!portalActive) {
-        if(ui>=0 && ui<12) memcpy(image,localScreens[ui],5000);
+        if(ui>=0 && ui<12) memcpy(image,ui==UiRecognizing && remoteAutoVoice ? localAutoRecognizing : localScreens[ui],5000);
         else memcpy(image+186*25,key==1?localFooterBoot:key==2?localFooterPower:localFooter,sizeof(localFooter));
         if(ui==UiHold) {
           for(int y=148;y<154;y++) for(int x=14;x<14+progress*43;x++) image[y*25+x/8]&=~(0x80>>(x%8));
@@ -571,7 +572,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.5.2";
+      hello["firmware"]="codex-pocket-0.6.0";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       String out; serializeJson(hello, out); socketClient.sendTXT(out);
@@ -580,7 +581,7 @@ void setupNetwork() {
       socketClient.logTransport("disconnected");
       // A transient cloud disconnect must not stop local microphone capture.
       netConnected = false;
-      online = false;remoteMulaw8k=false;
+      online = false;remoteMulaw8k=false;remoteAutoVoice=false;
     } else if (type == WStype_ERROR) {
       Serial.printf("NET ERROR %.*s\n",(int)length,payload ? (char*)payload : "");
       socketClient.logTransport("error");
