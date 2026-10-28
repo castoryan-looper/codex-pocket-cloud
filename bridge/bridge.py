@@ -18,6 +18,7 @@ from pathlib import Path
 import secrets
 import shutil
 import struct
+import threading
 import time
 import wave
 from functools import lru_cache
@@ -176,6 +177,7 @@ class Pocket:
         self.audio_codecs = {}
         self.voice_busy = False
         self.whisper_model = None
+        self.whisper_lock = threading.Lock()
         self.action_lock = asyncio.Lock()
         self.last_frame = None
         self.dirty = True
@@ -217,6 +219,8 @@ class Pocket:
         self.changed('待命', '按住 BOOT 说话；短按执行菜单')
         await self.refresh_limits()
         self.tasks = [asyncio.create_task(self.tick())]
+        if self.config.get('speech_backend') != 'windows':
+            self.tasks.append(asyncio.create_task(self.prewarm_whisper()))
         LOG.info('Hardware session: %s', self.thread)
 
     async def refresh_limits(self):
@@ -442,12 +446,13 @@ class Pocket:
         LOG.info('Voice capture: %.2fs RMS=%.1f',len(data)/32000,rms)
         path = self.runtime / 'last-recording.wav'
         try:
-            with wave.open(str(path), 'wb') as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(16000)
-                wav.writeframes(data)
+            started = time.monotonic()
             if self.config.get('speech_backend') == 'windows':
+                with wave.open(str(path), 'wb') as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(16000)
+                    wav.writeframes(data)
                 self.changed('识别语音', '正在使用 Windows 离线听写')
                 process = await asyncio.create_subprocess_exec('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                     '-File', str(ROOT / 'speech.ps1'), '-WavePath', str(path),
@@ -466,25 +471,54 @@ class Pocket:
                 text = await asyncio.wait_for(asyncio.to_thread(self.whisper_transcribe, data),90)
             if not text:
                 raise ValueError(f'录到 {len(data)/32000:.1f} 秒，但未识别出文字。请在“录音中”出现后说话，松开结束')
-            self.draft = text[:4000]
-            self.menu = 0
-            self.changed('待发送', self.draft)
+            text = text[:4000]
+            recognized_at = time.monotonic()
+            try:
+                async with self.action_lock:
+                    if self.turn:
+                        turn = self.turn
+                        await self.rpc.call('turn/steer', {'threadId': self.thread, 'expectedTurnId': turn,
+                            'input': [{'type':'text', 'text':text}]})
+                        self.changed('工作中', '语音指令已发送：'+text)
+                    else:
+                        await self.submit(text)
+                self.draft = ''
+                self.menu = 0
+                LOG.info('Voice timings: recognition=%.2fs submit=%.2fs',recognized_at-started,time.monotonic()-recognized_at)
+            except Exception:
+                # An ambiguous RPC may have reached Codex; preserve text and do not retry.
+                self.draft = text
+                self.menu = 0
+                raise
         except Exception as exc:
-            self.changed('语音失败', str(exc))
+            self.changed('语音失败', ('发送失败，文字已保留：' if self.draft else '') + str(exc))
         finally:
             self.voice_busy = False
             path.unlink(missing_ok=True)
 
-    def whisper_transcribe(self, data):
-        import numpy as np
+    def load_whisper(self):
         from faster_whisper import WhisperModel
         model_path = Path(os.environ.get('POCKET_MODEL_DIR',str(ROOT.parent/'models/whisper-small')))
         if not (model_path/'model.bin').exists():
             raise RuntimeError('本地语音模型未安装，请先运行 setup-speech.py')
-        if self.whisper_model is None:
-            self.whisper_model = WhisperModel(str(model_path),device='cpu',compute_type='int8',cpu_threads=int(os.environ.get('POCKET_ASR_THREADS','4')),local_files_only=True)
+        with self.whisper_lock:
+            if self.whisper_model is None:
+                self.whisper_model = WhisperModel(str(model_path),device='cpu',compute_type='int8',cpu_threads=int(os.environ.get('POCKET_ASR_THREADS','4')),local_files_only=True)
+            return self.whisper_model
+
+    async def prewarm_whisper(self):
+        try:
+            began=time.monotonic()
+            await asyncio.to_thread(self.load_whisper)
+            LOG.info('Speech model ready in %.2fs',time.monotonic()-began)
+        except Exception:
+            LOG.exception('Speech model prewarm failed')
+
+    def whisper_transcribe(self, data):
+        import numpy as np
+        model = self.load_whisper()
         pcm = np.frombuffer(data,dtype='<i2').astype(np.float32)/32768.0
-        segments, _ = self.whisper_model.transcribe(pcm,language='zh',beam_size=3,
+        segments, _ = model.transcribe(pcm,language='zh',beam_size=1,
             condition_on_previous_text=False,vad_filter=True,
             vad_parameters={'min_speech_duration_ms':150,'min_silence_duration_ms':400,'threshold':0.35})
         return ''.join(segment.text for segment in segments).strip()
@@ -589,7 +623,7 @@ class Pocket:
                     # Even identical screens carry heartbeat. E-paper only refreshes changed pixels.
                     packet = {'type':'frame', 'data':base64.b64encode(frame).decode(), 'hash':hashlib.sha256(frame).hexdigest()[:12],
                               'state':self.status,'voiceBusy':self.voice_busy,'draftReady':bool(self.draft),
-                              'audioCodecs':['pcm16','mulaw8k']}
+                              'audioCodecs':['pcm16','mulaw8k'],'voiceAutoSubmit':True}
                     for peer in list(self.peers.values()):
                         with contextlib.suppress(Exception):
                             await peer.send_json(packet)

@@ -57,6 +57,55 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('wifi',self.p.audio)
         self.assertEqual(self.p.status,'录音失败')
 
+    async def test_model_prewarm_and_capture_share_one_model(self):
+        import sys, threading, time
+        model_path=Path(self.temp.name)/'model'
+        model_path.mkdir();(model_path/'model.bin').touch()
+        calls=[]
+        def construct(*args,**kwargs):
+            calls.append(1);time.sleep(.03);return object()
+        fake=SimpleNamespace(WhisperModel=construct)
+        with patch.dict(sys.modules,{'faster_whisper':fake}), patch.dict(os.environ,{'POCKET_MODEL_DIR':str(model_path)}):
+            first,second=await asyncio.gather(asyncio.to_thread(self.p.load_whisper),asyncio.to_thread(self.p.load_whisper))
+        self.assertIs(first,second)
+        self.assertEqual(len(calls),1)
+
+    async def test_recognized_voice_starts_turn_without_confirmation(self):
+        self.p.rpc.call.return_value = {'turn': {'id':'voice-turn','status':'inProgress'}}
+        with patch.object(self.p,'whisper_transcribe',return_value='检查项目状态'):
+            await self.p.transcribe(bytes(16000))
+        method, params = self.p.rpc.call.await_args.args
+        self.assertEqual(method,'turn/start')
+        self.assertEqual(params['input'],[{'type':'text','text':'检查项目状态'}])
+        self.assertEqual(self.p.turn,'voice-turn')
+        self.assertEqual(self.p.draft,'')
+        self.assertFalse(self.p.voice_busy)
+
+    async def test_voice_steers_existing_turn(self):
+        self.p.turn = 'active-turn'
+        with patch.object(self.p,'whisper_transcribe',return_value='先检查测试结果'):
+            await self.p.transcribe(bytes(16000))
+        method, params = self.p.rpc.call.await_args.args
+        self.assertEqual(method,'turn/steer')
+        self.assertEqual(params['expectedTurnId'],'active-turn')
+        self.assertEqual(params['input'][0]['text'],'先检查测试结果')
+        self.assertEqual(self.p.draft,'')
+
+    async def test_failed_submit_preserves_text_without_automatic_retry(self):
+        self.p.rpc.call.side_effect = RuntimeError('network timeout')
+        with patch.object(self.p,'whisper_transcribe',return_value='请检查项目'):
+            await self.p.transcribe(bytes(16000))
+        self.p.rpc.call.assert_awaited_once()
+        self.assertEqual(self.p.draft,'请检查项目')
+        self.assertEqual(self.p.status,'语音失败')
+        self.assertIn('文字已保留',self.p.detail)
+
+    async def test_empty_transcription_does_not_submit(self):
+        with patch.object(self.p,'whisper_transcribe',return_value=''):
+            await self.p.transcribe(bytes(16000))
+        self.p.rpc.call.assert_not_awaited()
+        self.assertEqual(self.p.status,'语音失败')
+
     async def test_real_event_lifecycle(self):
         p = self.p
         await p.notification({'method':'turn/started','params':{'threadId':p.thread,'turn':{'id':'turn-1'}}})
@@ -145,6 +194,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frame['state'], '识别语音')
         self.assertTrue(frame['voiceBusy'])
         self.assertIn('mulaw8k',frame['audioCodecs'])
+        self.assertTrue(frame['voiceAutoSubmit'])
 
     def test_unknown_quota_not_zero_and_no_fake_tokens(self):
         self.assertEqual(self.p.remaining(),[])
