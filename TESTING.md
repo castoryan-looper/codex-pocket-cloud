@@ -49,3 +49,23 @@
 2026-10-28 自动语音：空闲时识别结果调用 turn/start；当前任务进行中调用 turn/steer（schema 要求 expectedTurnId）；发送异常仅保存文字，不盲目重试。新增测试验证自动提交、活动任务补充指令、提交失败保留文字、空识别不提交、并发预热只加载一次模型及能力声明。网关 38 项与工具 14 项测试通过；实际设备以合成静音和取消标志，4 秒 PCM（128000 字节，压缩后 32000 字节）在当前 Wi-Fi 完成上传约 4.2 秒，无错误和重试，不触发识别或任务；真实语音自动提交、识别质量及云端部署后端到端延迟仍待现场验证。
 
 2026-10-28 实体语音闭环：云端设备协议宣布 voiceAutoSubmit 与 mulaw8k；USB 状态记录真实录音 124800 字节、上传 100%、零重试且无错误，随后云端屏幕显示“已完成 / 设备在线”，无待确认草稿。测试指令由用户语音触发；本次未读取服务器识别/提交耗时日志，不能据此断言端到端延迟。
+
+
+2026-10-28 固件 0.6.1：配置网页增加 USB 数据线、USB配置.cmd、本机 8788 地址及首次启动步骤。配置入口检测到 HWCDC 主机总线连接时关闭配置 AP 并抑制自动/手动开启；仅充电不触发优先级。手动热点请求在 USB 拔出后恢复；未配网/断网仍沿用 30 秒自动恢复，Wi-Fi STA 与云端任务/语音通道保持原有行为。现有 USB 工具 11 项测试通过；新增 test_config_priority.py 提取实际固件 startConfigPortal/loopConfigPortal 函数，使用 MSVC 与模拟硬件编译运行，覆盖 USB 接入/拔出、仅充电、手动请求、关闭、Wi-Fi 恢复及 AP 启动失败重试。网页 JavaScript 通过 node --check。本机仅安装 ESP32 Arduino 2.0.13，缺少项目要求的 3.3.0 与 arduino-cli；本次尚未编译完整固件、生成 bin 或刷写设备，也未完成实机插拔验证。
+
+连接切换测试：在具有 cl、g++ 或 clang++ 的开发环境运行 `python -m unittest discover -s tools -p test_config_priority.py -v`。如临时目录受限，可用 POCKET_TEST_BUILD_DIR 指定已存在的测试构建目录。
+
+
+2026-10-28 固件 0.6.1 实机升级完成：在本台 Windows 电脑的工作目录安装独立 Arduino CLI 1.5.1、ESP32 3.3.0、ArduinoJson 7.3.2、WebSockets 2.7.2。受临时目录权限限制，打包 esptool.exe 无法自解压，改用校验过的同版本 esptool 5.0.0 Python 源码及本地启动器，分区表生成也使用核心自带 Python 源码；未修改 SDK 或固件逻辑。完整编译通过：Sketch 1554549/3145728 字节，静态 RAM 71204/327680 字节，应用 bin 1554704 字节。先读取并私下保存本设备完整 16MB Flash；核对设备分区表与构建分区表相同，OTA 当前选择 app0。仅向 COM10 的 0x10000 写入应用，esptool 报告 Hash of data verified。重启后真实 USB 状态：firmware=codex-pocket-0.6.1、configurationTransport=usb、configurationHotspotActive=false、usbConnected=true、wifiConnected=true、cloudConnected=true、audioStorageReady=true。已保存 SSID/主机/端口/TLS/根证书/密钥配置标记/录音参数与升级前一致。USB 网页返回 HTTP 200，说明及配置模式卡片可用；仓库 USB 启动环境已就绪。实际充电器/数据线拔插场景仍需物理操作验证，未将模拟测试冒充实机测试。
+应用 SHA256：ce2cde7b5b989ce5f5add0448f75b9a563dfbdeb323a296aa86431e4563d8943
+
+
+2026-10-28 0.7.0 候选更新：把配置模式与 AP 是否开启分开。USB 配置有独立画面，标明电脑的 127.0.0.1:8788 和启动工具步骤；AP 画面包含热点/KEY/192.168.4.1:80；USB 插拔切换时仍保持配置模式，语音按键在配置期间保持禁用。新增受鉴权保护的 /api/open 配置画面入口。ESP32 通过验证 CA bundle 的 HTTPS 请求在自身网络查询 IP 大致城市/时区/坐标，网络变化时废弃旧位置；异步后台查询不阻塞主循环。网关只按已鉴权设备上报且验证过的位置获取天气，显示城市、当地民用时间、温度和天气描述；固定服务器坐标不覆盖新固件位置。待机增加原生绘制的黑白 Codex 终端标识。54 项网关测试、12 项 USB 工具测试及配置状态切换 C++ 测试通过；Windows 测试只对临时测试目录的 POSIX 权限作兼容处理，未验证 Linux 权限实现。实际渲染预览已检查；定位和天气 HTTPS 响应结构在电脑网络验证通过。Arduino ESP32 3.3.0 完整编译通过（Sketch 1636417 字节，静态 RAM 71300 字节，bin SHA256 d85e7a1896138bc9eadd0864521ee961172bc4882922b9da660c4c4e80c1f3b7）。编译后电脑已无 ESP32 串口，尚未刷写 0.7.0；当前服务器无可用 SSH 连接信息，尚未部署新网关。未把预览、模拟测试或电脑的网络结果冒充设备/云端实测。
+
+
+2026-10-28 0.7.0 实机应用更新完成：重新检测到 COM10 后读取 0x00000000–0x0030ffff，保存当前引导/分区表/NVS/完整 app0 备份。核对分区表及 OTA 当前选择 app0，仅向 0x10000 写入 1636560 字节应用，esptool 验证写入哈希通过。真实 USB 回执 firmware=codex-pocket-0.7.0，已保存配置字段与升级前一致。通过已鉴权 /api/open 进入 USB 配置画面，真实回执 configurationMode=true、configurationTransport=usb、configurationHotspotActive=false；USB 配置服务已恢复。当前实体设备 Wi-Fi 未连接，位置状态 unavailable；本次未验证实体地理定位/天气，未声称云端 Logo/城市画面已部署。用户明确选择自行在服务器操作，已准备仅替换网关源文件的 Docker 更新脚本，包含源文件备份、旧镜像回滚标签、嵌入载荷 SHA256 校验和更新后健康检查，不修改登录/密钥/模型/持久卷配置。当前 Windows MSYS shell受限，无法执行 bash -n；已人工审阅脚本并校验嵌入的两个文件与通过54项测试的源码逐字节一致。脚本尚未在真实 Docker 服务器执行。
+
+
+2026-10-29 master 自动部署：新增独立安装的 systemd timer/oneshot 拉取部署器，原工作区不 checkout/reset；每个提交导出快照，固定 Compose 项目，校验现有卷名和挂载目标，先构建和无生产卷/无网络的隔离测试，再同步重建 gateway/ingress，HTTPS 健康通过后记录成功。构建失败保留旧容器，启动/健康失败恢复旧镜像与已解析的旧 Compose 配置；有中断恢复记录、失败重试冷却、并发文件锁和回滚失败停止逻辑。13 项状态机及 Git 测试中 12 项在 Windows 通过，Linux 文件锁项跳过，已加入 ubuntu-24.04 CI；真实 Git bundle master 拉取和保留 dirty main 工作区验证通过。测试 Docker 调用为替身，未在真实 Docker/systemd 或用户云服务器执行安装/部署。原 Docker CI 增加 master 触发。
+
+2026-10-29 同步 GitHub 前核对：远程默认分支为 main，master API 返回重命名重定向。安装器和说明已改为默认监听 origin/main，仍支持 --branch master。新增 main 分支选择测试，14 项测试中13项本地通过、Linux文件锁项跳过。

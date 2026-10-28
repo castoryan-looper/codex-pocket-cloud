@@ -173,6 +173,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if self.path == '/api/config':
             self.dispatch('save', body)
+        elif self.path == '/api/open':
+            self.dispatch('open')
         elif self.path == '/api/close':
             self.dispatch('close')
         elif self.path == '/api/wifi/scan':

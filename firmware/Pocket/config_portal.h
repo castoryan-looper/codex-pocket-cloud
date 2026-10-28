@@ -19,6 +19,7 @@ static WebServer configWeb(80);
 static DNSServer configDns;
 static volatile bool portalActive=false;
 static bool portalAutoOpened=false;
+static volatile bool configModeActive=false;
 static String portalSsid,portalKey;
 static uint32_t portalRestartAt=0,portalCloseAt=0,portalBootAt=0;
 static unsigned recordSeconds=20,holdMs=1000,refreshMinutes=15;
@@ -27,12 +28,13 @@ static const char CONFIG_PAGE[] PROGMEM=R"HTML(
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex Pocket 设备配置</title>
 <style>body{max-width:640px;margin:28px auto;padding:0 18px;background:#f3f4ee;color:#20251e;font:16px system-ui}section{background:white;border:1px solid #ddd;border-radius:12px;padding:20px;margin:18px 0}label{display:block;margin:14px 0}input,textarea,button,select{font:inherit;padding:10px;border:1px solid #aaa;border-radius:6px;box-sizing:border-box}input,textarea,select{width:100%;margin-top:6px}textarea{min-height:100px}button{background:#e1ebd8;cursor:pointer;margin:5px}small{color:#666}#message{white-space:pre-wrap}h1{font-size:26px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card{background:#f3f4ee;padding:12px;border-radius:8px;overflow-wrap:anywhere}.card strong{display:block;margin-top:6px}dl{display:grid;grid-template-columns:100px 1fr;gap:9px}dd{margin:0;overflow-wrap:anywhere}@media(max-width:450px){.grid{grid-template-columns:1fr}}</style>
 <h1>Codex Pocket 设备配置</h1><p>支持 USB 调试配置和设备 Wi-Fi 网页。语音与任务通过 Wi-Fi 连接云端。</p><p id="message" role="status"></p>
+<section><h2>如何打开配置网页</h2><p><strong>优先使用 USB：</strong>用 USB 数据线连接电脑与设备，在电脑上的 codex-pocket-cloud 仓库中双击 <code>USB配置.cmd</code>，工具会自动打开 <code>http://127.0.0.1:8788/</code>。保持工具运行，无需切换电脑网络；首次运行需要 Python 3 和网络以安装依赖。请关闭占用设备串口的其他工具。</p><p>直接输入本机地址前需先启动 USB 配置工具；USB 线本身不会创建网页服务。仅充电的线缆或充电器不算主机数据连接。</p><p><strong>没有 USB 主机连接时使用配置热点：</strong>同时按住 BOOT + PWR 约 3 秒，连接设备屏幕显示的 CPOCKET-… 热点，打开 <code>http://192.168.4.1/</code>，使用屏幕 KEY 登录。检测到 USB 主机时配置热点会关闭；拔掉数据线后，可用双键长按打开热点。已连接局域网时也可通过设备 IP 访问。</p><small>USB 优先级仅针对设备配置。语音与任务仍通过 Wi-Fi 连接云端。</small></section>
 <section id="login"><label>配置密码（显示在设备屏幕的 KEY 行）<input id="key" type="password" autocomplete="current-password"></label><button onclick="login()">打开设置</button><small>忘记密码时，同时按住 BOOT 和 PWR 约 3 秒查看。</small></section>
 <section id="live" hidden><h2>设备实时状态 <small id="connection"></small></h2><div id="statusGrid" class="grid"></div><details open><summary>设备信息</summary><dl id="deviceInfo"></dl></details><small>每 2 秒更新。外网状态以设备实际连接云端为依据；Wi-Fi 连接成功不等于外网已经连通。</small></section>
 <form id="settings" hidden novalidate onsubmit="save(event)"><section><h2>Wi-Fi</h2><label>选择附近的 2.4 GHz Wi-Fi<select id="wifiList" onchange="chooseWifi()"><option value="">先扫描，再选择网络</option></select></label><button id="scanButton" type="button" onclick="scanWifi()">扫描附近 Wi-Fi</button><p id="scanMessage" role="status"><small>扫描时设备 Wi-Fi 会短暂断开，完成后自动重连。</small></p><details id="manualWifi"><summary>手动输入隐藏网络</summary><label>2.4GHz Wi-Fi 名称<input id="ssid" maxlength="32" required></label></details><label>热点密码<input id="password" type="password" maxlength="63" autocomplete="new-password" placeholder="同一热点留空则保留原密码"></label><p id="network"></p></section>
 <section><h2>云端服务连接</h2><label>导入云端导出的连接配置<input id="importFile" type="file" accept=".json,application/json" onchange="importConfig(this)"></label><label>云端域名或 IP（不含协议）<input id="host" maxlength="253"></label><label>端口<input id="port" type="number" min="1" max="65535" value="443" required></label><label><input id="tls" type="checkbox" checked style="width:auto"> 使用 TLS 加密</label><label>设备连接密钥<input id="token" type="password" autocomplete="new-password" placeholder="已有密钥时留空保留"></label><label>根 CA 证书（PEM）<textarea id="ca"></textarea></label><small>设备通过 Wi-Fi 连接云端 WSS 服务。不要把配置网页端口开放到公网。</small></section>
 <section><h2>按键与屏幕</h2><label>BOOT 长按进入录音（毫秒）<input id="holdMs" readonly value="1000" type="number" min="800" max="2500" step="100"></label><label>单次录音上限（秒）<input id="recordSeconds" type="number" min="2" max="20"></label><label>维护全刷最小间隔（分钟）<input id="refreshMinutes" type="number" min="5" max="60"></label></section>
-<button id="saveButton" type="submit">保存并重启设备</button><button type="button" onclick="closePortal()">关闭配置热点</button><p>USB 页面在设备重启后会自动恢复状态，无需切换电脑网络。双键长按仍可打开设备配置热点。</p></form>
+<button id="saveButton" type="submit">保存并重启设备</button><button type="button" onclick="openPortal()">显示设备配置画面</button><button type="button" onclick="closePortal()">退出设备配置画面</button><p>USB 页面在设备重启后会自动恢复状态，无需切换电脑网络。没有 USB 主机连接时，双键长按可打开设备配置热点。</p></form>
 <script>
 const $=id=>document.getElementById(id);let auth=new URLSearchParams(location.hash.slice(1)).get('key')||sessionStorage.getItem('pocketSetupKey')||'';$('key').value=auth;history.replaceState(null,'',location.pathname);let polling=false,configLoaded=false,statusInFlight=false,saving=false;
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'X-Setup-Key':auth,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});const data=await r.json();if(!r.ok)throw Error(data.error||'请求失败');return data}
@@ -41,9 +43,9 @@ function text(tag,value){const e=document.createElement(tag);e.textContent=value
 const bytes=n=>n===undefined?'--':n>=1048576?(n/1048576).toFixed(1)+' MB':Math.round(n/1024)+' KB';
 async function refreshStatus(){if(statusInFlight)return;statusInFlight=true;try{const s=await api('/api/status');$('live').hidden=false;$('statusGrid').replaceChildren();$('deviceInfo').replaceChildren();$('connection').textContent=s.usbProxy?'USB 配置连接':'设备 Wi-Fi 网页';
 $('saveButton').disabled=saving||s.deviceConnected===false||s.recording||s.uploadPending;if(s.deviceConnected===false){$('statusGrid').append(text('p',s.message||'USB 未连接，请插入设备'));return;}if(!configLoaded){const c=await api('/api/config');if(c.deviceConnected!==false){fill(c);configLoaded=true;}}
-const cards=[['Wi-Fi',s.wifiConnected?'已连接 · '+s.connectedSsid:'未连接'],['外网',s.internetReachable?'已验证连通':s.wifiConnected?'等待验证':'未连接 Wi-Fi'],['云端服务',s.cloudConnected?'在线':s.cloudTransportConnected?'通道已连接，等待确认':'未连接'],['USB',s.usbConnected?'已连接':'未连接'],['录音 / 上传',s.recording?'正在录音':s.uploadPending?'上传中 '+s.uploadProgress+'%':'空闲'],['设备电量（电压估算）',s.battery>=0?s.battery+'%':'暂未读到']];
+const configModes={usb:'USB 优先',hotspot:'Wi-Fi 配置热点',lan:'局域网网页',none:'等待连接'};const cards=[['配置模式',configModes[s.configurationTransport]||'等待固件状态'],['Wi-Fi',s.wifiConnected?'已连接 · '+s.connectedSsid:'未连接'],['外网',s.internetReachable?'已验证连通':s.wifiConnected?'等待验证':'未连接 Wi-Fi'],['云端服务',s.cloudConnected?'在线':s.cloudTransportConnected?'通道已连接，等待确认':'未连接'],['USB',s.usbConnected?'已连接':'未连接'],['录音 / 上传',s.recording?'正在录音':s.uploadPending?'上传中 '+s.uploadProgress+'%':'空闲'],['设备电量（电压估算）',s.battery>=0?s.battery+'%':'暂未读到']];
 for(const [label,value] of cards){const c=text('div',label);c.className='card';c.append(text('strong',value));$('statusGrid').append(c);}
-const reasons={201:'未找到热点，请检查名称与 2.4GHz',202:'认证失败，请检查密码与安全方式',210:'热点安全方式不兼容',211:'热点认证方式不匹配',212:'信号太弱',15:'连接握手超时',204:'连接握手超时',200:'热点信号中断'};const info=[['Wi-Fi 诊断',s.wifiConnected?'已连接':s.wifiScanning?'正在扫描 Wi-Fi':(reasons[s.wifiReason]||('等待连接（代码 '+(s.wifiReason||'--')+'）'))],['已保存 Wi-Fi',s.configuredSsid||'未配置'],['设备地址',s.ip],['网关',s.gateway],['信号强度',s.rssi==null?'--':s.rssi+' dBm'],['云端地址',(s.host||'未配置')+':'+s.port],['外网判断',s.internetDetail],['固件版本',s.firmware],['芯片',s.chip+' / '+s.cores+' 核 / '+s.cpuMHz+' MHz'],['Flash',bytes(s.flashBytes)],['空闲内存',bytes(s.freeHeap)],['录音缓存',s.audioStorageReady?bytes(s.audioStorageFree)+' 可用':'不可用'],['最近音频',bytes(s.audioBytes)],['最近错误',s.audioError||'无'],['运行时间',Math.floor(s.uptimeSeconds/60)+' 分 '+s.uptimeSeconds%60+' 秒'],['MAC',s.mac]];
+const reasons={201:'未找到热点，请检查名称与 2.4GHz',202:'认证失败，请检查密码与安全方式',210:'热点安全方式不兼容',211:'热点认证方式不匹配',212:'信号太弱',15:'连接握手超时',204:'连接握手超时',200:'热点信号中断'};const info=[['定位城市',s.location?.city||'定位中/未知'],['定位方式','设备 Wi-Fi 出口 IP（大致位置）'],['Wi-Fi 诊断',s.wifiConnected?'已连接':s.wifiScanning?'正在扫描 Wi-Fi':(reasons[s.wifiReason]||('等待连接（代码 '+(s.wifiReason||'--')+'）'))],['已保存 Wi-Fi',s.configuredSsid||'未配置'],['设备地址',s.ip],['网关',s.gateway],['信号强度',s.rssi==null?'--':s.rssi+' dBm'],['云端地址',(s.host||'未配置')+':'+s.port],['外网判断',s.internetDetail],['固件版本',s.firmware],['芯片',s.chip+' / '+s.cores+' 核 / '+s.cpuMHz+' MHz'],['Flash',bytes(s.flashBytes)],['空闲内存',bytes(s.freeHeap)],['录音缓存',s.audioStorageReady?bytes(s.audioStorageFree)+' 可用':'不可用'],['最近音频',bytes(s.audioBytes)],['最近错误',s.audioError||'无'],['运行时间',Math.floor(s.uptimeSeconds/60)+' 分 '+s.uptimeSeconds%60+' 秒'],['MAC',s.mac]];
 for(const [label,value] of info)$('deviceInfo').append(text('dt',label),text('dd',value??'--'));
 $('network').textContent=s.wifiConnected?'当前连接：'+s.connectedSsid+' · '+s.ip:'当前未连接；已保存：'+(s.configuredSsid||'无');
 }catch(e){$('connection').textContent='正在重新连接设备…';$('statusGrid').replaceChildren(text('p','未能读取设备状态，请检查 USB 或网络连接。'));$('saveButton').disabled=true;}finally{statusInFlight=false;}}
@@ -73,6 +75,7 @@ function ssidImage(ssid){
  return btoa(String.fromCharCode(...bytes));
 }
 async function save(e){e.preventDefault();if(!$('ssid').value){$('manualWifi').open=true;$('message').textContent='请先选择 Wi-Fi，或手动输入网络名称。';$('ssid').focus();return;}if(!e.target.reportValidity())return;saving=true;$('saveButton').disabled=true;$('message').textContent='正在保存配置，请保持 USB 连接…';try{const c={};for(const k of ['ssid','password','host','token','ca'])c[k]=$(k).value;for(const k of ['port','holdMs','recordSeconds','refreshMinutes'])c[k]=Number($(k).value);c.tls=$('tls').checked;c.ssidBitmap=ssidImage(c.ssid);const r=await api('/api/config',c);$('password').value='';$('token').value='';$('message').textContent=r.message;}catch(e){$('message').textContent='保存失败：'+e.message}finally{saving=false;$('saveButton').disabled=false}}
+async function openPortal(){try{const r=await api('/api/open',{});$('message').textContent=r.message}catch(e){$('message').textContent=e.message}}
 async function closePortal(){try{const r=await api('/api/close',{});$('message').textContent=r.message}catch(e){$('message').textContent=e.message}}
 if(auth)login();
 </script></html>
@@ -98,7 +101,7 @@ static bool portalAuthorized() {
 }
 static int configFailure(JsonDocument &out,int code,const char *error){out["error"]=error;return code;}
 static void deviceConfig(JsonDocument &d){
- d["firmware"]="codex-pocket-0.6.0";d["ssid"]=wifiSsid;d["host"]=remoteHost;d["port"]=remotePort;d["tls"]=tlsEnabled;d["ca"]=rootCa;
+ d["firmware"]="codex-pocket-0.7.0";d["ssid"]=wifiSsid;d["host"]=remoteHost;d["port"]=remotePort;d["tls"]=tlsEnabled;d["ca"]=rootCa;
  d["tokenConfigured"]=remoteToken.length()>0;d["holdMs"]=holdMs;d["recordSeconds"]=recordSeconds;d["refreshMinutes"]=refreshMinutes;
 }
 // Scans run asynchronously. Disconnect STA briefly to avoid driver busy errors,
@@ -137,7 +140,10 @@ static void wifiScanResult(JsonDocument &out){
 }
 static void deviceStatus(JsonDocument &d){
  bool wifi=WiFi.status()==WL_CONNECTED;
- d["firmware"]="codex-pocket-0.6.0";d["wifiScanning"]=(wifiScanPhase==1 || wifiScanPhase==2);d["usbConnected"]=HWCDC::isPlugged();d["wifiConnected"]=wifi;d["wifiReason"]=(int)lastWifiDisconnectReason;d["configuredSsid"]=wifiSsid;
+ d["configurationTransport"]=HWCDC::isPlugged()?"usb":portalActive?"hotspot":wifi?"lan":"none";
+ d["configurationHotspotActive"]=(bool)portalActive;d["configurationMode"]=(bool)configModeActive;
+ deviceLocationStatus(d);
+ d["firmware"]="codex-pocket-0.7.0";d["wifiScanning"]=(wifiScanPhase==1 || wifiScanPhase==2);d["usbConnected"]=HWCDC::isPlugged();d["wifiConnected"]=wifi;d["wifiReason"]=(int)lastWifiDisconnectReason;d["configuredSsid"]=wifiSsid;
  d["connectedSsid"]=wifi?WiFi.SSID():"";d["ssidImageReady"]=ssidBitmapValid;d["ip"]=WiFi.localIP().toString();d["gateway"]=WiFi.gatewayIP().toString();
  if(wifi)d["rssi"]=WiFi.RSSI();else d["rssi"]=nullptr;
  if(wifi && netConnected)d["internetReachable"]=true;else d["internetReachable"]=nullptr;
@@ -177,6 +183,7 @@ static int saveDeviceConfig(const JsonDocument &doc,JsonDocument &result){
     prefs.putUInt("hold_ms",h);prefs.putUInt("rec_secs",r);prefs.putUInt("refresh_m",m);prefs.end();
     result["message"]="配置已保存，设备即将重启，USB 页面会自动重连。";portalRestartAt=millis()+1500;return 200;
  }
+static void startConfigPortal(bool automatic);
 static void loopUsbConfig(){
  static String line;static uint32_t lastByte=0;
  if(line.length() && millis()-lastByte>15000)line="";
@@ -196,7 +203,8 @@ static void loopUsbConfig(){
    if(recording || uploadPending || syntheticRequested || remoteVoiceBusy || !netConnected || !online)out["status"]=configFailure(payload,409,"请等待设备云端在线且空闲");
    else{syntheticRequested=true;payload["message"]="已开始无语音测试上传";}
   }
-  else if(method=="close"){payload["message"]="配置热点即将关闭，USB 配置连接仍可使用。";portalCloseAt=millis()+1000;}
+  else if(method=="open"){startConfigPortal(false);payload["message"]="设备已进入配置画面，PWR 长按可退出。";}
+  else if(method=="close"){payload["message"]="设备即将退出配置画面，USB 网页仍可使用。";portalCloseAt=millis()+1000;}
   else if(method=="save"){
    if(recording || uploadPending)out["status"]=configFailure(payload,409,"请先结束录音或上传，再保存配置");
    else{JsonDocument config;config.set(req["body"]);out["status"]=saveDeviceConfig(config,payload);}
@@ -206,8 +214,10 @@ static void loopUsbConfig(){
 }
 
 static void startConfigPortal(bool automatic=false) {
-  if(portalActive){if(!automatic)portalAutoOpened=false;return;}
-  portalAutoOpened=automatic;
+  configModeActive=true;imageDirty=true;
+  if(!automatic || !portalActive)portalAutoOpened=automatic;
+  // Configuration mode stays visible while USB replaces the AP transport.
+  if(HWCDC::isPlugged() || portalActive)return;
   WiFi.mode(WIFI_AP_STA);
   if(!WiFi.softAP(portalSsid.c_str(),portalKey.c_str()))return;
   configDns.start(53,"*",WiFi.softAPIP());
@@ -241,7 +251,8 @@ static void initConfigPortal() {
     if(recording || uploadPending){portalError(409,"请先结束录音或上传，再保存配置");return;}
     JsonDocument result;int status=saveDeviceConfig(doc,result);portalJson(status,result);
   });
-  configWeb.on("/api/close",HTTP_POST,[](){if(!portalAuthorized())return;JsonDocument result;result["message"]="配置热点即将关闭，设备继续通过 Wi-Fi 工作。";portalJson(200,result);portalCloseAt=millis()+1000;});
+  configWeb.on("/api/open",HTTP_POST,[](){if(!portalAuthorized())return;startConfigPortal(false);JsonDocument result;result["message"]="设备已进入配置画面";portalJson(200,result);});
+  configWeb.on("/api/close",HTTP_POST,[](){if(!portalAuthorized())return;JsonDocument result;result["message"]="设备即将退出配置画面，继续通过 Wi-Fi 工作。";portalJson(200,result);portalCloseAt=millis()+1000;});
   configWeb.onNotFound([](){configWeb.sendHeader("Location","http://"+WiFi.softAPIP().toString()+"/",true);configWeb.send(302,"text/plain","");});
   configWeb.begin();portalBootAt=millis();
   if(firstWebSetup||!wifiConfigured)startConfigPortal(true);
@@ -250,8 +261,13 @@ static void loopConfigPortal() {
   configWeb.handleClient();
   if(portalActive)configDns.processNextRequest();
   if(portalRestartAt && (int32_t)(millis()-portalRestartAt)>=0)ESP.restart();
-  if(portalCloseAt && (int32_t)(millis()-portalCloseAt)>=0){portalCloseAt=0;portalActive=false;configDns.stop();WiFi.softAPdisconnect(true);offlineStage=-1;imageDirty=true;}
-  if(!portalActive && WiFi.status()!=WL_CONNECTED && millis()-portalBootAt>30000)startConfigPortal(true);
+  if(portalCloseAt && (int32_t)(millis()-portalCloseAt)>=0){portalCloseAt=0;configModeActive=false;portalActive=false;configDns.stop();WiFi.softAPdisconnect(true);offlineStage=-1;imageDirty=true;}
+  if(HWCDC::isPlugged()){
+    if(portalActive){portalActive=false;configDns.stop();WiFi.softAPdisconnect(true);offlineStage=-1;imageDirty=true;}
+    return;
+  }
+  if(configModeActive && !portalActive)startConfigPortal(portalAutoOpened);
+  if(!configModeActive && WiFi.status()!=WL_CONNECTED && millis()-portalBootAt>30000)startConfigPortal(true);
   if(portalActive && portalAutoOpened && WiFi.status()==WL_CONNECTED && WiFi.softAPgetStationNum()==0 && !portalCloseAt)portalCloseAt=millis()+500;
 }
 

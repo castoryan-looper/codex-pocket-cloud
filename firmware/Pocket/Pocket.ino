@@ -124,7 +124,9 @@ static volatile int screenPhase = 0;
 static volatile uint32_t fullRefreshes = 0, partialRefreshes = 0;
 static uint32_t lastAudioEnd = 0;
 static int offlineStage = -1;
+#include "device_location.h"
 #include "config_portal.h"
+#include "config_screens.h"
 
 void imageAscii(uint8_t *image,int px,int py,const String &text) {
   for(unsigned n=0;n<text.length();n++) {
@@ -178,7 +180,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.6.0";
+  doc["firmware"] = "codex-pocket-0.7.0";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -198,8 +200,9 @@ void telemetry(bool hello = false) {
   doc["screenPhase"] = screenPhase;
   doc["fullRefreshes"] = fullRefreshes;
   doc["partialRefreshes"] = partialRefreshes;
-  doc["configurationMode"] = (bool)portalActive;
-  doc["configurationUrl"] = "http://"+WiFi.localIP().toString()+"/";
+  doc["configurationMode"] = (bool)configModeActive;
+  doc["configurationUrl"] = HWCDC::isPlugged()?"http://127.0.0.1:8788/":portalActive?"http://"+WiFi.softAPIP().toString()+":80/":"http://"+WiFi.localIP().toString()+":80/";
+  deviceLocationStatus(doc);
   doc["configurationSsid"] = portalSsid;
   sendPacket(doc);
 }
@@ -266,7 +269,7 @@ void screenTask(void *) {
     bool usbConnected=HWCDC::isPlugged();
     int cloud=wifiConnected && netConnected && online;
     int ui=localUi;
-    if(!portalActive && !recording && !uploadPending) {
+    if(!configModeActive && !recording && !uploadPending) {
       if(!wifiConnected) ui=8;
       else if(!bridgeConfigured) ui=10;
       else if(!netConnected) ui=9;
@@ -275,7 +278,7 @@ void screenTask(void *) {
     int key=(millis()-lastLocalKeyAt<500) ? lastLocalKey : 0;
     int second=recording ? (millis()-recordingStartedAt)/1000 : -1;
     int progress=ui==UiHold ? min(4,(int)((millis()-pressStartedAt)/250)) : ui==UiSending ? (int)(uploadProgress/10) : -1;
-    if (previousWifi!=wifiConnected || previousUsb!=usbConnected || previousPortal!=(int)portalActive || previousCloud!=cloud || previousUi!=ui || previousSecond!=second || previousProgress!=progress || previousKey!=key || previousSsid!=connectedSsid) imageDirty=true;
+    if (previousWifi!=wifiConnected || previousUsb!=usbConnected || previousPortal!=(int)configModeActive || previousCloud!=cloud || previousUi!=ui || previousSecond!=second || previousProgress!=progress || previousKey!=key || previousSsid!=connectedSsid) imageDirty=true;
     if (imageDirty) {
       xSemaphoreTake(imageMutex, portMAX_DELAY);
       memcpy(image, desiredImage, 5000);
@@ -283,8 +286,8 @@ void screenTask(void *) {
       imageDirty = false;
       xSemaphoreGive(imageMutex);
       previousWifi=wifiConnected; previousUsb=usbConnected;
-      previousPortal=portalActive;previousCloud=cloud;previousUi=ui;previousSecond=second;previousProgress=progress;previousKey=key;previousSsid=connectedSsid;
-      if(!portalActive) {
+      previousPortal=configModeActive;previousCloud=cloud;previousUi=ui;previousSecond=second;previousProgress=progress;previousKey=key;previousSsid=connectedSsid;
+      if(!configModeActive) {
         if(ui>=0 && ui<12) memcpy(image,ui==UiRecognizing && remoteAutoVoice ? localAutoRecognizing : localScreens[ui],5000);
         else memcpy(image+186*25,key==1?localFooterBoot:key==2?localFooterPower:localFooter,sizeof(localFooter));
         if(ui==UiHold) {
@@ -310,7 +313,7 @@ void screenTask(void *) {
         for(int y=0;y<24;y++) for(int x=139;x<200;x++) image[y*25+x/8]|=0x80>>(x%8);
         imageAscii(image,145,5,localBattery<0 ? "--%" : String(localBattery)+"%");
       }
-      if(!portalActive && wifiConnected && (ui==UiIdle || ui==9 || ui==11)) {
+      if(!configModeActive && wifiConnected && (ui==UiIdle || ui==9 || ui==11)) {
         // Show the actual SSID even while waiting for the cloud to reconnect.
         int top=ui==UiIdle?186:145;
         for(int y=top;y<top+14;y++)memset(image+y*25,0xff,25);
@@ -321,12 +324,14 @@ void screenTask(void *) {
           imageAscii(image,4,top+1,"WiFi:"+name);
         }
       }
-      if(portalActive) {
-        memcpy(image,offlineImages[4],5000);
-        imageAscii(image,10,94,portalSsid);
-        imageAscii(image,10,113,"KEY: "+portalKey);
-        imageAscii(image,10,135,"192.168.4.1");
-        imageAscii(image,10,169,"PWR HOLD: CLOSE");
+      if(configModeActive) {
+        memcpy(image,usbConnected?configUsbScreen:configApScreen,5000);
+        if(usbConnected)imageAscii(image,8,99,"http://127.0.0.1:8788/");
+        else if(portalActive){
+          imageAscii(image,8,92,portalSsid);
+          imageAscii(image,8,113,"KEY: "+portalKey);
+          imageAscii(image,8,137,"http://"+WiFi.softAPIP().toString()+":80/");
+        }else imageAscii(image,8,99,"AP STARTING...");
       }
       // This strip is owned by the MCU so it remains current without a bridge.
       for (int y=1;y<24;y++) for (int x=76;x<132;x++) image[y*25+x/8]|=0x80>>(x%8);
@@ -358,7 +363,7 @@ void screenTask(void *) {
       ack["localUi"]=ui;ack["recording"]=(bool)recording;
       ack["wifiConnected"]=wifiConnected;
       ack["usbConnected"]=usbConnected;
-      ack["configurationMode"]=(bool)portalActive;
+      ack["configurationMode"]=(bool)configModeActive;
       sendPacket(ack);
     }
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -383,7 +388,7 @@ void audioTask(void *) {
     }
     if(!captureRequested) {vTaskDelay(pdMS_TO_TICKS(5));continue;}
     captureRequested=false;
-    if(uploadPending || digitalRead(BOOT_BUTTON_PIN)!=LOW || digitalRead(PWR_BUTTON_PIN)==LOW || portalActive || !netConnected || !online)continue;
+    if(uploadPending || digitalRead(BOOT_BUTTON_PIN)!=LOW || digitalRead(PWR_BUTTON_PIN)==LOW || configModeActive || !netConnected || !online)continue;
     captureCancelled=false;audioEndSent=false;audioBytes=0;uploadProgress=0;uploadRetries=0;syntheticUpload=false;audioFailure="";codecFailure=0;
     File clip=audioStoreReady ? FFat.open(audioCachePath,FILE_WRITE) : File();
     if(!clip || FFat.freeBytes()<recordSeconds*32000UL) {
@@ -401,7 +406,7 @@ void audioTask(void *) {
       captured+=sizeof(mono);audioBytes=captured;
     }
     bool limit=millis()-began>=recordSeconds*1000UL || captured+sizeof(mono)>recordSeconds*32000UL;
-    if(digitalRead(PWR_BUTTON_PIN)==LOW || portalActive)captureCancelled=true;
+    if(digitalRead(PWR_BUTTON_PIN)==LOW || configModeActive)captureCancelled=true;
     clip.close();recording=false;lastAudioEnd=millis();
     Serial.printf("PTT STOP %lu bytes=%lu error=%d cancelled=%d reason=%s heap=%u\n",(unsigned long)lastAudioEnd,(unsigned long)captured,failed,(int)captureCancelled,audioFailure,ESP.getFreeHeap());
     if(captureCancelled || failed || captured<6400) {
@@ -572,9 +577,10 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.6.0";
+      hello["firmware"]="codex-pocket-0.7.0";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
+      deviceLocationStatus(hello);
       String out; serializeJson(hello, out); socketClient.sendTXT(out);
     } else if (type == WStype_DISCONNECTED) {
       Serial.printf("NET DISCONNECT reason=%.*s recording=%d bytes=%lu queue=%u\n",(int)length,payload ? (char*)payload : "",(int)recording,(unsigned long)audioBytes,(unsigned)uxQueueMessagesWaiting(netQueue));
@@ -605,6 +611,7 @@ void setup() {
   Serial.println("POCKET_BOOT: initializing hardware");
   imageMutex=xSemaphoreCreateMutex();
   netQueue=xQueueCreate(64, sizeof(char *));
+  initDeviceLocation();
   for (gpio_num_t pin : {EPD_DC_PIN,EPD_CS_PIN,EPD_SCK_PIN,EPD_MOSI_PIN,EPD_RST_PIN,EPD_BUSY_PIN,BOOT_BUTTON_PIN,PWR_BUTTON_PIN})
     gpio_hold_dis(pin);
   gpio_hold_dis(ESP32_I2C_SDA_PIN);
@@ -664,10 +671,10 @@ void setup() {
   bootButton.setClickMs(180);powerButton.setClickMs(180);
   bootButton.setPressMs(1000);
   powerButton.setPressMs(1200);
-  bootButton.attachPress([](){if(!portalActive && !remoteVoiceBusy && localUi!=UiRecognizing && localUi!=UiSending){pressStartedAt=millis();if(netConnected&&online)setLocalUi(UiHold);}});
-  bootButton.attachClick([](){ if(!portalActive && !recording){if(localUi==UiHold)setLocalUi(UiIdle);event("b1_click");} });
+  bootButton.attachPress([](){if(!configModeActive && !remoteVoiceBusy && localUi!=UiRecognizing && localUi!=UiSending){pressStartedAt=millis();if(netConnected&&online)setLocalUi(UiHold);}});
+  bootButton.attachClick([](){ if(!configModeActive && !recording){if(localUi==UiHold)setLocalUi(UiIdle);event("b1_click");} });
   bootButton.attachLongPressStart([](){
-    if(portalActive || uploadPending || remoteVoiceBusy || localUi==UiRecognizing || localUi==UiSending)return;
+    if(configModeActive || uploadPending || remoteVoiceBusy || localUi==UiRecognizing || localUi==UiSending)return;
     if(netConnected && online) captureRequested=true; else disconnectedImage();
   });
   bootButton.attachLongPressStop([](){
@@ -677,14 +684,15 @@ void setup() {
     else if(localUi==UiHold)setLocalUi(UiIdle);
     else if(localUi==UiLimit)setLocalUi((remoteDraftReady||remoteVoiceBusy)?UiIdle:(audioEndSent?UiRecognizing:UiSending));
   });
-  powerButton.attachClick([](){ if(!portalActive)event("b2_click"); });
-  powerButton.attachLongPressStart([](){ if(portalActive){portalCloseAt=millis()+100;return;}captureCancelled=true;recording=false;captureRequested=false;setLocalUi(UiCancelled);event("b2_long"); });
+  powerButton.attachClick([](){ if(!configModeActive)event("b2_click"); });
+  powerButton.attachLongPressStart([](){ if(configModeActive){portalCloseAt=millis()+100;return;}captureCancelled=true;recording=false;captureRequested=false;setLocalUi(UiCancelled);event("b2_long"); });
   // Do not interpret a held power-on button as a stop command.
   while (digitalRead(PWR_BUTTON_PIN)==LOW) delay(10);
   disconnectedImage();
   xTaskCreate(screenTask,"screen",8192,nullptr,1,nullptr);
   xTaskCreate(audioTask,"audio",8192,nullptr,2,nullptr);
   xTaskCreate(networkTask,"network",12288,nullptr,3,nullptr);
+  xTaskCreate(deviceLocationTask,"location",8192,nullptr,1,nullptr);
 }
 
 void loop() {

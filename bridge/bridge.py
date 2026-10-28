@@ -14,6 +14,8 @@ import hmac
 import io
 import json
 import logging
+import math
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import os
 from pathlib import Path
 import secrets
@@ -72,8 +74,13 @@ def codex_binary():
     return shutil.which('codex.exe') or shutil.which('codex.cmd') or shutil.which('codex') or 'codex'
 
 
-def dashboard_time():
-    """Shanghai time by default; configurable without assuming the server's zone."""
+def dashboard_time(location=None):
+    """Use the Wi-Fi location's civil time; legacy devices retain their offset."""
+    if location:
+        try:
+            return datetime.now(ZoneInfo(location['timezone']))
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            return datetime.now(timezone(timedelta(seconds=location['utcOffsetSeconds'])))
     try:
         hours = float(os.environ.get('POCKET_UTC_OFFSET', '8'))
         if not -12 <= hours <= 14:
@@ -82,6 +89,26 @@ def dashboard_time():
     except (ValueError, OverflowError):
         zone = timezone(timedelta(hours=8))
     return datetime.now(zone)
+
+
+def draw_codex_mark(draw, x, y, size=28):
+    """Small monochrome Codex terminal mark, rendered natively for e-paper."""
+    draw.rounded_rectangle((x,y,x+size-1,y+size-1), radius=5, fill=0)
+    draw.line([(x+6,y+8),(x+12,y+13),(x+6,y+18)], fill=1, width=2)
+    draw.line((x+15,y+18,x+22,y+18), fill=1, width=2)
+
+
+def weather_description(code):
+    if code == 0: return '晴'
+    if code in (1,2): return '晴间多云'
+    if code == 3: return '阴'
+    if code in (45,48): return '有雾'
+    if code in (51,53,55,56,57): return '毛毛雨'
+    if code in (61,63,65,66,67): return '雨'
+    if code in (71,73,75,77,85,86): return '雪'
+    if code in (80,81,82): return '阵雨'
+    if code in (95,96,99): return '雷雨'
+    return '天气未知'
 
 
 def dashboard_advice(hour, weather, battery, windows):
@@ -287,6 +314,8 @@ class Pocket:
         self.display_battery = None
         self.weather = None
         self.weather_at = 0
+        self.location_at = 0
+        self.weather_location_key = None
         self.weather_last_attempt = -1800
         self.weather_task = None
         self.chat_advice = None
@@ -490,10 +519,12 @@ class Pocket:
         kind = msg.get('type')
         if kind == 'hello':
             self.device = {'source': 'wifi' if source != 'usb' else 'usb', 'connectionId':source, 'lastSeen': time.time(), **{k: msg[k] for k in ('battery', 'millivolts', 'firmware', 'rssi', 'wifiConnected', 'usbConnected', 'configurationMode', 'configurationUrl', 'configurationSsid') if k in msg}}
+            self.accept_location(msg.get('location'))
             self.dirty = True
         elif kind == 'telemetry':
             self.device.update({k: msg[k] for k in ('battery', 'millivolts', 'rssi', 'displayBusy', 'displayTimeouts', 'screenPhase', 'fullRefreshes', 'partialRefreshes', 'firmware', 'wifiConnected', 'usbConnected', 'configurationMode', 'configurationUrl', 'configurationSsid') if k in msg})
             self.device.update(source='wifi' if source != 'usb' else 'usb', lastSeen=time.time())
+            self.accept_location(msg.get('location'))
             self.dirty = True
         elif kind == 'event':
             try:
@@ -649,12 +680,55 @@ class Pocket:
                     windows.append({'bucket': name, 'label': label, 'remaining': max(0, min(100, 100-window['usedPercent'])), 'resetsAt': window.get('resetsAt')})
         return windows
 
+    def accept_location(self, value):
+        """Only authenticated device packets reach this method; still validate data."""
+        if not isinstance(value, dict) or value.get('source') != 'wifi-ip':
+            return
+        old_key = self.location_key(self.current_location())
+        clean = {'source': 'wifi-ip', 'status': 'unavailable'}
+        if value.get('status') == 'ready':
+            lat, lon = value.get('latitude'), value.get('longitude')
+            offset, age = value.get('utcOffsetSeconds'), value.get('ageSeconds')
+            city, zone = value.get('city'), value.get('timezone')
+            number = lambda n: isinstance(n, (int, float)) and not isinstance(n, bool) and math.isfinite(n)
+            valid = (number(lat) and -90 <= lat <= 90 and number(lon) and -180 <= lon <= 180
+                     and number(offset) and -43200 <= offset <= 50400 and number(age) and 0 <= age < 5400
+                     and isinstance(city, str) and 0 < len(city) <= 80 and not any(ord(c) < 32 for c in city)
+                     and isinstance(zone, str) and 0 < len(zone) <= 80 and '..' not in zone
+                     and all(c.isalnum() or c in '/_+-' for c in zone))
+            if valid:
+                clean.update(status='ready', latitude=lat, longitude=lon, city=city,
+                             timezone=zone, utcOffsetSeconds=offset)
+                self.location_at = time.monotonic() - age
+        self.device['location'] = clean
+        if old_key != self.location_key(self.current_location()):
+            self.weather = None
+            self.weather_location_key = None
+            self.weather_last_attempt = -1800
+            self.dirty = True
+
+    def current_location(self):
+        loc = self.device.get('location') or {}
+        if loc.get('status') == 'ready' and time.monotonic() - self.location_at < 5400:
+            return loc
+        return None
+
+    @staticmethod
+    def location_key(location):
+        if not location:
+            return None
+        return tuple(location.get(k) for k in ('latitude', 'longitude', 'city', 'timezone', 'utcOffsetSeconds'))
+
     async def refresh_weather(self):
-        """Opt in only with explicit coordinates; cache observations and fail closed."""
+        location = self.current_location()
+        automatic = (self.device.get('location') or {}).get('source') == 'wifi-ip'
+        key = self.location_key(location)
+        if automatic and not location:
+            return  # Never fall back to a fixed city for a location-capable device.
         try:
-            lat = float(os.environ.get('POCKET_WEATHER_LAT', ''))
-            lon = float(os.environ.get('POCKET_WEATHER_LON', ''))
-            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            lat = float(location['latitude'] if location else os.environ.get('POCKET_WEATHER_LAT', ''))
+            lon = float(location['longitude'] if location else os.environ.get('POCKET_WEATHER_LON', ''))
+            if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
                 return
         except (ValueError, TypeError):
             return
@@ -668,18 +742,24 @@ class Pocket:
                     response.raise_for_status()
                     data = await response.json()
             current = data.get('current') or {}
-            temperature = current.get('temperature_2m')
-            code = current.get('weather_code')
+            temperature, code = current.get('temperature_2m'), current.get('weather_code')
             if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not -90 <= temperature <= 70:
                 return
+            if isinstance(code, bool) or not isinstance(code, int) or code not in (0,1,2,3,45,48,51,53,55,56,57,61,63,65,66,67,71,73,75,77,80,81,82,85,86,95,96,99):
+                return
+            if automatic and key != self.location_key(self.current_location()):
+                return  # An old city's request completed after Wi-Fi changed.
             self.weather = {'temperature': temperature, 'code': code}
+            self.weather_location_key = key
             self.weather_at = time.monotonic()
             self.dirty = True
         except Exception:
-            # No stale reading is displayed as current; no coordinates are logged.
             return
 
     def current_weather(self):
+        automatic = (self.device.get('location') or {}).get('source') == 'wifi-ip'
+        if automatic and (not self.current_location() or self.weather_location_key != self.location_key(self.current_location())):
+            return None
         if self.weather and time.monotonic() - self.weather_at < 5400:
             return self.weather
         return None
@@ -774,6 +854,11 @@ class Pocket:
                 'device': device, 'cwd': self.config['cwd'], 'noProgressSeconds': int(time.monotonic()-self.last_event),
                 'mobileHost': mobile_host, 'mobileCa': mobile_ca}
 
+    def is_idle_dashboard(self):
+        age = time.monotonic()-self.last_event
+        return (self.page == 0 and not self.turn and not self.draft and not self.approvals
+                and (self.status == '待命' or (self.status in ('已完成', '已停止') and age >= 180)))
+
     def render(self):
         im = Image.new('1', (200, 200), 1)
         d = ImageDraw.Draw(im)
@@ -817,22 +902,27 @@ class Pocket:
         text(145,4,f'{battery}%' if battery is not None else '--%',12)
         d.line((6,25,194,25),fill=0)
         age = int(time.monotonic()-self.last_event)
-        idle = (self.page == 0 and not self.turn and not self.draft and not self.approvals
-                and (self.status == '待命' or (self.status in ('已完成', '已停止') and age >= 180)))
+        idle = self.is_idle_dashboard()
         if idle:
-            now = dashboard_time()
+            location = self.current_location()
+            automatic = (self.device.get('location') or {}).get('source') == 'wifi-ip'
+            now = dashboard_time(location)
             windows = self.remaining()
             weather = self.current_weather()
-            text(8,29,now.strftime('%H:%M'),24)
-            text(116,35,'待命',15)
+            text(8,29,'--:--' if automatic and not location else now.strftime('%H:%M'),24)
+            text(115,37,'待命',13)
+            draw_codex_mark(d, 164, 30, 28)
             quota = '  '.join(f'{q["label"]}余{q["remaining"]:g}%' for q in windows[:2])
             text(8,63,quota or '订阅额度：未知',13)
             text(8,84,dashboard_context(self.context),13)
             temperature = f'{weather["temperature"]:.0f}°C' if weather else '未配置/未知'
-            text(8,104,'天气：'+temperature,13)
+            city = location['city'] if location else ('定位中/未知' if automatic else '天气')
+            text(8,104,fit(city,13,110),13)
+            text(124,104,temperature if weather else '--°C',13)
+            text(8,124,weather_description(weather['code']) if weather else '天气暂不可用',12)
             personal = personal_advice(self.read_personal_context(), time.time())
             label, advice = personal or self.current_chat_advice() or ('通用建议', dashboard_advice(now.hour, weather, battery, windows))
-            text(8,126,label,12)
+            # The source label remains available in the console; city gets its own row.
             text(8,145,fit(advice,13),13)
         else:
             text(8,29,self.status[:10],20)
@@ -878,7 +968,7 @@ class Pocket:
                     # Even identical screens carry heartbeat. E-paper only refreshes changed pixels.
                     packet = {'type':'frame', 'data':base64.b64encode(frame).decode(), 'hash':hashlib.sha256(frame).hexdigest()[:12],
                               'state':self.status,'voiceBusy':self.voice_busy,'draftReady':bool(self.draft),
-                              'audioCodecs':['pcm16','mulaw8k'],'voiceAutoSubmit':True}
+                              'audioCodecs':['pcm16','mulaw8k'],'voiceAutoSubmit':True,'idleDashboard':self.is_idle_dashboard()}
                     for peer in list(self.peers.values()):
                         with contextlib.suppress(Exception):
                             await peer.send_json(packet)

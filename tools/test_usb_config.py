@@ -75,6 +75,11 @@ class UsbWebTests(unittest.TestCase):
         self.assertEqual(self.request('/api/config', 'POST', '{"ssid":"new"}')[0], 200)
         self.assertEqual(self.device.calls, [('save', {'ssid': 'new'})])
 
+    def test_configuration_screen_controls(self):
+        self.assertEqual(self.request('/api/open', 'POST', '{}')[0], 200)
+        self.assertEqual(self.request('/api/close', 'POST', '{}')[0], 200)
+        self.assertEqual(self.device.calls, [('open', None), ('close', None)])
+
     def test_wifi_scan_start_and_results(self):
         status, body = self.request('/api/wifi/scan', 'POST', '{}')
         self.assertEqual(status, 200)
