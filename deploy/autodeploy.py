@@ -158,7 +158,7 @@ def deploy(config, *, retry=False):
         run_command(['docker', 'run', '--rm', '--network', 'none', '--read-only',
                      '--tmpfs', '/tmp:rw,size=256m', '--entrypoint', 'env',
                      candidate['services']['gateway']['image'], '-u', 'POCKET_STATE_DIR',
-                     '-u', 'POCKET_WORKSPACE', '-u', 'POCKET_EXTERNAL_SANDBOX', 'python', '-m',
+                     '-u', 'POCKET_WORKSPACE', '-u', 'POCKET_EXTERNAL_SANDBOX', '-u', 'POCKET_CA_FILE', 'python', '-m',
                      'unittest', 'discover', '-s', '/app/bridge', '-p', 'test_*.py', '-v'])
         state['pending'] = dict(active=str(active), rollback=str(rollback))
         save_json(state_path, state)

@@ -48,7 +48,7 @@ jobs:
           docker run --rm --entrypoint gosu pocket-gateway:check pocket:pocket sh -c 'id && node --version && npm --version && codex --version && python -c "import aiohttp, PIL, faster_whisper"'
       - name: Run tests inside Linux image
         run: |
-          docker run --rm --entrypoint env pocket-gateway:check -u POCKET_STATE_DIR -u POCKET_WORKSPACE -u POCKET_EXTERNAL_SANDBOX python -m unittest discover -s /app/bridge -p 'test_*.py' -v
+          docker run --rm --entrypoint env pocket-gateway:check -u POCKET_STATE_DIR -u POCKET_WORKSPACE -u POCKET_EXTERNAL_SANDBOX -u POCKET_CA_FILE python -m unittest discover -s /app/bridge -p 'test_*.py' -v
       - name: Build and validate ingress
         run: |
           docker build --target ingress -t pocket-ingress:check .

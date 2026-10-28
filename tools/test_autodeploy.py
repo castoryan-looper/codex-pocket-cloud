@@ -101,6 +101,7 @@ class AutoDeployTests(unittest.TestCase):
         fetch = next(c[1] for c in self.calls if c[0] == 'git' and c[1][0] == 'fetch')
         self.assertIn('+refs/heads/master:refs/pocket-autodeploy/candidate', fetch)
         tests = next(c[1] for c in self.calls if c[0] == 'run' and c[1][:2] == ['docker', 'run'])
+        self.assertIn('POCKET_CA_FILE', tests)
         self.assertIn('--read-only', tests)
         self.assertIn('none', tests)
         self.assertNotIn('--volume', tests)

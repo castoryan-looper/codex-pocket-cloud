@@ -69,3 +69,5 @@
 2026-10-29 master 自动部署：新增独立安装的 systemd timer/oneshot 拉取部署器，原工作区不 checkout/reset；每个提交导出快照，固定 Compose 项目，校验现有卷名和挂载目标，先构建和无生产卷/无网络的隔离测试，再同步重建 gateway/ingress，HTTPS 健康通过后记录成功。构建失败保留旧容器，启动/健康失败恢复旧镜像与已解析的旧 Compose 配置；有中断恢复记录、失败重试冷却、并发文件锁和回滚失败停止逻辑。13 项状态机及 Git 测试中 12 项在 Windows 通过，Linux 文件锁项跳过，已加入 ubuntu-24.04 CI；真实 Git bundle master 拉取和保留 dirty main 工作区验证通过。测试 Docker 调用为替身，未在真实 Docker/systemd 或用户云服务器执行安装/部署。原 Docker CI 增加 master 触发。
 
 2026-10-29 同步 GitHub 前核对：远程默认分支为 main，master API 返回重命名重定向。安装器和说明已改为默认监听 origin/main，仍支持 --branch master。新增 main 分支选择测试，14 项测试中13项本地通过、Linux文件锁项跳过。
+
+2026-10-29 GitHub Linux 自动部署测试14项全部通过。首次 Docker CI 的54项测试中2项因继承镜像 POCKET_CA_FILE=/trust/root.crt、隔离容器未挂载生产CA而失败；CI与自动部署的隔离测试命令都清除此环境变量，保持正式服务的证书校验逻辑不变。
