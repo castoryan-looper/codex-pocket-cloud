@@ -5,6 +5,10 @@
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <mbedtls/base64.h>
+#include <FFat.h>
+#include <esp_partition.h>
+#include <esp_random.h>
+#include <esp_wifi.h>
 #include "epaper_config.h"
 #include "port_i2c.h"
 #include "port_display.h"
@@ -19,13 +23,43 @@
 // All transport sends are serialized. The audio task never calls the WS client.
 static SemaphoreHandle_t imageMutex;
 static QueueHandle_t netQueue;
-static WebSocketsClient socketClient;
+class PocketSocket : public WebSocketsClient {
+public:
+  // One masked WebSocket frame with bounded TLS writes, including large payloads.
+  bool sendPackedText(const String &text) {
+    size_t length=text.length();
+    uint8_t *frame=(uint8_t*)malloc(length+14);
+    if(!frame)return false;
+    uint8_t mask[4];esp_fill_random(mask,sizeof(mask));
+    uint8_t header=createHeader(frame,WSop_text,length,true,mask,true);
+    for(size_t i=0;i<length;i++)frame[header+i]=(uint8_t)text[i]^mask[i%4];
+    // Keep TLS writes small for hotspot paths that stall on full-size segments.
+    // TCP preserves one continuous WebSocket frame across these writes.
+    size_t total=header+length,offset=0;
+    while(offset<total) {
+      size_t count=min((size_t)512,total-offset);
+      size_t written=write(&_client,frame+offset,count);
+      if(written!=count)break;
+      offset+=written;
+    }
+    free(frame);return offset==total;
+  }
+  void logTransport(const char *stage) {
+    char detail[160]={0};
+    int code=_client.ssl ? _client.ssl->lastError(detail,sizeof(detail)) : 0;
+    Serial.printf("NET %s tls=%d detail=%s heap=%u largest=%u wifi=%d rssi=%d\n",stage,code,detail,
+      ESP.getFreeHeap(),ESP.getMaxAllocHeap(),(int)WiFi.status(),WiFi.RSSI());
+    Serial.printf("NET options nodelay=%d ip=%s cpu=%u\n",_client.tcp ? _client.tcp->getNoDelay() : -1,WiFi.localIP().toString().c_str(),getCpuFrequencyMhz());
+  }
+};
+static PocketSocket socketClient;
 static Preferences prefs;
 static OneButton bootButton, powerButton;
 static esp_io_expander_handle_t exio;
 static String wifiSsid, wifiPass, remoteHost, remotePath, remoteToken, rootCa;
 static bool tlsEnabled = true, wifiConfigured = false, bridgeConfigured = false;
 static volatile bool netConnected=false;
+static volatile int lastWifiDisconnectReason=0;
 static uint16_t remotePort = 443;
 static volatile bool imageDirty = false;
 static volatile bool recording = false, captureRequested = false, captureCancelled = false;
@@ -37,6 +71,48 @@ static volatile uint32_t localUiAt=0, pressStartedAt=0, recordingStartedAt=0;
 static volatile uint32_t audioBytes=0;
 static volatile bool audioEndSent=false, remoteVoiceBusy=false, remoteDraftReady=false;
 static int localBattery=-1;
+static const char * volatile audioFailure="";
+static volatile int codecFailure=0;
+static const char * volatile enqueueFailure="";
+static volatile uint32_t networkProgressAt=0,networkPackets=0;
+static bool audioStoreReady=false;
+static volatile bool uploadPending=false;
+static volatile bool remoteMulaw8k=false;
+static uint8_t ssidBitmap[350];
+static bool ssidBitmapValid=false;
+static volatile unsigned uploadRetries=0;
+static volatile bool syntheticRequested=false,syntheticUpload=false;
+static volatile unsigned uploadProgress=0;
+static volatile bool transportProbeRequested=false;
+static uint32_t uploadRequestedAt=0;
+static const char *audioCachePath="/pocket-recording.pcm";
+// Never format an existing filesystem. Only initialize an entirely erased FAT partition.
+static bool initAudioStore() {
+  const esp_partition_t *part=esp_partition_find_first(ESP_PARTITION_TYPE_DATA,ESP_PARTITION_SUBTYPE_DATA_FAT,"ffat");
+  if(!part)return false;
+  // wl_mount can initialize management sectors even when FAT mounting fails.
+  // Inspect raw flash BEFORE any mount attempt, otherwise a virgin partition
+  // is misclassified as nonblank by our own first mount attempt.
+  bool erased=true;uint8_t block[1024];
+  for(size_t offset=0;erased && offset<part->size;offset+=sizeof(block)) {
+    size_t count=min(sizeof(block),(size_t)part->size-offset);
+    if(esp_partition_read(part,offset,block,count)!=ESP_OK)return false;
+    for(size_t i=0;i<count;i++)if(block[i]!=0xff) {erased=false;break;}
+  }
+  bool mounted=FFat.begin(erased);
+  Serial.printf("AUDIO STORE partition=%s erased=%d mounted=%d\n",part->label,erased,mounted);
+  if(!mounted)return false;
+  const uint8_t pattern[]={0x50,0x54,0x54,0,0xff,0x55,0xaa,0x34};
+  uint8_t verify[sizeof(pattern)]={0};
+  File probe=FFat.open(audioCachePath,FILE_WRITE);
+  bool writable=probe && probe.write(pattern,sizeof(pattern))==sizeof(pattern);
+  if(probe)probe.close();
+  probe=FFat.open(audioCachePath,FILE_READ);
+  bool readable=probe && probe.read(verify,sizeof(verify))==sizeof(verify) && memcmp(pattern,verify,sizeof(pattern))==0;
+  if(probe)probe.close();FFat.remove(audioCachePath);
+  Serial.printf("AUDIO STORE CHECK write=%d read=%d free=%u\n",writable,readable,(unsigned)FFat.freeBytes());
+  return writable && readable;
+}
 static volatile int lastLocalKey=0;
 static volatile uint32_t lastLocalKeyAt=0;
 static void setLocalUi(int state) { localUi=state; localUiAt=millis(); imageDirty=true; }
@@ -77,13 +153,14 @@ bool sendPacket(const JsonDocument &doc) {
   String out;
   serializeJson(doc, out);
   // Runtime commands, voice, frames and status use Wi-Fi only.
-  // Device configuration uses HTTP; USB is only for flashing/startup logs.
+  // USB carries configuration/status only; runtime traffic stays on Wi-Fi.
   if (netConnected) {
     char *copy = strdup(out.c_str());
-    if (!copy) return false;
+    if (!copy) {enqueueFailure="TX NO MEMORY";return false;}
     if (xQueueSend(netQueue, &copy, pdMS_TO_TICKS(doc["type"]=="audio_end" ? 500 : 10)) == pdTRUE) return true;
     free(copy);
-  }
+    enqueueFailure="TX QUEUE FULL";
+  } else enqueueFailure="CLOUD DISCONNECTED";
   return false;
 }
 
@@ -101,7 +178,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.3.0";
+  doc["firmware"] = "codex-pocket-0.5.2";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -158,10 +235,13 @@ void packet(const String &line) {
     online = true;
     remoteVoiceBusy=doc["voiceBusy"]|false;
     remoteDraftReady=doc["draftReady"]|false;
+    remoteMulaw8k=false;
+    for(JsonVariant codec : doc["audioCodecs"].as<JsonArray>())
+      if(String(codec.as<const char*>())=="mulaw8k")remoteMulaw8k=true;
     String state=doc["state"]|"";
     // Ignore delayed cloud "recording" screens until local capture/upload is over.
     if(audioEndSent && localUi==UiRecognizing) {
-      bool finalState=remoteVoiceBusy || remoteDraftReady || state=="识别语音" || state=="待发送" || state=="语音失败" || state=="录音失败" || state=="录音太短";
+      bool finalState=remoteVoiceBusy || remoteDraftReady || state=="ʶ������" || state=="������" || state=="����ʧ��" || state=="¼��ʧ��" || state=="¼��̫��";
       bool oldGateway=state.length()==0 && millis()-localUiAt>1500;
       if(finalState || oldGateway) setLocalUi(UiIdle);
     }
@@ -178,12 +258,14 @@ void screenTask(void *) {
   unsigned refreshCount = 0;
   uint32_t lastFullRefresh = millis();
   int previousWifi=-1,previousUsb=-1,previousPortal=-1,previousCloud=-1,previousUi=-99,previousSecond=-1,previousProgress=-1,previousKey=0;
+  String previousSsid;
   for (;;) {
     bool wifiConnected=WiFi.status()==WL_CONNECTED;
+    String connectedSsid=wifiConnected?WiFi.SSID():"";
     bool usbConnected=HWCDC::isPlugged();
-    int cloud=netConnected && online;
+    int cloud=wifiConnected && netConnected && online;
     int ui=localUi;
-    if(!portalActive) {
+    if(!portalActive && !recording && !uploadPending) {
       if(!wifiConnected) ui=8;
       else if(!bridgeConfigured) ui=10;
       else if(!netConnected) ui=9;
@@ -191,8 +273,8 @@ void screenTask(void *) {
     }
     int key=(millis()-lastLocalKeyAt<500) ? lastLocalKey : 0;
     int second=recording ? (millis()-recordingStartedAt)/1000 : -1;
-    int progress=ui==UiHold ? min(4,(int)((millis()-pressStartedAt)/250)) : -1;
-    if (previousWifi!=wifiConnected || previousUsb!=usbConnected || previousPortal!=(int)portalActive || previousCloud!=cloud || previousUi!=ui || previousSecond!=second || previousProgress!=progress || previousKey!=key) imageDirty=true;
+    int progress=ui==UiHold ? min(4,(int)((millis()-pressStartedAt)/250)) : ui==UiSending ? (int)(uploadProgress/10) : -1;
+    if (previousWifi!=wifiConnected || previousUsb!=usbConnected || previousPortal!=(int)portalActive || previousCloud!=cloud || previousUi!=ui || previousSecond!=second || previousProgress!=progress || previousKey!=key || previousSsid!=connectedSsid) imageDirty=true;
     if (imageDirty) {
       xSemaphoreTake(imageMutex, portMAX_DELAY);
       memcpy(image, desiredImage, 5000);
@@ -200,7 +282,7 @@ void screenTask(void *) {
       imageDirty = false;
       xSemaphoreGive(imageMutex);
       previousWifi=wifiConnected; previousUsb=usbConnected;
-      previousPortal=portalActive;previousCloud=cloud;previousUi=ui;previousSecond=second;previousProgress=progress;previousKey=key;
+      previousPortal=portalActive;previousCloud=cloud;previousUi=ui;previousSecond=second;previousProgress=progress;previousKey=key;previousSsid=connectedSsid;
       if(!portalActive) {
         if(ui>=0 && ui<12) memcpy(image,localScreens[ui],5000);
         else memcpy(image+186*25,key==1?localFooterBoot:key==2?localFooterPower:localFooter,sizeof(localFooter));
@@ -212,11 +294,31 @@ void screenTask(void *) {
           snprintf(timer,sizeof(timer),"%02u:%02u / %us",seconds/60,seconds%60,recordSeconds);
           imageAsciiLarge(image,23,103,timer);
         }
+        if(ui==UiSending) {
+          imageAsciiLarge(image,65,110,String(uploadProgress)+"%");
+          if(uploadRetries)imageAscii(image,52,143,"RETRY "+String(uploadRetries)+"/3");
+        }
+        if(ui==UiAudioError) {
+          imageAscii(image,8,108,audioFailure);
+          char diagnostic[28];snprintf(diagnostic,sizeof(diagnostic),"MIC=%d Q=%u",codecFailure,(unsigned)uxQueueMessagesWaiting(netQueue));
+          imageAscii(image,8,129,diagnostic);
+        }
         if(ui==9 || ui==11) imageAscii(image,8,118,remoteHost+":"+String(remotePort));
         const uint8_t *header=cloud ? localHeaderOnline : netConnected ? localHeaderConnecting : localHeaderOffline;
         for(int y=0;y<25;y++) memcpy(image+y*25,header+y*10,10);
         for(int y=0;y<24;y++) for(int x=139;x<200;x++) image[y*25+x/8]|=0x80>>(x%8);
         imageAscii(image,145,5,localBattery<0 ? "--%" : String(localBattery)+"%");
+      }
+      if(!portalActive && wifiConnected && (ui==UiIdle || ui==9 || ui==11)) {
+        // Show the actual SSID even while waiting for the cloud to reconnect.
+        int top=ui==UiIdle?186:145;
+        for(int y=top;y<top+14;y++)memset(image+y*25,0xff,25);
+        if(ssidBitmapValid && connectedSsid==wifiSsid)memcpy(image+top*25,ssidBitmap,sizeof(ssidBitmap));
+        else {
+          String name=connectedSsid;
+          if(name.length()>22)name=name.substring(0,21)+"~";
+          imageAscii(image,4,top+1,"WiFi:"+name);
+        }
       }
       if(portalActive) {
         memcpy(image,offlineImages[4],5000);
@@ -262,64 +364,183 @@ void screenTask(void *) {
   }
 }
 
+// Capture never waits for TLS or the upload queue. The reserved FAT partition
+// holds at most one 20-second PCM clip; remove it after upload/cancel and on boot.
 void audioTask(void *) {
-  int16_t stereo[1024];
-  int16_t mono[512];
-  unsigned char b64[1400];
+  int16_t stereo[960],mono[480];
   for (;;) {
-    if (!captureRequested) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
-    captureRequested=false;
-    // Release just after the threshold must never start an unattended recording.
-    if(digitalRead(BOOT_BUTTON_PIN)!=LOW || digitalRead(PWR_BUTTON_PIN)==LOW || portalActive || !netConnected || !online) continue;
-    captureCancelled=false;audioEndSent=false;audioBytes=0;
-    recording=true;recordingStartedAt=millis();setLocalUi(UiRecording);
-    Serial.printf("PTT START %lu\n",(unsigned long)recordingStartedAt);
-    JsonDocument start;start["type"]="audio_start";start["maxSeconds"]=recordSeconds;
-    bool captureError=!sendPacket(start);
-    uint32_t began=millis(),sentBytes=0;
-    while (!captureError && recording && digitalRead(BOOT_BUTTON_PIN)==LOW && digitalRead(PWR_BUTTON_PIN)!=LOW && netConnected && millis()-began<recordSeconds*1000UL && sentBytes+sizeof(mono)<=recordSeconds*32000UL) {
-      if(Codec_RecordData((uint8_t*)stereo,sizeof(stereo))!=ESP_OK) {captureError=true;break;}
-      if(!recording || digitalRead(BOOT_BUTTON_PIN)!=LOW || digitalRead(PWR_BUTTON_PIN)==LOW) break;
-      for(int i=0;i<512;i++) mono[i]=stereo[2*i];
-      size_t size=0;mbedtls_base64_encode(b64,sizeof(b64),&size,(uint8_t*)mono,sizeof(mono));b64[size]=0;
-      JsonDocument chunk;chunk["type"]="audio_chunk";chunk["data"]=(char*)b64;
-      if(!sendPacket(chunk)) {captureError=true;break;}
-      sentBytes+=sizeof(mono);audioBytes=sentBytes;
+    if(syntheticRequested) {
+      syntheticRequested=false;
+      if(!audioStoreReady || uploadPending || recording || !netConnected || !online)continue;
+      File test=FFat.open(audioCachePath,FILE_WRITE);
+      uint8_t silence[512]={0};bool ok=(bool)test;
+      for(int n=0;ok && n<250;n++) {ok=test.write(silence,sizeof(silence))==sizeof(silence);vTaskDelay(1);}
+      if(test)test.close();
+      if(!ok){FFat.remove(audioCachePath);audioFailure="AUDIO WRITE FAILED";setLocalUi(UiAudioError);continue;}
+      captureCancelled=false;audioEndSent=false;audioBytes=128000;uploadProgress=0;uploadRetries=0;audioFailure="";syntheticUpload=true;
+      uploadRequestedAt=millis();setLocalUi(UiSending);uploadPending=true;continue;
     }
-    bool limit=millis()-began>=recordSeconds*1000UL || sentBytes+sizeof(mono)>recordSeconds*32000UL;
-    if(digitalRead(PWR_BUTTON_PIN)==LOW || portalActive) captureCancelled=true;
-    recording=false;lastAudioEnd=millis();
-    Serial.printf("PTT STOP %lu bytes=%lu error=%d cancelled=%d\n",(unsigned long)lastAudioEnd,(unsigned long)sentBytes,captureError,(int)captureCancelled);
-    if(captureCancelled) setLocalUi(UiCancelled);
-    else if(captureError || !netConnected) setLocalUi(UiAudioError);
-    else if(sentBytes<6400) setLocalUi(UiTooShort);
-    else if(limit && digitalRead(BOOT_BUTTON_PIN)==LOW) setLocalUi(UiLimit);
-    else setLocalUi(UiSending);
-    JsonDocument end;end["type"]="audio_end";end["bytes"]=sentBytes;
-    end["cancelled"]=(bool)captureCancelled;
-    end["error"]=captureCancelled ? "cancelled" : captureError ? "capture_or_queue_failed" : "";
-    if(!sendPacket(end) && !captureCancelled) setLocalUi(UiAudioError);
+    if(!captureRequested) {vTaskDelay(pdMS_TO_TICKS(5));continue;}
+    captureRequested=false;
+    if(uploadPending || digitalRead(BOOT_BUTTON_PIN)!=LOW || digitalRead(PWR_BUTTON_PIN)==LOW || portalActive || !netConnected || !online)continue;
+    captureCancelled=false;audioEndSent=false;audioBytes=0;uploadProgress=0;uploadRetries=0;syntheticUpload=false;audioFailure="";codecFailure=0;
+    File clip=audioStoreReady ? FFat.open(audioCachePath,FILE_WRITE) : File();
+    if(!clip || FFat.freeBytes()<recordSeconds*32000UL) {
+      if(clip)clip.close();audioFailure="AUDIO STORAGE FAILED";setLocalUi(UiAudioError);continue;
+    }
+    recording=true;recordingStartedAt=millis();setLocalUi(UiRecording);
+    Serial.printf("PTT START %lu mode=local-cache\n",(unsigned long)recordingStartedAt);
+    uint32_t began=millis(),captured=0;bool failed=false;
+    while(recording && digitalRead(BOOT_BUTTON_PIN)==LOW && digitalRead(PWR_BUTTON_PIN)!=LOW && millis()-began<recordSeconds*1000UL && captured+sizeof(mono)<=recordSeconds*32000UL) {
+      int result=Codec_RecordData((uint8_t*)stereo,sizeof(stereo));
+      if(result!=ESP_OK) {codecFailure=result;audioFailure="MIC READ FAILED";failed=true;break;}
+      if(!recording || digitalRead(BOOT_BUTTON_PIN)!=LOW || digitalRead(PWR_BUTTON_PIN)==LOW)break;
+      for(int i=0;i<480;i++)mono[i]=stereo[2*i];
+      if(clip.write((uint8_t*)mono,sizeof(mono))!=sizeof(mono)) {audioFailure="AUDIO WRITE FAILED";failed=true;break;}
+      captured+=sizeof(mono);audioBytes=captured;
+    }
+    bool limit=millis()-began>=recordSeconds*1000UL || captured+sizeof(mono)>recordSeconds*32000UL;
+    if(digitalRead(PWR_BUTTON_PIN)==LOW || portalActive)captureCancelled=true;
+    clip.close();recording=false;lastAudioEnd=millis();
+    Serial.printf("PTT STOP %lu bytes=%lu error=%d cancelled=%d reason=%s heap=%u\n",(unsigned long)lastAudioEnd,(unsigned long)captured,failed,(int)captureCancelled,audioFailure,ESP.getFreeHeap());
+    if(captureCancelled || failed || captured<6400) {
+      FFat.remove(audioCachePath);
+      setLocalUi(captureCancelled?UiCancelled:failed?UiAudioError:UiTooShort);
+    } else {
+      uploadRequestedAt=millis();setLocalUi(limit && digitalRead(BOOT_BUTTON_PIN)==LOW ? UiLimit : UiSending);
+      uploadPending=true;
+    }
   }
+}
+
+// 16-bit linear PCM to 8-bit G.711 mu-law, used after averaging sample pairs.
+static uint8_t muLawEncode(int32_t sample) {
+  int mask=0xff;
+  if(sample<0){sample=132-sample;mask=0x7f;}else sample+=132;
+  sample=min(sample,(int32_t)32767);
+  int segment=0;while(segment<7 && sample>((0x100<<segment)-1))segment++;
+  return ((segment<<4)|((sample>>(segment+3))&15))^mask;
+}
+
+// A failed partial frame is discarded by the gateway when this connection
+// closes. Keep the cached clip and start it from the beginning on reconnect.
+void retryUpload(File &clip,bool &started,const char *reason) {
+  if(clip)clip.close();started=false;
+  if(netConnected)socketClient.disconnect();
+  netConnected=false;online=false;remoteMulaw8k=false;
+  if(++uploadRetries<=3 && millis()-uploadRequestedAt<300000UL && !captureCancelled) {
+    uploadProgress=0;audioFailure="";setLocalUi(UiSending);
+    Serial.printf("UPLOAD RETRY attempt=%u cause=%s\n",uploadRetries,reason);
+  } else {
+    FFat.remove(audioCachePath);uploadPending=false;audioFailure=reason;
+    setLocalUi(UiAudioError);Serial.printf("UPLOAD FAILED retries=%u cause=%s\n",uploadRetries,reason);
+  }
+}
+
+void uploadTick() {
+  static File clip;static bool started=false;static bool compressed=false;
+  static uint32_t uploaded=0,wireBytes=0;
+  if(!uploadPending)return;
+  bool expired=millis()-uploadRequestedAt>300000UL;
+  if(captureCancelled || expired) {
+    if(started && netConnected)socketClient.sendTXT("{\"type\":\"audio_end\",\"cancelled\":true,\"error\":\"upload_cancelled\"}");
+    if(clip)clip.close();FFat.remove(audioCachePath);started=false;uploadPending=false;
+    if(!captureCancelled)audioFailure="UPLOAD TIMEOUT";
+    setLocalUi(captureCancelled?UiCancelled:UiAudioError);return;
+  }
+  if(started && !netConnected){retryUpload(clip,started,"CLOUD DISCONNECTED");return;}
+  if(!netConnected || !online)return;
+  bool sent=false;
+  if(!started) {
+    clip=FFat.open(audioCachePath,FILE_READ);uploaded=0;wireBytes=0;
+    if(!clip || clip.size()!=audioBytes) {if(clip)clip.close();FFat.remove(audioCachePath);audioFailure="AUDIO SIZE MISMATCH";uploadPending=false;setLocalUi(UiAudioError);return;}
+    compressed=remoteMulaw8k;
+    JsonDocument start;start["type"]="audio_start";start["maxSeconds"]=recordSeconds;
+    if(compressed)start["codec"]="mulaw8k";
+    String json;serializeJson(start,json);sent=socketClient.sendTXT(json);started=sent;
+    Serial.printf("UPLOAD START at=%lu pcm=%lu codec=%s retry=%u test=%d\n",(unsigned long)millis(),(unsigned long)audioBytes,compressed?"mulaw8k":"pcm16",uploadRetries,(int)syntheticUpload);
+  } else if(clip.available()) {
+    static uint8_t pcm[6144],encodedAudio[1536];static unsigned char encoded[8193];
+    int count=clip.read(pcm,sizeof(pcm));size_t length=0;
+    if(count<=0 || (compressed && count%4)) {audioFailure="AUDIO READ FAILED";}
+    else {
+      size_t wireSize=count;const uint8_t *wire=pcm;
+      if(compressed) {
+        wireSize=count/4;wire=encodedAudio;
+        for(size_t i=0;i<wireSize;i++) {
+          int16_t first=(int16_t)((uint16_t)pcm[i*4]|((uint16_t)pcm[i*4+1]<<8));
+          int16_t second=(int16_t)((uint16_t)pcm[i*4+2]|((uint16_t)pcm[i*4+3]<<8));
+          encodedAudio[i]=muLawEncode(((int32_t)first+(int32_t)second)/2);
+        }
+      }
+      if(mbedtls_base64_encode(encoded,sizeof(encoded),&length,wire,wireSize)!=0){audioFailure="AUDIO ENCODE FAILED";}
+      else {
+        encoded[length]=0;JsonDocument chunk;chunk["type"]="audio_chunk";chunk["data"]=(char*)encoded;
+        String json;serializeJson(chunk,json);uint32_t before=millis();sent=socketClient.sendPackedText(json);
+        if(millis()-before>500)Serial.printf("UPLOAD SLOW ms=%lu offset=%lu\n",(unsigned long)(millis()-before),(unsigned long)uploaded);
+        if(sent){uploaded+=count;wireBytes+=wireSize;uploadProgress=audioBytes?min(100UL,uploaded*100UL/audioBytes):0;}
+      }
+    }
+  } else {
+    JsonDocument end;end["type"]="audio_end";end["bytes"]=uploaded;
+    if(syntheticUpload){end["cancelled"]=true;end["error"]="diagnostic_cancelled";}
+    String json;serializeJson(end,json);sent=socketClient.sendTXT(json);
+    if(sent){
+      clip.close();FFat.remove(audioCachePath);started=false;uploadPending=false;
+      Serial.printf("UPLOAD END pcm=%lu encoded=%lu ms=%lu retry=%u test=%d\n",(unsigned long)uploaded,(unsigned long)wireBytes,(unsigned long)(millis()-uploadRequestedAt),uploadRetries,(int)syntheticUpload);
+      audioEndSent=true;if(localUi==UiSending)setLocalUi(syntheticUpload?UiIdle:UiRecognizing);
+    }
+  }
+  if(!sent){
+    socketClient.logTransport("upload-failed");
+    if(audioFailure[0]){if(clip)clip.close();FFat.remove(audioCachePath);started=false;uploadPending=false;setLocalUi(UiAudioError);socketClient.disconnect();}
+    else retryUpload(clip,started,"WIFI SEND FAILED");
+  }
+}
+
+// Diagnostic traffic has no audio_start/end and cannot create an AI task.
+void transportProbe() {
+  transportProbeRequested=false;
+  if(recording || uploadPending || !netConnected) {Serial.println("PROBE BUSY/OFFLINE");return;}
+  socketClient.logTransport("probe-start");
+  const unsigned sizes[]={512,1312,8192};
+  for(unsigned size:sizes) {
+    String message="{\"type\":\"transport_probe\",\"pad\":\"";
+    message.reserve(size+64);while(message.length()<size-2)message+='x';message+="\"}";
+    uint32_t began=millis();unsigned sent=0;
+    for(int i=0;i<4 && netConnected;i++) {
+      if(!socketClient.sendPackedText(message))break;
+      sent+=message.length();socketClient.loop();vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    Serial.printf("PROBE size=%u bytes=%u ms=%lu connected=%d\n",size,sent,(unsigned long)(millis()-began),(int)netConnected);
+  }
+  socketClient.logTransport("probe-end");
 }
 
 // TLS handshakes and Wi-Fi socket writes must not block physical button sampling.
 void networkTask(void *) {
   for(;;) {
-    if(bridgeConfigured && wifiConfigured && WiFi.status()==WL_CONNECTED && (!portalActive||netConnected)) socketClient.loop();
+    if(bridgeConfigured && wifiConfigured && WiFi.status()==WL_CONNECTED) socketClient.loop();
+    networkProgressAt=millis();
     char *queued=nullptr;
     for(int i=0;i<8 && xQueueReceive(netQueue,&queued,0)==pdTRUE;i++) {
       if(netConnected) {
         bool isEnd=strstr(queued,"\"audio_end\"")!=nullptr;
         bool sent=socketClient.sendTXT(queued);
+        if(sent)networkPackets++;
+        networkProgressAt=millis();
         if(isEnd && sent) {
           audioEndSent=true;
           if(localUi==UiSending) setLocalUi(UiRecognizing);
-        } else if(!sent && (recording || localUi==UiSending)) {
-          captureCancelled=true;recording=false;captureRequested=false;setLocalUi(UiAudioError);
+        } else if(!sent) {
+          // Telemetry/ack failure cannot cancel microphone capture or a cached clip.
+          socketClient.logTransport("control-send-failed");
         }
       }
       free(queued);
     }
+    if(transportProbeRequested)transportProbe();
+    uploadTick();
     if(millis()-lastTelemetry>5000) {lastTelemetry=millis();telemetry();}
     vTaskDelay(pdMS_TO_TICKS(2));
   }
@@ -335,8 +556,13 @@ void setupNetwork() {
   wifiConfigured = wifiSsid.length()>0;
   bridgeConfigured = remoteHost.length() && remoteToken.length() && (!tlsEnabled || rootCa.length());
   if (!wifiConfigured) return;
+  WiFi.onEvent([](WiFiEvent_t event,WiFiEventInfo_t info){
+    if(event==ARDUINO_EVENT_WIFI_STA_DISCONNECTED){lastWifiDisconnectReason=info.wifi_sta_disconnected.reason;netConnected=false;online=false;remoteMulaw8k=false;Serial.printf("WIFI DISCONNECT reason=%d\n",(int)lastWifiDisconnectReason);imageDirty=true;}
+    else if(event==ARDUINO_EVENT_WIFI_STA_GOT_IP)lastWifiDisconnectReason=0;
+  });
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
   if(!bridgeConfigured)return;
@@ -345,15 +571,19 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.3.0";
+      hello["firmware"]="codex-pocket-0.5.2";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       String out; serializeJson(hello, out); socketClient.sendTXT(out);
     } else if (type == WStype_DISCONNECTED) {
+      Serial.printf("NET DISCONNECT reason=%.*s recording=%d bytes=%lu queue=%u\n",(int)length,payload ? (char*)payload : "",(int)recording,(unsigned long)audioBytes,(unsigned)uxQueueMessagesWaiting(netQueue));
+      socketClient.logTransport("disconnected");
+      // A transient cloud disconnect must not stop local microphone capture.
       netConnected = false;
-      online = false;
-      recording = false;
-      captureRequested = false;
+      online = false;remoteMulaw8k=false;
+    } else if (type == WStype_ERROR) {
+      Serial.printf("NET ERROR %.*s\n",(int)length,payload ? (char*)payload : "");
+      socketClient.logTransport("error");
     } else if (type == WStype_TEXT && length < 15000) {
       JsonDocument msg;
       if (!deserializeJson(msg, payload, length) && String(msg["type"] | "") == "frame")
@@ -421,6 +651,9 @@ void setup() {
   ESP_ERROR_CHECK(esp_io_expander_set_level(exio,pins,1));
   BoardAdc_Init();
   Codec_StartInit();
+  audioStoreReady=initAudioStore();
+  if(audioStoreReady)FFat.remove(audioCachePath);
+  Serial.printf("AUDIO STORE ready=%d free=%u\n",audioStoreReady,audioStoreReady ? (unsigned)FFat.freeBytes() : 0);
   bootButton.setup(BOOT_BUTTON_PIN, INPUT_PULLUP, true);
   powerButton.setup(PWR_BUTTON_PIN, INPUT_PULLUP, true);
   setupNetwork();
@@ -433,7 +666,7 @@ void setup() {
   bootButton.attachPress([](){if(!portalActive && !remoteVoiceBusy && localUi!=UiRecognizing && localUi!=UiSending){pressStartedAt=millis();if(netConnected&&online)setLocalUi(UiHold);}});
   bootButton.attachClick([](){ if(!portalActive && !recording){if(localUi==UiHold)setLocalUi(UiIdle);event("b1_click");} });
   bootButton.attachLongPressStart([](){
-    if(portalActive || remoteVoiceBusy || localUi==UiRecognizing || localUi==UiSending)return;
+    if(portalActive || uploadPending || remoteVoiceBusy || localUi==UiRecognizing || localUi==UiSending)return;
     if(netConnected && online) captureRequested=true; else disconnectedImage();
   });
   bootButton.attachLongPressStop([](){
@@ -450,10 +683,12 @@ void setup() {
   disconnectedImage();
   xTaskCreate(screenTask,"screen",8192,nullptr,1,nullptr);
   xTaskCreate(audioTask,"audio",8192,nullptr,2,nullptr);
-  xTaskCreate(networkTask,"network",12288,nullptr,1,nullptr);
+  xTaskCreate(networkTask,"network",12288,nullptr,3,nullptr);
 }
 
 void loop() {
+  loopUsbConfig();
+  loopWifiScan();
   static uint32_t chordStart=0;
   static bool buttonGuard=false,chordDone=false;
   bool bootDown=digitalRead(BOOT_BUTTON_PIN)==LOW,powerDown=digitalRead(PWR_BUTTON_PIN)==LOW;

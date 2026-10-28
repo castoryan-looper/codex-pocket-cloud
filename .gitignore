@@ -17,3 +17,6 @@ auth.json
 connection.json
 *.connection.json
 firmware/Pocket/device_config.h
+
+.usb-config-venv/
+.usb-config-runtime/
