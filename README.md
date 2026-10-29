@@ -254,3 +254,5 @@ USB 通道仅支持读取状态和设备配置、保存配置及关闭配置热�
 蓝牙 ANTICATER 旋钮的配对、默认键位和实机验证边界见 [BLUETOOTH_KNOB.md](BLUETOOTH_KNOB.md)。
 
 设备提示音、音量开关和录音互斥说明见 [SOUND_FEEDBACK.md](SOUND_FEEDBACK.md)。
+
+目标连续推进：说“新目标是……”定义目标，“验收标准是……”补充标准；每轮结果后立即给出同目标A/B，详情菜单可回顾和确认收尾。见 [RECOMMENDATIONS.md](RECOMMENDATIONS.md)。

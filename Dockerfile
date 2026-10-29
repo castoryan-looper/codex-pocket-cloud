@@ -18,7 +18,7 @@ COPY bridge/requirements.txt /app/bridge/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     PIP_CONFIG_FILE=/dev/null python -m pip install --index-url https://pypi.org/simple \
     --prefer-binary --timeout 60 --retries 5 -r /app/bridge/requirements.txt
-COPY bridge/bridge.py bridge/harness.py bridge/conversation_memory.py bridge/recommendations.py bridge/console.html bridge/icons.json bridge/test_*.py /app/bridge/
+COPY bridge/bridge.py bridge/harness.py bridge/goal_flow.py bridge/conversation_memory.py bridge/recommendations.py bridge/console.html bridge/icons.json bridge/test_*.py /app/bridge/
 COPY deployment-revision.txt /app/deployment-revision.txt
 COPY deploy/export_connection.py /app/deploy/export_connection.py
 COPY assistant-workspace/AGENTS.md /app/default-AGENTS.md
