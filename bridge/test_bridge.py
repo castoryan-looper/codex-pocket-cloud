@@ -154,6 +154,40 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         await run_case(None)
         await run_case('existing-thread')
 
+    async def test_missing_session_recovers_without_replaying_a_turn(self):
+        for message in ('no rollout found for thread id old', 'invalid session id: bad'):
+            p=self.p
+            p.thread='old'
+            p.config['thread_id']='old'
+            p.save()
+            before=p.config_path.read_bytes()
+            async def call(method, params):
+                if method=='account/read': return {'account': {'type':'chatgpt'}}
+                if method=='thread/resume': raise bridge.RpcError({'code':-32600,'message':message})
+                if method=='thread/start': return {'thread':{'id':'new'}}
+                return {}
+            p.rpc.start=AsyncMock();p.rpc.call=AsyncMock(side_effect=call)
+            p.refresh_limits=AsyncMock();p.config['speech_backend']='windows'
+            with patch('bridge.asyncio.create_task',side_effect=lambda coro:coro.close()):
+                await p.start()
+            self.assertEqual(p.config['thread_id'],'new')
+            self.assertEqual(p.config['thread_recovery']['previous_thread_id'],'old')
+            self.assertTrue(any(f.read_bytes()==before for f in p.runtime.glob('settings.before-thread-recovery-*.json')))
+            self.assertFalse(any(c.args[0]=='turn/start' for c in p.rpc.call.await_args_list))
+
+    async def test_other_resume_errors_keep_config_and_do_not_start_thread(self):
+        for error in (bridge.RpcError({'code':-32600,'message':'permission denied'}),
+                      bridge.RpcError({'code':-32000,'message':'no rollout found for thread id old'}),
+                      TimeoutError('timeout'), RuntimeError('connection lost')):
+            p=self.p;p.thread='old';p.config['thread_id']='old';p.save();before=p.config_path.read_bytes()
+            async def call(method, params):
+                if method=='account/read':return {'account':{'type':'chatgpt'}}
+                raise error
+            p.rpc.start=AsyncMock();p.rpc.call=AsyncMock(side_effect=call)
+            with self.assertRaises(RuntimeError):await p.start()
+            self.assertEqual(p.config_path.read_bytes(),before)
+            self.assertFalse(any(c.args[0]=='thread/start' for c in p.rpc.call.await_args_list))
+
     async def test_foreign_thread_ignored(self):
         await self.p.notification({'method':'turn/started','params':{'threadId':'another','turn':{'id':'wrong'}}})
         self.assertIsNone(self.p.turn)

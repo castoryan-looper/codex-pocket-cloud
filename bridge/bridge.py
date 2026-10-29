@@ -205,6 +205,17 @@ def dashboard_context(context):
     return f'上下文剩余：{left / 1000:.1f}k' if left >= 1000 else f'上下文剩余：{left}'
 
 
+class RpcError(RuntimeError):
+    def __init__(self, error):
+        self.code = error.get('code')
+        self.message = str(error.get('message', ''))
+        super().__init__(str(error))
+
+    def missing_thread(self):
+        return self.code == -32600 and self.message.startswith((
+            'no rollout found for thread id ', 'invalid session id:'))
+
+
 class Rpc:
     def __init__(self, notify):
         self.notify = notify
@@ -254,7 +265,7 @@ class Rpc:
                     future = self.pending.get(msg['id'])
                     if future and not future.done():
                         if 'error' in msg:
-                            future.set_exception(RuntimeError(str(msg['error'])))
+                            future.set_exception(RpcError(msg['error']))
                         else:
                             future.set_result(msg.get('result', {}))
                 else:
@@ -357,19 +368,36 @@ class Pocket:
             raise RuntimeError('Codex CLI 未登录。请运行 codex login 后重启。')
         params = {'cwd': self.config['cwd'], 'approvalPolicy': 'on-request', 'sandbox': 'workspace-write',
                   'developerInstructions': DEVELOPER_INSTRUCTIONS}
+        recovered = False
         if self.thread:
             try:
                 result = await self.rpc.call('thread/resume', dict(params, threadId=self.thread))
                 self.thread = result['thread']['id']
-            except Exception:
-                LOG.exception('Cannot resume hardware session')
-                raise RuntimeError('保存的硬件会话恢复失败；保留记录，请检查 CLI 登录与权限。')
+            except RpcError as error:
+                if not error.missing_thread():
+                    raise RuntimeError('保存的硬件会话恢复失败；原配置保留，请检查 CLI 状态。') from error
+                # Preserve the exact prior configuration before replacing only its
+                # dangling reference. Never send a turn or replay a prior task.
+                backup = self.runtime / ('settings.before-thread-recovery-' + str(time.time_ns()) + '.json')
+                with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
+                    output.write(self.config_path.read_bytes())
+                old_thread = self.thread
+                result = await self.rpc.call('thread/start', params)
+                self.thread = result['thread']['id']
+                self.config['thread_id'] = self.thread
+                self.config['thread_recovery'] = {'previous_thread_id': old_thread,
+                    'reason': 'missing_rollout_or_invalid_id', 'at': time.time()}
+                self.save()
+                recovered = True
+                LOG.warning('Missing hardware session reference backed up; started an idle replacement')
+            except Exception as error:
+                raise RuntimeError('保存的硬件会话恢复失败；原配置保留，请检查 CLI 状态。') from error
         else:
             result = await self.rpc.call('thread/start', params)
             self.thread = result['thread']['id']
             self.config['thread_id'] = self.thread
             self.save()
-        self.changed('待命', '按住 BOOT 说话；短按执行菜单')
+        self.changed('待命', '旧会话不可恢复，已备份并新建会话；未重放任务' if recovered else '按住 BOOT 说话；短按执行菜单')
         await self.refresh_limits()
         self.tasks = [asyncio.create_task(self.tick())]
         if self.config.get('speech_backend') != 'windows':
