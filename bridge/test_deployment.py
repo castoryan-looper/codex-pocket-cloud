@@ -32,7 +32,18 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         async with TestClient(TestServer(self.p.app())) as client:
             r=await client.get('/healthz')
             self.assertEqual(r.status,200)
-            self.assertEqual(set((await r.json()).keys()),{'ok','deviceConnected'})
+            self.assertEqual(set((await r.json()).keys()),{'ok','deviceConnected','commit'})
+            self.assertEqual(r.headers.get('Cache-Control'),'no-store')
+            with tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)/'bridge'
+                root.mkdir()
+                (root.parent/'deployment-revision.txt').write_text('a'*40,encoding='ascii')
+                with patch.object(bridge,'ROOT',root):
+                    r=await client.get('/healthz')
+                    self.assertEqual((await r.json())['commit'],'a'*40)
+                    (root.parent/'deployment-revision.txt').write_text('$Format:%H$',encoding='ascii')
+                    r=await client.get('/healthz')
+                    self.assertIsNone((await r.json())['commit'])
             self.p.rpc.process.returncode=1
             r=await client.get('/healthz')
             self.assertEqual(r.status,503)

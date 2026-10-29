@@ -17,6 +17,7 @@ import logging
 import math
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -1163,7 +1164,14 @@ class Pocket:
     async def health(self, request):
         process=getattr(self.rpc,'process',None)
         ready=process is not None and process.returncode is None
-        return web.json_response({'ok':ready,'deviceConnected':bool(self.peers)},status=200 if ready else 503)
+        revision = None
+        try:
+            candidate = (ROOT.parent/'deployment-revision.txt').read_text('ascii').strip()
+            if re.fullmatch(r'[0-9a-f]{40,64}', candidate): revision = candidate
+        except (OSError, UnicodeError):
+            pass
+        return web.json_response({'ok':ready,'deviceConnected':bool(self.peers),'commit':revision},status=200 if ready else 503,
+                                 headers={'Cache-Control':'no-store'})
 
     def app(self):
         app = web.Application(client_max_size=16000)

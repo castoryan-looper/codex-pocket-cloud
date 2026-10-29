@@ -19,6 +19,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     PIP_CONFIG_FILE=/dev/null python -m pip install --index-url https://pypi.org/simple \
     --prefer-binary --timeout 60 --retries 5 -r /app/bridge/requirements.txt
 COPY bridge/bridge.py bridge/recommendations.py bridge/console.html bridge/icons.json bridge/test_*.py /app/bridge/
+COPY deployment-revision.txt /app/deployment-revision.txt
 COPY deploy/export_connection.py /app/deploy/export_connection.py
 COPY assistant-workspace/AGENTS.md /app/default-AGENTS.md
 COPY setup-speech.py /app/setup-speech.py
