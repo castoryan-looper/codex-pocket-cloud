@@ -182,7 +182,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.9.0";
+  doc["firmware"] = "codex-pocket-0.9.1";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -203,7 +203,7 @@ void telemetry(bool hello = false) {
   doc["fullRefreshes"] = fullRefreshes;
   doc["partialRefreshes"] = partialRefreshes;
   doc["configurationMode"] = (bool)configModeActive;
-  doc["configurationUrl"] = HWCDC::isPlugged()?"http://127.0.0.1:8788/":portalActive?"http://"+WiFi.softAPIP().toString()+":80/":"http://"+WiFi.localIP().toString()+":80/";
+  doc["configurationUrl"] = HWCDC::isPlugged()?"https://43.160.215.253:8448/setup/":portalActive?"http://"+WiFi.softAPIP().toString()+":80/":"http://"+WiFi.localIP().toString()+":80/";
   deviceLocationStatus(doc);
   doc["configurationSsid"] = portalSsid;
   sendPacket(doc);
@@ -330,7 +330,10 @@ void screenTask(void *) {
       }
       if(configModeActive) {
         memcpy(image,usbConnected?configUsbScreen:configApScreen,5000);
-        if(usbConnected)imageAscii(image,8,99,"http://127.0.0.1:8788/");
+        if(usbConnected){
+          imageAscii(image,8,94,"https://43.160.215.253");
+          imageAscii(image,8,110,":8448/setup/");
+        }
         else if(portalActive){
           imageAscii(image,8,92,portalSsid);
           imageAscii(image,8,113,"KEY: "+portalKey);
@@ -582,7 +585,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.9.0";
+      hello["firmware"]="codex-pocket-0.9.1";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       deviceLocationStatus(hello);

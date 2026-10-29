@@ -19,8 +19,8 @@ def screens():
         text(8, 36, 'USB 配置' if mode == 'Usb' else 'Wi-Fi 热点配置', 21)
         if mode == 'Usb':
             text(8, 74, '在已连接电脑的浏览器打开', 12)
-            text(8, 126, '先双击 USB配置.cmd', 13)
-            text(8, 148, '保持工具运行，无需切换网络', 12)
+            text(8, 132, 'Chrome / Edge 连接 USB', 12)
+            text(8, 150, '刷机前请在网页断开连接', 12)
         else:
             text(8, 72, '连接下方热点，再打开管理页', 12)
         draw.line((6, 168, 194, 168), fill=0)
