@@ -3,7 +3,22 @@ import threading
 import unittest
 from http.client import HTTPConnection
 from unittest.mock import patch
-from usb_config import ConfigServer, DeviceLink
+from usb_config import ConfigServer, DeviceLink, watch_usb
+
+
+class UsbAutoOpenTests(unittest.TestCase):
+    def test_opens_only_for_verified_device_once_per_connection(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        stop = Mock()
+        stop.wait.side_effect = [False, False, False, False, True]
+        link = Mock(port=None)
+        link.rpc.side_effect = [(200, {'firmware': 'unrelated'}), (200, {'firmware': 'codex-pocket-0.8.0'}), (200, {'firmware': 'codex-pocket-0.8.0'})]
+        port = SimpleNamespace(device='COM6', vid=0x303A)
+        with patch('usb_config.list_ports.comports', side_effect=[[port], [port], [], [port]]), patch('usb_config.webbrowser.open') as opened:
+            watch_usb(link, 'http://127.0.0.1:8788/', stop)
+        self.assertEqual(opened.call_count, 2)
+        self.assertEqual(link.rpc.call_count, 3)
 
 
 class FakeDevice:

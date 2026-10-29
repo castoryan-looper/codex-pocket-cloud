@@ -185,11 +185,32 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self.reply(404, {'error': 'USB 仅支持设备配置和状态查询'})
 
 
+def watch_usb(device, url, stop):
+    """Open once per connection, only after the board answers our protocol."""
+    announced = False
+    while not stop.wait(2):
+        ports = [p.device for p in list_ports.comports() if p.vid == 0x303A]
+        selected = device.port or (ports[0] if len(ports) == 1 else None)
+        if not selected or selected not in ports:
+            announced = False
+            continue
+        if announced:
+            continue
+        try:
+            status, data = device.rpc('status')
+            if status == 200 and str(data.get('firmware', '')).startswith('codex-pocket-'):
+                webbrowser.open(url)
+                announced = True
+        except (OSError, serial.SerialException):
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser(description='Codex Pocket USB 配置网页')
     parser.add_argument('--port', type=int, default=8788)
     parser.add_argument('--serial-port')
     parser.add_argument('--open', action='store_true')
+    parser.add_argument('--auto-open', action='store_true', help='open the page when a Codex Pocket USB device connects')
     parser.add_argument('--url-file', type=Path)
     args = parser.parse_args()
     if args.port:
@@ -217,6 +238,9 @@ def main():
         args.url_file.parent.mkdir(parents=True, exist_ok=True)
         args.url_file.write_text(url, encoding='utf-8')
     print(f'USB configuration ready: http://127.0.0.1:{server.server_port}/', flush=True)
+    stop = threading.Event()
+    if args.auto_open:
+        threading.Thread(target=watch_usb, args=(device, url, stop), daemon=True).start()
     if args.open:
         webbrowser.open(url)
     try:
@@ -224,6 +248,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
         server.server_close()
         device.close()
 
