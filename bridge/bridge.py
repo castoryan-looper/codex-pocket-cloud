@@ -1217,7 +1217,7 @@ class Pocket:
         finally:
             with contextlib.suppress(FileNotFoundError): tmp.unlink()
         self.chat_last_attempt = -900
-        return web.json_response({'ok':True,'messages':len(payload['messages'])},headers={'Cache-Control':'no-store'})
+        return web.json_response({'ok':True,'messages':len(payload['messages']), 'sha256':hashlib.sha256(raw).hexdigest()},headers={'Cache-Control':'no-store'})
 
     def app(self):
         app = web.Application(client_max_size=conversation_memory.MAX_BYTES)
