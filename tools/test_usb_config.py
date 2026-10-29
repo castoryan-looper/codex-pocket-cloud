@@ -98,7 +98,13 @@ class UsbWebTests(unittest.TestCase):
     def test_bluetooth_pair_and_forget_use_config_rpc(self):
         self.assertEqual(self.request('/api/bluetooth/pair','POST','{}')[0],200)
         self.assertEqual(self.request('/api/bluetooth/forget','POST','{}')[0],200)
-        self.assertEqual(self.device.calls,[('bluetooth_pair',None),('bluetooth_forget',None)])
+        self.assertEqual(self.device.calls,[('bluetooth_pair',{}),('bluetooth_forget',None)])
+
+    def test_bluetooth_discovery_and_selected_address(self):
+        self.assertEqual(self.request('/api/bluetooth/scan','POST','{}')[0],200)
+        self.assertEqual(self.request('/api/bluetooth/scan')[0],200)
+        self.assertEqual(self.request('/api/bluetooth/pair','POST','{"address":"aa:bb:cc:dd:ee:ff"}')[0],200)
+        self.assertEqual(self.device.calls,[('bluetooth_scan_start',None),('bluetooth_scan_results',None),('bluetooth_pair',{'address':'aa:bb:cc:dd:ee:ff'})])
 
     def test_bluetooth_offline_is_not_success(self):
         self.device.offline=True

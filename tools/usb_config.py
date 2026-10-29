@@ -131,7 +131,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self.reply(status, data)
         except (OSError, serial.SerialException) as error:
             data = {'usbProxy': True, 'deviceConnected': False, 'message': str(error)}
-            if method in ('save', 'wifi_forget', 'bluetooth_pair', 'bluetooth_forget'):
+            if method in ('save', 'wifi_forget', 'bluetooth_pair', 'bluetooth_forget', 'bluetooth_scan_start'):
                 self.reply(503, {'error': str(error)})
             else:
                 self.reply(200, data)
@@ -152,6 +152,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self.dispatch('status')
         elif path == '/api/config':
             self.dispatch('get')
+        elif path == '/api/bluetooth/scan':
+            self.dispatch('bluetooth_scan_results')
         elif path == '/api/wifi/scan':
             self.dispatch('scan_results')
         else:
@@ -177,8 +179,10 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self.dispatch('open')
         elif self.path == '/api/close':
             self.dispatch('close')
+        elif self.path == '/api/bluetooth/scan':
+            self.dispatch('bluetooth_scan_start')
         elif self.path == '/api/bluetooth/pair':
-            self.dispatch('bluetooth_pair')
+            self.dispatch('bluetooth_pair', body)
         elif self.path == '/api/bluetooth/forget':
             self.dispatch('bluetooth_forget')
         elif self.path == '/api/wifi/forget':

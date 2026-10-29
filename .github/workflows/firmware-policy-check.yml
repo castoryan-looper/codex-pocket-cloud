@@ -7,6 +7,7 @@ on:
       - tools/test_knob_hid.py
       - tools/test_wifi_profiles.py
       - tools/test_config_priority.py
+      - tools/test_bluetooth_form.cjs
       - tools/test_config_form.cjs
       - tools/test_usb_disconnect.cjs
       - tools/test_usb_config.py
@@ -19,6 +20,7 @@ on:
       - tools/test_knob_hid.py
       - tools/test_wifi_profiles.py
       - tools/test_config_priority.py
+      - tools/test_bluetooth_form.cjs
       - tools/test_config_form.cjs
       - tools/test_usb_disconnect.cjs
       - tools/test_usb_config.py
@@ -55,3 +57,4 @@ jobs:
           node --check web/serial.js
           node tools/test_usb_disconnect.cjs
           node tools/test_config_form.cjs
+          node tools/test_bluetooth_form.cjs

@@ -19,6 +19,28 @@ struct KnobInput {uint8_t action;uint32_t at,epoch;};
 struct KnobReport {uint16_t handle;uint8_t id;};
 static KnobReport knobReports[8];static unsigned knobReportCount=0;
 static portMUX_TYPE knobLock=portMUX_INITIALIZER_UNLOCKED;
+struct KnobDiscovery {char address[18],name[49];int rssi;bool hid;};
+static KnobDiscovery knobDiscovered[20];static unsigned knobDiscoveredCount=0;
+static volatile unsigned knobDiscoveryState=0; // idle, requested, scanning, done, failed
+static char knobSelectedAddress[18]={};
+static uint32_t knobDiscoveryAt=0;
+static int knobScanStart(JsonDocument &out){
+ if(!knobQueue){out["error"]="蓝牙初始化失败";return 503;}
+ if(recording||uploadPending||captureRequested){out["error"]="请先结束录音和上传";return 409;}
+ if(knobPairUntil&&(int32_t)(knobPairUntil-millis())>0){out["error"]="正在配对，请等待完成后搜索";return 409;}
+ if(knobDiscoveryState!=1&&knobDiscoveryState!=2){knobDiscoveryState=1;knobDiscoveryAt=millis();}
+ out["state"]="scanning";return 200;
+}
+static void knobScanResults(JsonDocument &out){
+ unsigned state=knobDiscoveryState;
+ if((state==1||state==2)&&millis()-knobDiscoveryAt>20000){out["state"]="error";out["error"]="蓝牙搜索超时，请稍后重试";return;}
+ out["state"]=state==1||state==2?"scanning":state==3?"done":state==4?"error":"idle";
+ if(state!=3)return;
+ KnobDiscovery rows[20];unsigned count;
+ portENTER_CRITICAL(&knobLock);count=knobDiscoveredCount;memcpy(rows,knobDiscovered,sizeof(rows));portEXIT_CRITICAL(&knobLock);
+ JsonArray list=out["devices"].to<JsonArray>();
+ for(unsigned i=0;i<count;i++){JsonObject row=list.add<JsonObject>();row["address"]=rows[i].address;row["name"]=rows[i].name;row["rssi"]=rows[i].rssi;row["hid"]=rows[i].hid;}
+}
 static void knobNotification(BLERemoteCharacteristic *characteristic,uint8_t *data,size_t length,bool){
  if(!knobConnected||!knobQueue||length>256)return;
  uint8_t id=0;bool found=false;
@@ -81,6 +103,23 @@ static void knobTask(void*){
  esp_ble_remove_bond_device(address.getNative());
 #endif
  }knobSaveAddress("");knobStatus=0;imageDirty=true;}
+  if(knobDiscoveryState==1){
+   if(recording||uploadPending||captureRequested){knobDiscoveryState=4;}
+   else{
+    knobDiscoveryState=2;knobScanning=true;
+    BLEScanResults *found=scan->start(5,false);
+    KnobDiscovery rows[20]={};unsigned count=0;
+    if(found)for(unsigned i=0;i<found->getCount()&&count<20;i++){
+     BLEAdvertisedDevice device=found->getDevice(i);String address=device.getAddress().toString();bool duplicate=false;
+     for(unsigned k=0;k<count;k++)if(address.equalsIgnoreCase(rows[k].address)){duplicate=true;break;}if(duplicate)continue;
+     strlcpy(rows[count].address,address.c_str(),sizeof(rows[count].address));strlcpy(rows[count].name,device.getName().c_str(),sizeof(rows[count].name));rows[count].rssi=device.getRSSI();rows[count].hid=device.isAdvertisingService(BLEUUID((uint16_t)0x1812));count++;
+    }
+    // Prefer stronger nearby devices; the UI still lets the user choose explicitly.
+    for(unsigned i=0;i<count;i++)for(unsigned j=i+1;j<count;j++)if(rows[j].rssi>rows[i].rssi){KnobDiscovery temp=rows[i];rows[i]=rows[j];rows[j]=temp;}
+    portENTER_CRITICAL(&knobLock);knobDiscoveredCount=count;memcpy(knobDiscovered,rows,sizeof(rows));portEXIT_CRITICAL(&knobLock);
+    knobScanning=false;knobDiscoveryState=found?3:4;scan->clearResults();
+   }
+  }
   bool pairing=knobPairUntil&&(int32_t)(knobPairUntil-millis())>0;
   if(!pairing&&!knobConnected&&!knobAddress[0]&&knobStatus==2)knobStatus=0;
   if(!knobConnected && (pairing||knobAddress[0]) && !recording&&!uploadPending&&!captureRequested){
@@ -90,7 +129,7 @@ static void knobTask(void*){
     BLEAdvertisedDevice device=results->getDevice(i);String address=device.getAddress().toString();String name=device.getName();name.toUpperCase();
     bool saved=knobAddress[0]&&address.equalsIgnoreCase(knobAddress);
     // Pair only by explicit 60s user request and the manufacturer's advertised name.
-    if(!saved&&!(pairing&&name.startsWith("ANTICATER")))continue;
+    if(pairing){if(!address.equalsIgnoreCase(knobSelectedAddress))continue;}else if(!saved)continue;
     if(knobForgetRequested||recording||uploadPending||captureRequested)break;
     if(knobBind(device)){knobPairUntil=0;break;}knobStatus=4;imageDirty=true;
    }scan->clearResults();
@@ -107,12 +146,18 @@ static void knobStatusJson(JsonDocument &d){
  const char *states[]={"unpaired","reconnecting","pairing","connected","unsupported_or_failed"};
  d["bluetoothInputCount"]=(uint32_t)knobInputCount;
  d["bluetoothConnected"]=(bool)knobConnected;d["bluetoothScanning"]=(bool)knobScanning;d["bluetoothState"]=states[knobStatus<5?knobStatus:4];
- portENTER_CRITICAL(&knobLock);char address[18];strlcpy(address,knobAddress,sizeof(address));portEXIT_CRITICAL(&knobLock);d["bluetoothPaired"]=address[0]!=0;
+ portENTER_CRITICAL(&knobLock);char address[18];strlcpy(address,knobAddress,sizeof(address));portEXIT_CRITICAL(&knobLock);d["bluetoothPaired"]=address[0]!=0;d["bluetoothAddress"]=address;
 }
-static int knobCommand(bool forget,JsonDocument &out){
+static int knobCommand(bool forget,JsonDocument &out,const String &selected=""){
  if(recording||uploadPending||captureRequested){out["error"]="请先结束录音和上传";return 409;}
  if(!knobQueue){out["error"]="蓝牙初始化失败";return 503;}
  if(forget)knobForgetRequested=true;
- else{if(knobConnected){out["error"]="旋钮已连接，请先忘记设备再重新配对";return 409;}knobPairUntil=millis()+60000;}
- out["message"]=forget?"已请求忘记旋钮；再次使用需重新配对。":"60秒内搜索 ANTICATER 蓝牙旋钮，请唤醒旋钮并断开其他主机。";return 200;
+ else{
+  if(knobForgetRequested){out["error"]="正在忘记设备，请稍后配对";return 409;}
+  if(knobDiscoveryState==1||knobDiscoveryState==2){out["error"]="正在搜索，请等待完成后选择设备";return 409;}
+  if(knobConnected){out["error"]="旋钮已连接，请先忘记设备再重新配对";return 409;}bool found=false;
+  portENTER_CRITICAL(&knobLock);for(unsigned i=0;i<knobDiscoveredCount;i++)if(selected.equalsIgnoreCase(knobDiscovered[i].address)){strlcpy(knobSelectedAddress,knobDiscovered[i].address,sizeof(knobSelectedAddress));found=true;break;}portEXIT_CRITICAL(&knobLock);
+  if(!found){out["error"]="请先搜索并选择列表中的蓝牙设备";return 400;}
+  knobPairUntil=millis()+60000;}
+ out["message"]=forget?"已请求忘记旋钮；再次使用需重新配对。":"正在配对所选设备，请保持旋钮唤醒并断开其他主机。";return 200;
 }
