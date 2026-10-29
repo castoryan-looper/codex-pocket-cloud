@@ -26,10 +26,12 @@ static QueueHandle_t netQueue;
 class PocketSocket : public WebSocketsClient {
 public:
   // One masked WebSocket frame with bounded TLS writes, including large payloads.
+  const char *lastSendFailure="";
+  size_t lastSendLength=0,lastSendOffset=0;
   bool sendPackedText(const String &text) {
-    size_t length=text.length();
-    uint8_t *frame=(uint8_t*)malloc(length+14);
-    if(!frame)return false;
+    size_t length=text.length();lastSendFailure="";lastSendLength=length;lastSendOffset=0;
+    uint8_t small[512];uint8_t *frame=length+14<=sizeof(small)?small:(uint8_t*)malloc(length+14);
+    if(!frame){lastSendFailure="TX NO MEMORY";return false;}
     uint8_t mask[4];esp_fill_random(mask,sizeof(mask));
     uint8_t header=createHeader(frame,WSop_text,length,true,mask,true);
     for(size_t i=0;i<length;i++)frame[header+i]=(uint8_t)text[i]^mask[i%4];
@@ -42,7 +44,8 @@ public:
       if(written!=count)break;
       offset+=written;
     }
-    free(frame);return offset==total;
+    lastSendOffset=offset;if(offset!=total)lastSendFailure="TLS SHORT WRITE";
+    if(frame!=small)free(frame);return offset==total;
   }
   void logTransport(const char *stage) {
     char detail[160]={0};
@@ -187,7 +190,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.11.0";
+  doc["firmware"] = "codex-pocket-0.11.1";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -481,8 +484,10 @@ void uploadTick() {
     String json;serializeJson(start,json);sent=socketClient.sendTXT(json);started=sent;
     Serial.printf("UPLOAD START at=%lu pcm=%lu codec=%s retry=%u test=%d\n",(unsigned long)millis(),(unsigned long)audioBytes,compressed?"mulaw8k":"pcm16",uploadRetries,(int)syntheticUpload);
   } else if(clip.available()) {
-    static uint8_t pcm[6144],encodedAudio[1536];static unsigned char encoded[8193];
-    int count=clip.read(pcm,sizeof(pcm));size_t length=0;
+    // Keep each complete masked WebSocket frame below one 512-byte TLS write.
+    // Smaller static buffers also leave heap headroom for BLE + TLS + display frames.
+    static uint8_t pcm[960],encodedAudio[240];static unsigned char encoded[385];
+    int count=clip.read(pcm,compressed?sizeof(pcm):288);size_t length=0;
     if(count<=0 || (compressed && count%4)) {audioFailure="AUDIO READ FAILED";}
     else {
       size_t wireSize=count;const uint8_t *wire=pcm;
@@ -515,7 +520,7 @@ void uploadTick() {
   if(!sent){
     socketClient.logTransport("upload-failed");
     if(audioFailure[0]){if(clip)clip.close();FFat.remove(audioCachePath);started=false;uploadPending=false;setLocalUi(UiAudioError);socketClient.disconnect();}
-    else retryUpload(clip,started,"WIFI SEND FAILED");
+    else{Serial.printf("UPLOAD TX FAILED cause=%s length=%u offset=%u\n",socketClient.lastSendFailure,(unsigned)socketClient.lastSendLength,(unsigned)socketClient.lastSendOffset);retryUpload(clip,started,"CLOUD SEND FAILED");}
   }
 }
 
@@ -594,7 +599,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.11.0";
+      hello["firmware"]="codex-pocket-0.11.1";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       deviceLocationStatus(hello);
