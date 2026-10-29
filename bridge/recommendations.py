@@ -21,6 +21,19 @@ class Card:
     context: str = ""
 
 
+def choice_label(card):
+    """A glanceable action; full topic and instructions remain in the reader."""
+    labels = {'goal_repair': '修好当前问题', 'goal_diagnose': '先查问题原因',
+              'goal_verify': '检查刚才结果', 'goal_advance': '继续下一步',
+              'goal_accept': '检查能否收尾', 'goal_criteria': '定好完成标准',
+              'goal_scope': '先缩小范围', 'goal_review': '回顾当前目标',
+              'goal_close': '确认目标收尾', 'goal_new': '开始新目标',
+              'goal_history': '回顾已存成果', 'advance': '推进下一步',
+              'verify': '找出一个隐患', 'explain': '换个角度理解',
+              'experiment': '试一个小实验'}
+    return labels.get(card.strategy, card.title.split('：', 1)[0])
+
+
 STRATEGIES = (
     ('advance', '推进下一步', '先核对已经完成的工作，再选一个最值得推进的小步骤，给出具体方案并在现有权限内完成。不要重复已完成的操作。'),
     ('verify', '找出一个隐患', '针对这个话题，检查最可能遗漏的边界或失败场景，给出验证办法和优先修复建议。先分析，不直接更改或部署。'),

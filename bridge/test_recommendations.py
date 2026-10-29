@@ -137,7 +137,7 @@ class RecommendationInteractionTests(unittest.IsolatedAsyncioTestCase):
         second = self.p.recommendation_cards[1]
         await self.p.action('b2_click')
         self.assertEqual(self.p.recommendation_index, 1)
-        self.assertIn(first.id, self.p.recommendations.feedback['seen'])
+        self.assertNotIn(first.id, self.p.recommendations.feedback['seen'])
         self.assertNotIn(second.id, self.p.recommendations.feedback['seen'])
         await self.p.action('b1_click')
         self.assertEqual(self.p.recommendation_reader['card'], 1)
@@ -149,7 +149,7 @@ class RecommendationInteractionTests(unittest.IsolatedAsyncioTestCase):
         await self.p.action('b2_click')
         await self.p.action('b2_click')
         self.assertEqual(self.p.recommendation_index, 0)
-        self.assertEqual(self.p.recommendation_generation, 1)
+        self.assertEqual(self.p.recommendation_generation, 0)
         await self.p.action('b2_long')
         self.assertEqual(self.p.page, 1)
         self.p.submit.assert_not_awaited()

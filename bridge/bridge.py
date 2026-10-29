@@ -29,7 +29,7 @@ from functools import lru_cache
 
 from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
 from PIL import Image, ImageDraw, ImageFont
-from recommendations import Feed, paginate
+from recommendations import Feed, paginate, choice_label
 from harness import DEVELOPER_INSTRUCTIONS, task_record
 from goal_flow import GoalFlow
 import conversation_memory
@@ -499,27 +499,20 @@ class Pocket:
             return [('发送语音文字', 'send_draft'), ('取消草稿', 'discard'), ('切换页面', 'page')]
         if self.recommendation_reading():
             card=self.recommendation_cards[self.recommendation_reader['card']]
+            if self.recommendation_expanded():
+                return [('返回确认', 'rec_summary')]
             if card.strategy in ('goal_review','goal_close','goal_history','goal_new'):
-                actions=[];pages=self.recommendation_pages();reader=self.recommendation_reader
-                if reader['page']<len(pages)-1:actions.append(('下一页','rec_next'))
-                if reader['page']>0:actions.append(('上一页','rec_prev'))
-                actions.append(('返回推荐','rec_back'))
-                if card.strategy=='goal_review':actions.append(('目标已达成，准备收尾','goal_finish'))
+                actions=[]
+                if card.strategy=='goal_review':actions.append(('准备收尾','goal_finish'))
                 if card.strategy=='goal_close':actions.append(('确认收尾','rec_run'))
+                actions += [('返回推荐','rec_back'), ('了解详情','rec_details')]
                 return actions
-            pages = self.recommendation_pages()
-            reader = self.recommendation_reader
-            actions = []
-            last = reader['page'] == len(pages)-1
-            if not last: actions.append(('下一页', 'rec_next'))
-            if last and not reader['context']: actions.append(('执行这条', 'rec_run'))
-            if reader['page'] > 0: actions.append(('上一页', 'rec_prev'))
-            if not last and not reader['context']: actions.append(('执行这条', 'rec_run'))
+            actions = [('开始执行','rec_run'), ('返回推荐','rec_back'), ('了解详情','rec_details')]
             if self.goal_flow.active:actions += [('回顾原目标','goal_review'),('都不合适，换方向','rec_skip')]
-            actions += [('返回任务详情' if reader['context'] else '查看目标档案' if self.goal_flow.active else '查看话题摘录', 'rec_context'), ('换看 B' if reader['card']==0 else '换看 A', 'rec_other'), ('返回推荐', 'rec_back')]
+            actions += [('查看目标档案' if self.goal_flow.active else '查看话题摘录', 'rec_context')]
             return actions
         if self.is_idle_dashboard():
-            return [('查看详情', 'rec_open')]
+            return [('选择 '+('A' if self.recommendation_index == 0 else 'B'), 'rec_open')]
         if self.page and not self.turn and not self.draft:
             return [('返回推荐', 'rec_back'), ('切换页面', 'page'), ('刷新额度', 'refresh')]
         return [('切换页面', 'page'), ('继续未完成工作', 'continue'), ('停止任务', 'stop'), ('刷新额度', 'refresh')]
@@ -532,6 +525,8 @@ class Pocket:
                 if self.is_idle_dashboard() and not self.recommendation_reading():
                     self.recommendation_index = (self.recommendation_index + direction) % 2
                     self.menu = 0
+                elif self.recommendation_reading() and self.recommendation_expanded():
+                    await self.recommendation_action('rec_next' if direction > 0 else 'rec_prev')
                 else:
                     self.menu = (self.menu + direction) % len(self.menu_items())
                 self.dirty = True
@@ -541,7 +536,7 @@ class Pocket:
             elif action == 'knob_back':
                 # Back never stops a task, declines an approval or submits text.
                 if self.recommendation_reading():
-                    await self.recommendation_action('rec_back')
+                    await self.recommendation_action('rec_summary' if self.recommendation_expanded() else 'rec_back')
                 elif not (self.turn or self.draft or self.approvals or self.voice_busy):
                     self.page = 0; self.menu = 0; self.dirty = True
             elif action == 'knob_feed':
@@ -550,6 +545,8 @@ class Pocket:
             elif action == 'b2_click':
                 if self.is_idle_dashboard() and not self.recommendation_reading():
                     await self.recommendation_action('rec_feed_next')
+                elif self.recommendation_reading() and self.recommendation_expanded():
+                    await self.recommendation_action('rec_next')
                 else:
                     self.menu = (self.menu + 1) % len(self.menu_items())
                     self.dirty = True
@@ -924,6 +921,10 @@ class Pocket:
     def recommendation_reading(self):
         return self.recommendation_reader is not None and self.status in ('待命','已完成','已停止','出错') and not (self.turn or self.draft or self.approvals or self.voice_busy)
 
+    def recommendation_expanded(self):
+        reader = self.recommendation_reader or {}
+        return bool(reader.get('expanded') or reader.get('context'))
+
     def recommendation_pages(self):
         reader = self.recommendation_reader
         card = self.recommendation_cards[reader['card']]
@@ -946,14 +947,7 @@ class Pocket:
             self.recommendation_reader = {'card': index, 'page': 0, 'context': False}
         elif action == 'rec_feed_next':
             if not self.is_idle_dashboard() or self.recommendation_reading(): raise ValueError('请先返回待机推荐页')
-            self.recommendations.record([self.recommendation_cards[self.recommendation_index]])
-            if self.recommendation_index == 0:
-                self.recommendation_index = 1
-            else:
-                if self.goal_flow.active:self.goal_flow.skip()
-                self.recommendation_cards = self.recommendation_pair()
-                self.recommendation_index = 0
-                self.recommendation_generation += 1
+            self.recommendation_index = 1-self.recommendation_index
         elif action == 'rec_back':
             self.recommendation_reader = None; self.page = 0
             if self.goal_flow.active or self.goal_flow.closed_pair():self.refresh_goal_followup()
@@ -973,11 +967,15 @@ class Pocket:
             self.recommendation_reader['page'] = max(0, self.recommendation_reader['page']-1)
         elif action == 'rec_context':
             self.recommendation_reader['context'] = not self.recommendation_reader['context']; self.recommendation_reader['page'] = 0
+        elif action == 'rec_details':
+            self.recommendation_reader.update(expanded=True, context=False, page=0)
+        elif action == 'rec_summary':
+            self.recommendation_reader.update(expanded=False, context=False, page=0)
         elif action == 'rec_other':
             self.recommendation_index = 1-self.recommendation_reader['card']
             self.recommendation_reader = {'card': self.recommendation_index, 'page': 0, 'context': False}
         elif action == 'rec_run':
-            if self.recommendation_reader['context']: raise ValueError('请返回任务详情再执行')
+            if self.recommendation_expanded(): raise ValueError('请返回确认页再执行')
             card = self.recommendation_cards[self.recommendation_reader['card']]
             if card.strategy=='goal_close':
                 self.goal_flow.archive();self.recommendation_reader=None;self.goal_followup_ready=True;self.page=0;self.changed('待命','目标已由你确认收尾，成果已保留。');self.refresh_goal_followup();return
@@ -1126,12 +1124,18 @@ class Pocket:
         if self.recommendation_reading():
             reader = self.recommendation_reader
             card = self.recommendation_cards[reader['card']]
-            text(8,30,('A' if reader['card']==0 else 'B')+' · '+('收尾确认' if card.strategy=='goal_close' else '目标档案' if card.strategy in ('goal_review','goal_history') else ('目标档案' if card.strategy.startswith('goal_') else '聊天摘录') if reader['context'] else '任务详情'),16)
-            pages = self.recommendation_pages()
-            reader['page'] = min(reader['page'], len(pages)-1)
-            for row, line in enumerate(pages[reader['page']]): text(8,56+row*18,line,13)
-            text(8,149,f"{reader['page']+1}/{len(pages)} 页",11)
-            text(82,149,'PWR 长按返回',11)
+            if self.recommendation_expanded():
+                text(8,30,'目标档案' if reader['context'] and self.goal_flow.active else '详细说明',16)
+                pages = self.recommendation_pages()
+                reader['page'] = min(reader['page'], len(pages)-1)
+                for row, line in enumerate(pages[reader['page']]): text(8,56+row*18,line,13)
+                text(8,149,f"{reader['page']+1}/{len(pages)} 页 · 旋转翻页",11)
+            else:
+                text(8,32,('A' if reader['card']==0 else 'B')+' · '+('收尾确认' if card.strategy=='goal_close' else '你的选择'),14)
+                text(8,59,fit(choice_label(card),20),20)
+                text(8,94,'围绕：'+fit(card.topic,12,140),12)
+                text(8,120,'按下确认 · 旋转换操作' if self.device.get('bluetoothConnected') else 'BOOT 确认 · PWR 换操作',12)
+                text(8,145,'说明可按需查看',11)
         elif idle:
             location = self.current_location()
             automatic = (self.device.get('location') or {}).get('source') == 'wifi-ip'
@@ -1141,17 +1145,16 @@ class Pocket:
             text(8,29,'--:--' if automatic and not location else now.strftime('%H:%M'),24)
             text(115,37,'下一步' if self.goal_flow.active else '待命',13)
             draw_codex_mark(d, 164, 30, 28)
-            quota = '  '.join(f'{q["label"]}余{q["remaining"]:g}%' for q in windows[:2])
-            text(8,78,fit(quota or '订阅额度：未知',11),11)
             temperature = f'{weather["temperature"]:.0f}°C' if weather else '未配置/未知'
             city = location['city'] if location else ('定位中/未知' if automatic else '天气')
             text(8,58,fit(city,11,100),11)
             text(110,58,(temperature if weather else '--°C')+' '+(weather_description(weather['code']) if weather else ''),11)
-            card = self.recommendation_cards[self.recommendation_index]
-            d.rounded_rectangle((6,96,194,160),radius=4,outline=0)
-            text(11,99,fit(('A' if self.recommendation_index==0 else 'B')+' · '+card.title.split('：',1)[0],11,174),11)
-            for row, line in enumerate(paginate(card.topic, lambda value: ui_font(14).getlength(value), width=174, rows=2)[0]):
-                text(11,117+row*18,line,14)
+            text(8,77,fit(('目标：' if self.goal_flow.active else '话题：')+self.recommendation_cards[self.recommendation_index].topic,11),11)
+            for index, card in enumerate(self.recommendation_cards):
+                y=97+index*33
+                selected=index==self.recommendation_index
+                d.rounded_rectangle((6,y,194,y+29),radius=4,outline=0,width=2 if selected else 1)
+                text(11,y+3,('> ' if selected else '  ')+('A ' if index==0 else 'B ')+fit(choice_label(card),15,142),15)
         else:
             text(8,29,self.status[:10],20)
             age = int(time.monotonic()-self.last_event)
@@ -1171,7 +1174,7 @@ class Pocket:
         d.line((6,166,194,166),fill=0)
         selected = self.menu_items()[self.menu % len(self.menu_items())][0]
         text(8,170,'> '+selected,13)
-        text(8,188,'旋转选择 / 按下确认' if self.device.get('bluetoothConnected') else 'PWR 下一条 BOOT 详情' if idle and not self.recommendation_reading() else 'PWR 选择 / BOOT 确认' if self.recommendation_reading() else 'PWR 选择   BOOT 执行',10)
+        text(8,188,('旋转翻页 / 按下返回' if self.device.get('bluetoothConnected') else 'PWR 下一页 · BOOT 返回') if self.recommendation_reading() and self.recommendation_expanded() else '旋转选择 / 按下确认' if self.device.get('bluetoothConnected') else 'PWR 选 A/B · BOOT 确认' if idle and not self.recommendation_reading() else 'PWR 选择 / BOOT 确认' if self.recommendation_reading() else 'PWR 选择   BOOT 执行',10)
         return im
 
     async def tick(self):
