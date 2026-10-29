@@ -15,6 +15,13 @@ https://{$POCKET_PUBLIC_HOST}:8443 {
   handle @health {
     reverse_proxy 127.0.0.1:8787
   }
+  handle_path /setup/* {
+    root * /srv/setup
+    header Cache-Control "no-store"
+    header X-Content-Type-Options "nosniff"
+    header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    file_server
+  }
   handle {
     respond 404
   }

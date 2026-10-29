@@ -38,5 +38,6 @@ FROM caddy:2.11.7-alpine AS ingress
 # We only listen on 8443, and keep cap_drop=ALL at runtime.
 RUN setcap -r /usr/bin/caddy && test -z "$(getcap /usr/bin/caddy)" && caddy version
 COPY docker/Caddyfile /etc/caddy/Caddyfile
+COPY web/ /srv/setup/
 COPY docker/caddy-entrypoint.sh /etc/caddy/pocket-entrypoint.sh
 ENTRYPOINT ["/bin/sh", "/etc/caddy/pocket-entrypoint.sh"]
