@@ -1,6 +1,6 @@
 /* USB data stays in the browser. Only explicitly supported configuration RPCs. */
 let usbPort, usbWriter, usbReader, usbPending = new Map(), usbQueue = Promise.resolve();
-let usbBuffer = '', usbSequence = 0;
+let usbBuffer = '', usbSequence = 0, usbClosing = false, usbReadTask = null;
 const usbMethods = {
   'GET /api/status': 'status', 'GET /api/config': 'get',
   'POST /api/config': 'save', 'POST /api/wifi/scan': 'scan_start',
@@ -14,7 +14,7 @@ function failPending(error) {
 async function readUsb() {
   const decoder = new TextDecoder();
   try {
-    while (usbPort && usbPort.readable) {
+    while (!usbClosing && usbPort && usbPort.readable) {
       usbReader = usbPort.readable.getReader();
       try {
         while (true) {
@@ -40,16 +40,39 @@ async function readUsb() {
       } finally { usbReader.releaseLock(); usbReader = null; }
     }
   } catch (_) { /* Disconnect is reported below. */ }
-  failPending(new Error('USB 已断开，请重新连接设备'));
-  usbPort = null; usbWriter = null;
-  document.getElementById('usbMessage').textContent = 'USB 已断开，请重新连接设备';
-  document.getElementById('connect').disabled = false;
+  if (!usbClosing) await disconnectUsb('USB 已断开，请重新连接设备', true);
 }
+async function disconnectUsb(message = 'USB 已断开，串口已释放，可刷写固件或重新连接', fromReader = false) {
+  if (usbClosing) return;
+  usbClosing = true;
+  document.getElementById('connect').disabled = true;
+  document.getElementById('disconnect').disabled = true;
+  failPending(new Error('USB 已断开'));
+  try {
+    if (usbReader) await usbReader.cancel().catch(() => {});
+    if (!fromReader && usbReadTask) await usbReadTask;
+    await usbQueue;
+    if (usbWriter) { usbWriter.releaseLock(); usbWriter = null; }
+    if (usbPort && (usbPort.readable || usbPort.writable)) await usbPort.close();
+    usbPort = null; usbBuffer = ''; configLoaded = false;
+    document.getElementById('settings').hidden = true;
+    document.getElementById('live').hidden = true;
+    document.getElementById('usbMessage').textContent = message;
+  } catch (error) {
+    document.getElementById('usbMessage').textContent = '释放串口失败，请重试断开：' + error.message;
+    document.getElementById('disconnect').disabled = false;
+  } finally {
+    usbClosing = false;
+    document.getElementById('connect').disabled = !!usbPort;
+  }
+}
+document.getElementById('disconnect').addEventListener('click', () => disconnectUsb());
+
 async function usbRequest(path, body) {
   const method = usbMethods[(body === undefined ? 'GET ' : 'POST ') + path];
   if (!method) throw new Error('不支持此配置操作');
   const run = async () => {
-    if (!usbWriter) throw new Error('请先连接 USB 设备');
+    if (usbClosing || !usbWriter) throw new Error('请先连接 USB 设备');
     const id = String(++usbSequence), message = {type:'usb_config', id, method};
     if (body !== undefined) message.body = body;
     const wire = new TextEncoder().encode(JSON.stringify(message) + '\n');
@@ -71,21 +94,19 @@ async function usbRequest(path, body) {
 }
 document.getElementById('connect').addEventListener('click', async () => {
   const message = document.getElementById('usbMessage');
-  if (!('serial' in navigator)) { message.textContent = '请使用支持 Web Serial 的 Chrome 或 Edge，并通过受信任的 HTTPS 访问。'; return; }
+  document.getElementById('connect').disabled = true;
+  if (!('serial' in navigator)) { message.textContent = '请使用支持 Web Serial 的 Chrome 或 Edge，并通过受信任的 HTTPS 访问。'; document.getElementById('connect').disabled = false; return; }
   try {
     usbPort = await navigator.serial.requestPort({filters:[{usbVendorId:0x303a}]});
     await usbPort.open({baudRate:115200, bufferSize:32768});
     await usbPort.setSignals({dataTerminalReady:true, requestToSend:false});
-    usbWriter = usbPort.writable.getWriter(); readUsb();
+    usbWriter = usbPort.writable.getWriter(); usbReadTask = readUsb();
+    document.getElementById('disconnect').disabled = false;
     const status = await usbRequest('/api/status');
     if (!String(status.firmware || '').startsWith('codex-pocket-')) throw new Error('此设备不是 Codex Pocket');
     message.textContent = 'USB 已连接'; document.getElementById('connect').disabled = true;
     await login();
   } catch (error) {
-    message.textContent = '连接失败：' + error.message;
-    if (usbReader) await usbReader.cancel().catch(() => {});
-    if (usbWriter) { usbWriter.releaseLock(); usbWriter = null; }
-    if (usbPort) await usbPort.close().catch(() => {});
-    usbPort = null; document.getElementById('connect').disabled = false;
+    await disconnectUsb('连接失败：' + error.message);
   }
 });

@@ -6,6 +6,7 @@ on:
       - firmware/Pocket/**
       - tools/test_wifi_profiles.py
       - tools/test_config_priority.py
+      - tools/test_usb_disconnect.cjs
       - tools/test_usb_config.py
       - tools/usb_config.py
       - web/**
@@ -15,6 +16,7 @@ on:
       - firmware/Pocket/**
       - tools/test_wifi_profiles.py
       - tools/test_config_priority.py
+      - tools/test_usb_disconnect.cjs
       - tools/test_usb_config.py
       - tools/usb_config.py
       - web/**
@@ -46,3 +48,4 @@ jobs:
           node --check /tmp/device-page.js
           node --check /tmp/usb-page.js
           node --check web/serial.js
+          node tools/test_usb_disconnect.cjs
