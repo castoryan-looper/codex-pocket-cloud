@@ -5,7 +5,7 @@ const usbMethods = {
   'GET /api/status': 'status', 'GET /api/config': 'get',
   'POST /api/config': 'save', 'POST /api/wifi/scan': 'scan_start',
   'GET /api/wifi/scan': 'scan_results', 'POST /api/open': 'open',
-  'POST /api/close': 'close'
+  'POST /api/close': 'close', 'POST /api/wifi/forget': 'wifi_forget'
 };
 function failPending(error) {
   for (const item of usbPending.values()) { clearTimeout(item.timer); item.reject(error); }

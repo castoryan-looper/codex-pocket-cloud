@@ -125,6 +125,7 @@ static volatile int screenPhase = 0;
 static volatile uint32_t fullRefreshes = 0, partialRefreshes = 0;
 static uint32_t lastAudioEnd = 0;
 static int offlineStage = -1;
+#include "wifi_profiles.h"
 #include "device_location.h"
 #include "config_portal.h"
 #include "config_screens.h"
@@ -181,7 +182,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.8.0";
+  doc["firmware"] = "codex-pocket-0.9.0";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -562,7 +563,7 @@ void setupNetwork() {
   remoteToken=prefs.getString("token", ""); rootCa=normalizeRootCa(prefs.getString("ca", ""));
   tlsEnabled=prefs.getBool("tls", true); remotePort=prefs.getUInt("port", 443);
   prefs.end();
-  wifiConfigured = wifiSsid.length()>0;
+  loadKnownWifi();
   bridgeConfigured = remoteHost.length() && remoteToken.length() && (!tlsEnabled || rootCa.length());
   if (!wifiConfigured) return;
   WiFi.onEvent([](WiFiEvent_t event,WiFiEventInfo_t info){
@@ -570,9 +571,10 @@ void setupNetwork() {
     else if(event==ARDUINO_EVENT_WIFI_STA_GOT_IP)lastWifiDisconnectReason=0;
   });
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
   WiFi.setSleep(false);
-  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  wifiStartKnown(knownWifiFind(knownWifi,knownWifi.preferred));
   configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
   if(!bridgeConfigured)return;
   socketClient.onEvent([](WStype_t type, uint8_t *payload, size_t length) {
@@ -580,7 +582,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.8.0";
+      hello["firmware"]="codex-pocket-0.9.0";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       deviceLocationStatus(hello);
@@ -701,6 +703,7 @@ void setup() {
 void loop() {
   loopUsbConfig();
   loopWifiScan();
+  loopKnownWifi();
   static uint32_t chordStart=0;
   static bool buttonGuard=false,chordDone=false;
   bool bootDown=digitalRead(BOOT_BUTTON_PIN)==LOW,powerDown=digitalRead(PWR_BUTTON_PIN)==LOW;

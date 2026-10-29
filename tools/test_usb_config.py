@@ -95,6 +95,14 @@ class UsbWebTests(unittest.TestCase):
         self.assertEqual(self.request('/api/close', 'POST', '{}')[0], 200)
         self.assertEqual(self.device.calls, [('open', None), ('close', None)])
 
+    def test_forget_network_uses_configuration_rpc(self):
+        self.assertEqual(self.request('/api/wifi/forget', 'POST', '{"ssid":"old-network"}')[0], 200)
+        self.assertEqual(self.device.calls, [('wifi_forget', {'ssid':'old-network'})])
+
+    def test_forget_offline_is_a_failure_not_a_success(self):
+        self.device.offline = True
+        self.assertEqual(self.request('/api/wifi/forget', 'POST', '{"ssid":"old-network"}')[0], 503)
+
     def test_wifi_scan_start_and_results(self):
         status, body = self.request('/api/wifi/scan', 'POST', '{}')
         self.assertEqual(status, 200)

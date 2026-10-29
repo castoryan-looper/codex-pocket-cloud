@@ -131,7 +131,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self.reply(status, data)
         except (OSError, serial.SerialException) as error:
             data = {'usbProxy': True, 'deviceConnected': False, 'message': str(error)}
-            if method == 'save':
+            if method in ('save', 'wifi_forget'):
                 self.reply(503, {'error': str(error)})
             else:
                 self.reply(200, data)
@@ -177,6 +177,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self.dispatch('open')
         elif self.path == '/api/close':
             self.dispatch('close')
+        elif self.path == '/api/wifi/forget':
+            self.dispatch('wifi_forget', body)
         elif self.path == '/api/wifi/scan':
             self.dispatch('scan_start')
         elif self.path == '/api/test-upload':
