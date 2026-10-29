@@ -182,7 +182,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.9.1";
+  doc["firmware"] = "codex-pocket-0.9.2";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -195,7 +195,7 @@ void telemetry(bool hello = false) {
   doc["recording"]=(bool)recording;
   doc["localUi"]=(int)localUi;
   doc["audioBytes"]=(uint32_t)audioBytes;
-  doc["holdMs"]=1000;
+  doc["holdMs"]=holdMs;
   doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
   doc["displayBusy"] = gpio_get_level(EPD_BUSY_PIN);
   doc["displayTimeouts"] = EPD_GetBusyTimeouts();
@@ -585,7 +585,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.9.1";
+      hello["firmware"]="codex-pocket-0.9.2";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       deviceLocationStatus(hello);
@@ -674,10 +674,10 @@ void setup() {
   powerButton.setup(PWR_BUTTON_PIN, INPUT_PULLUP, true);
   setupNetwork();
   initConfigPortal();
-  holdMs=1000;
+  // holdMs is loaded from persisted configuration by initConfigPortal().
   bootButton.setDebounceMs(20);powerButton.setDebounceMs(20);
   bootButton.setClickMs(180);powerButton.setClickMs(180);
-  bootButton.setPressMs(1000);
+  bootButton.setPressMs(holdMs);
   powerButton.setPressMs(1200);
   bootButton.attachPress([](){if(!configModeActive && !remoteVoiceBusy && localUi!=UiRecognizing && localUi!=UiSending){pressStartedAt=millis();if(netConnected&&online&&!remoteRecommendationUi)setLocalUi(UiHold);}});
   bootButton.attachClick([](){ if(!configModeActive && !recording){if(localUi==UiHold)setLocalUi(UiIdle);event("b1_click");} });
