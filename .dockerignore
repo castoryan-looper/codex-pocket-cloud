@@ -14,6 +14,9 @@
 !docker/*.py
 !docker/*.sh
 !docker/Caddyfile
+!web/
+!web/index.html
+!web/serial.js
 **/.git/**
 **/.venv/**
 **/runtime/**

@@ -7,6 +7,7 @@ on:
       - compose.yaml
       - .dockerignore
       - docker/**
+      - web/**
       - bridge/**
       - deploy/docker.sh
       - .github/workflows/docker-check.yml
@@ -70,6 +71,8 @@ jobs:
           done
           [ "$ready" = true ]
           [ "$(status /device)" = 418 ]
+          [ "$(status /setup/)" = 200 ]
+          [ "$(status /setup/serial.js)" = 200 ]
           [ "$(status /not-a-route)" = 404 ]
           [ "$(status /api/connection)" = 404 ]
           [ "$(status /api/state)" = 404 ]
