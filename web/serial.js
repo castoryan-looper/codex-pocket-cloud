@@ -2,6 +2,7 @@
 let usbPort, usbWriter, usbReader, usbPending = new Map(), usbQueue = Promise.resolve();
 let usbBuffer = '', usbSequence = 0, usbClosing = false, usbReadTask = null;
 const usbMethods = {
+  'POST /api/bluetooth/pair': 'bluetooth_pair', 'POST /api/bluetooth/forget': 'bluetooth_forget',
   'GET /api/status': 'status', 'GET /api/config': 'get',
   'POST /api/config': 'save', 'POST /api/wifi/scan': 'scan_start',
   'GET /api/wifi/scan': 'scan_results', 'POST /api/open': 'open',

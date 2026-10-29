@@ -188,6 +188,21 @@ class Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(p.config_path.read_bytes(),before)
             self.assertFalse(any(c.args[0]=='thread/start' for c in p.rpc.call.await_args_list))
 
+    async def test_knob_browsing_never_submits_and_click_is_explicit(self):
+        p=self.p;p.status='待命';p.page=0;p.submit=AsyncMock()
+        await p.action('knob_right');self.assertEqual(p.recommendation_index,1)
+        await p.action('knob_left');self.assertEqual(p.recommendation_index,0)
+        await p.action('knob_click');self.assertTrue(p.recommendation_reading())
+        await p.action('knob_right');self.assertEqual(p.menu,1)
+        await p.action('knob_left');self.assertEqual(p.menu,0)
+        await p.action('knob_back');self.assertFalse(p.recommendation_reading())
+        await p.action('knob_feed');p.submit.assert_not_awaited()
+
+    async def test_knob_back_does_not_interrupt_or_accept(self):
+        p=self.p;p.turn='running';p.submit=AsyncMock();p.decide=AsyncMock()
+        await p.action('knob_back');await p.action('knob_feed')
+        p.decide.assert_not_awaited();p.submit.assert_not_awaited();p.rpc.call.assert_not_awaited()
+
     async def test_foreign_thread_ignored(self):
         await self.p.notification({'method':'turn/started','params':{'threadId':'another','turn':{'id':'wrong'}}})
         self.assertIsNone(self.p.turn)

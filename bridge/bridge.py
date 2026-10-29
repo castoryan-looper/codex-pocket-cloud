@@ -497,7 +497,27 @@ class Pocket:
     async def action(self, action, payload=None):
         payload = payload or {}
         async with self.action_lock:
-            if action == 'b2_click':
+            if action in ('knob_left', 'knob_right'):
+                direction = 1 if action == 'knob_right' else -1
+                if self.is_idle_dashboard() and not self.recommendation_reading():
+                    self.recommendation_index = (self.recommendation_index + direction) % 2
+                    self.menu = 0
+                else:
+                    self.menu = (self.menu + direction) % len(self.menu_items())
+                self.dirty = True
+            elif action == 'knob_click':
+                selected = self.menu_items()[self.menu % len(self.menu_items())][1]
+                await self.execute(selected, payload)
+            elif action == 'knob_back':
+                # Back never stops a task, declines an approval or submits text.
+                if self.recommendation_reading():
+                    await self.recommendation_action('rec_back')
+                elif not (self.turn or self.draft or self.approvals or self.voice_busy):
+                    self.page = 0; self.menu = 0; self.dirty = True
+            elif action == 'knob_feed':
+                if self.is_idle_dashboard() and not self.recommendation_reading():
+                    await self.recommendation_action('rec_skip')
+            elif action == 'b2_click':
                 if self.is_idle_dashboard() and not self.recommendation_reading():
                     await self.recommendation_action('rec_feed_next')
                 else:
@@ -1106,7 +1126,7 @@ class Pocket:
         d.line((6,166,194,166),fill=0)
         selected = self.menu_items()[self.menu % len(self.menu_items())][0]
         text(8,170,'> '+selected,13)
-        text(8,188,'PWR 下一条 BOOT 详情' if idle and not self.recommendation_reading() else 'PWR 选择 / BOOT 确认' if self.recommendation_reading() else 'PWR 选择   BOOT 执行',10)
+        text(8,188,'旋转选择 / 按下确认' if self.device.get('bluetoothConnected') else 'PWR 下一条 BOOT 详情' if idle and not self.recommendation_reading() else 'PWR 选择 / BOOT 确认' if self.recommendation_reading() else 'PWR 选择   BOOT 执行',10)
         return im
 
     async def tick(self):

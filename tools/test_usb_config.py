@@ -95,6 +95,16 @@ class UsbWebTests(unittest.TestCase):
         self.assertEqual(self.request('/api/close', 'POST', '{}')[0], 200)
         self.assertEqual(self.device.calls, [('open', None), ('close', None)])
 
+    def test_bluetooth_pair_and_forget_use_config_rpc(self):
+        self.assertEqual(self.request('/api/bluetooth/pair','POST','{}')[0],200)
+        self.assertEqual(self.request('/api/bluetooth/forget','POST','{}')[0],200)
+        self.assertEqual(self.device.calls,[('bluetooth_pair',None),('bluetooth_forget',None)])
+
+    def test_bluetooth_offline_is_not_success(self):
+        self.device.offline=True
+        self.assertEqual(self.request('/api/bluetooth/pair','POST','{}')[0],503)
+        self.assertEqual(self.request('/api/bluetooth/forget','POST','{}')[0],503)
+
     def test_forget_network_uses_configuration_rpc(self):
         self.assertEqual(self.request('/api/wifi/forget', 'POST', '{"ssid":"old-network"}')[0], 200)
         self.assertEqual(self.device.calls, [('wifi_forget', {'ssid':'old-network'})])

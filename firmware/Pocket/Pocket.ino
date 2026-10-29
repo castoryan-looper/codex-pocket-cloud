@@ -127,6 +127,7 @@ static uint32_t lastAudioEnd = 0;
 static int offlineStage = -1;
 #include "wifi_profiles.h"
 #include "device_location.h"
+#include "bluetooth_knob.h"
 #include "config_portal.h"
 #include "config_screens.h"
 
@@ -182,7 +183,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.9.2";
+  doc["firmware"] = "codex-pocket-0.10.0";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -196,6 +197,7 @@ void telemetry(bool hello = false) {
   doc["localUi"]=(int)localUi;
   doc["audioBytes"]=(uint32_t)audioBytes;
   doc["holdMs"]=holdMs;
+  knobStatusJson(doc);
   doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
   doc["displayBusy"] = gpio_get_level(EPD_BUSY_PIN);
   doc["displayTimeouts"] = EPD_GetBusyTimeouts();
@@ -341,10 +343,10 @@ void screenTask(void *) {
         }else imageAscii(image,8,99,"AP STARTING...");
       }
       // This strip is owned by the MCU so it remains current without a bridge.
-      for (int y=1;y<24;y++) for (int x=76;x<132;x++) image[y*25+x/8]|=0x80>>(x%8);
-      const uint16_t *icons[2]={wifiConnected ? icon_wifi_on : icon_wifi_off,usbConnected ? icon_usb_on : icon_usb_off};
-      for (int i=0;i<2;i++) for (int y=0;y<16;y++) for (int x=0;x<16;x++) {
-        int px=80+i*28+x,py=4+y;
+      for (int y=1;y<24;y++) for (int x=76;x<142;x++) image[y*25+x/8]|=0x80>>(x%8);
+      const uint16_t *icons[3]={wifiConnected ? icon_wifi_on : icon_wifi_off,usbConnected ? icon_usb_on : icon_usb_off,knobConnected ? icon_bt_on : icon_bt_off};
+      for (int i=0;i<3;i++) for (int y=0;y<16;y++) for (int x=0;x<16;x++) {
+        int px=80+i*22+x,py=4+y;
         if (icons[i][y] & (0x8000>>x)) image[py*25+px/8]&=~(0x80>>(px%8));
       }
       if (memcmp(lastImage, image, 5000) != 0) {
@@ -585,7 +587,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.9.2";
+      hello["firmware"]="codex-pocket-0.10.0";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       deviceLocationStatus(hello);
@@ -696,6 +698,7 @@ void setup() {
   powerButton.attachLongPressStart([](){ if(configModeActive){portalCloseAt=millis()+100;return;}if(remoteRecommendationReader&&!recording&&!uploadPending){event("b2_long");return;}captureCancelled=true;recording=false;captureRequested=false;setLocalUi(UiCancelled);event("b2_long"); });
   // Do not interpret a held power-on button as a stop command.
   while (digitalRead(PWR_BUTTON_PIN)==LOW) delay(10);
+  initKnob();
   disconnectedImage();
   xTaskCreate(screenTask,"screen",8192,nullptr,1,nullptr);
   xTaskCreate(audioTask,"audio",8192,nullptr,2,nullptr);
@@ -705,6 +708,10 @@ void setup() {
 
 void loop() {
   loopUsbConfig();
+  if(knobQueue){KnobInput input;unsigned budget=8;while(budget--&&xQueueReceive(knobQueue,&input,0)==pdTRUE){
+    if(!knobConnected||input.epoch!=knobEpoch||millis()-input.at>800||configModeActive||recording||uploadPending||captureRequested||!online||!netConnected)continue;
+    const char *action=input.action==1?"knob_right":input.action==2?"knob_left":input.action==4?"knob_click":input.action==8?"knob_back":"knob_feed";event(action);
+  }}
   loopWifiScan();
   loopKnownWifi();
   static uint32_t chordStart=0;
