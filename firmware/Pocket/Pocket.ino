@@ -117,7 +117,8 @@ static bool initAudioStore() {
 }
 static volatile int lastLocalKey=0;
 static volatile uint32_t lastLocalKeyAt=0;
-static void setLocalUi(int state) { localUi=state; localUiAt=millis(); imageDirty=true; }
+static void soundEnqueue(uint8_t cue);
+static void setLocalUi(int state) { if(state!=localUi){if(state==UiAudioError||state==UiTooShort)soundEnqueue(6);else if(state==UiCancelled)soundEnqueue(5);}localUi=state; localUiAt=millis(); imageDirty=true; }
 static uint8_t desiredImage[5000], lastImage[5000];
 static String pendingHash;
 static uint32_t lastContact = 0, lastTelemetry = 0;
@@ -129,6 +130,7 @@ static int offlineStage = -1;
 #include "wifi_profiles.h"
 #include "device_location.h"
 #include "bluetooth_knob.h"
+#include "sound_feedback.h"
 #include "config_portal.h"
 #include "config_screens.h"
 
@@ -171,6 +173,7 @@ bool sendPacket(const JsonDocument &doc) {
 }
 
 void event(const char *action) {
+  if(!strcmp(action,"knob_click")||!strcmp(action,"b1_click"))soundEnqueue(SoundConfirm);
   JsonDocument doc;
   doc["type"] = "event";
   doc["action"] = action;
@@ -184,7 +187,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.10.4";
+  doc["firmware"] = "codex-pocket-0.11.0";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -247,6 +250,7 @@ void packet(const JsonDocument &doc) {
     for(JsonVariantConst codec : doc["audioCodecs"].as<JsonArrayConst>())
       if(String(codec.as<const char*>())=="mulaw8k")remoteMulaw8k=true;
     String state=doc["state"]|"";
+    soundRemoteState(state);
     // Ignore delayed cloud "recording" screens until local capture/upload is over.
     if(audioEndSent && localUi==UiRecognizing) {
       bool finalState=remoteVoiceBusy || remoteDraftReady || (remoteAutoVoice && (state=="正在提交" || state=="工作中" || state=="已完成")) || state=="识别语音" || state=="待发送" || state=="语音失败" || state=="录音失败" || state=="录音太短";
@@ -393,7 +397,7 @@ void audioTask(void *) {
       captureCancelled=false;audioEndSent=false;audioBytes=128000;uploadProgress=0;uploadRetries=0;audioFailure="";syntheticUpload=true;
       uploadRequestedAt=millis();setLocalUi(UiSending);uploadPending=true;continue;
     }
-    if(!captureRequested) {vTaskDelay(pdMS_TO_TICKS(5));continue;}
+    if(!captureRequested) {soundIdleTick();vTaskDelay(pdMS_TO_TICKS(5));continue;}
     captureRequested=false;
     if(uploadPending || digitalRead(BOOT_BUTTON_PIN)!=LOW || digitalRead(PWR_BUTTON_PIN)==LOW || configModeActive || !netConnected || !online)continue;
     captureCancelled=false;audioEndSent=false;audioBytes=0;uploadProgress=0;uploadRetries=0;syntheticUpload=false;audioFailure="";codecFailure=0;
@@ -401,6 +405,10 @@ void audioTask(void *) {
     if(!clip || FFat.freeBytes()<recordSeconds*32000UL) {
       if(clip)clip.close();audioFailure="AUDIO STORAGE FAILED";setLocalUi(UiAudioError);continue;
     }
+    if(soundQueue)xQueueReset(soundQueue);
+    // Play before capture, then discard buffered microphone audio containing it.
+    if(soundEnabled&&soundVolume){soundPlay(SoundRecordStart);for(unsigned flush=0;flush<3;flush++)Codec_RecordData((uint8_t*)stereo,sizeof(stereo));}
+    if(captureCancelled||digitalRead(BOOT_BUTTON_PIN)!=LOW||digitalRead(PWR_BUTTON_PIN)==LOW||configModeActive){clip.close();FFat.remove(audioCachePath);continue;}
     recording=true;recordingStartedAt=millis();setLocalUi(UiRecording);
     Serial.printf("PTT START %lu mode=local-cache\n",(unsigned long)recordingStartedAt);
     uint32_t began=millis(),captured=0;bool failed=false;
@@ -421,7 +429,7 @@ void audioTask(void *) {
       setLocalUi(captureCancelled?UiCancelled:failed?UiAudioError:UiTooShort);
     } else {
       uploadRequestedAt=millis();setLocalUi(limit && digitalRead(BOOT_BUTTON_PIN)==LOW ? UiLimit : UiSending);
-      uploadPending=true;
+      uploadPending=true;soundEnqueue(SoundRecordEnd);
     }
   }
 }
@@ -586,7 +594,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.10.4";
+      hello["firmware"]="codex-pocket-0.11.0";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       deviceLocationStatus(hello);
@@ -675,6 +683,7 @@ void setup() {
   powerButton.setup(PWR_BUTTON_PIN, INPUT_PULLUP, true);
   setupNetwork();
   initConfigPortal();
+  soundQueue=xQueueCreate(6,sizeof(SoundRequest));
   // holdMs is loaded from persisted configuration by initConfigPortal().
   bootButton.setDebounceMs(20);powerButton.setDebounceMs(20);
   bootButton.setClickMs(180);powerButton.setClickMs(180);
@@ -707,6 +716,7 @@ void setup() {
 
 void loop() {
   loopUsbConfig();
+  soundObserve();
   if(knobQueue){KnobInput input;unsigned budget=8;while(budget--&&xQueueReceive(knobQueue,&input,0)==pdTRUE){
     if(!knobConnected||input.epoch!=knobEpoch||millis()-input.at>800||configModeActive||recording||uploadPending||captureRequested||!online||!netConnected)continue;
     const char *action=input.action==1?"knob_right":input.action==2?"knob_left":input.action==4?"knob_click":input.action==8?"knob_back":"knob_feed";event(action);

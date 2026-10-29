@@ -4,6 +4,7 @@ let usbBuffer = '', usbSequence = 0, usbClosing = false, usbReadTask = null;
 const usbMethods = {
   'POST /api/bluetooth/scan': 'bluetooth_scan_start', 'GET /api/bluetooth/scan': 'bluetooth_scan_results',
   'POST /api/bluetooth/pair': 'bluetooth_pair', 'POST /api/bluetooth/forget': 'bluetooth_forget',
+  'POST /api/sound/test': 'test_sound',
   'GET /api/status': 'status', 'GET /api/config': 'get',
   'POST /api/config': 'save', 'POST /api/wifi/scan': 'scan_start',
   'GET /api/wifi/scan': 'scan_results', 'POST /api/open': 'open',

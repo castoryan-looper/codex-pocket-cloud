@@ -100,6 +100,12 @@ class UsbWebTests(unittest.TestCase):
         self.assertEqual(self.request('/api/bluetooth/forget','POST','{}')[0],200)
         self.assertEqual(self.device.calls,[('bluetooth_pair',{}),('bluetooth_forget',None)])
 
+    def test_sound_preview_routes_and_offline_failure(self):
+        self.assertEqual(self.request('/api/sound/test','POST','{}')[0],200)
+        self.assertEqual(self.device.calls,[('test_sound',None)])
+        self.device.offline=True
+        self.assertEqual(self.request('/api/sound/test','POST','{}')[0],503)
+
     def test_bluetooth_discovery_and_selected_address(self):
         self.assertEqual(self.request('/api/bluetooth/scan','POST','{}')[0],200)
         self.assertEqual(self.request('/api/bluetooth/scan')[0],200)
