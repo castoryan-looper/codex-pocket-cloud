@@ -15,6 +15,10 @@ https://{$POCKET_PUBLIC_HOST}:8443 {
   handle @health {
     reverse_proxy 127.0.0.1:8787
   }
+  @context_import path /context-import
+  handle @context_import {
+    reverse_proxy 127.0.0.1:8787
+  }
   handle_path /setup/* {
     root * /srv/setup
     header Cache-Control "no-store"

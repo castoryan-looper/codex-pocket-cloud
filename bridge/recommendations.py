@@ -55,7 +55,7 @@ def recent_topics(turns, now):
             title = re.split(r'[。！？!?\n]', raw)[0]
             title = re.sub(r'^(?:请|帮我|我想|我希望|能不能|可以|关于|我们来|现在)+', '', title).strip(' ，,：:')
             if not title: title = raw
-            result.append((fingerprint, title[:48], raw))
+            result.append((fingerprint, title[:48], raw, '已导入聊天' if turn.get('pocketSource')=='已导入聊天' else '设备近期聊天'))
     return result
 
 
@@ -87,22 +87,22 @@ class Feed:
 
     def pair(self):
         candidates = []
-        for rank, (fingerprint, topic, raw) in enumerate(self.topics):
+        for rank, (fingerprint, topic, raw, source) in enumerate(self.topics):
             for order, (strategy, title, instruction) in enumerate(STRATEGIES):
                 ident = fingerprint + ':' + strategy
                 if ident in self.feedback['used']: continue
                 prompt = f'我们最近讨论过：\n「{raw}」\n\n这次我选择：{title}。\n{instruction}\n请结合本会话最新进展；如果缺少信息，先提出具体问题。'
-                card = Card(ident, topic, f'{title}：{topic}', prompt, strategy, '近期聊天', f'话题：{topic}\n\n{instruction}', raw)
+                card = Card(ident, topic, f'{title}：{topic}', prompt, strategy, source, f'话题：{topic}\n\n{instruction}', raw)
                 score = 100-rank*5-order + self.feedback['weights'].get(strategy, 0)*2
                 if ident in self.feedback['seen']: score -= 80
                 candidates.append((score, card))
         if not candidates and self.topics:
             cards = []
             for index, strategy in enumerate(('explain', 'verify')):
-                fingerprint, topic, raw = self.topics[min(index,len(self.topics)-1)]
+                fingerprint, topic, raw, source = self.topics[min(index,len(self.topics)-1)]
                 instruction = STRATEGIES[2 if index==0 else 1][2]
                 detail = '话题：'+topic+'\n\n此前的建议已浏览过，这次换成回顾：'+instruction
-                cards.append(Card(fingerprint+':revisit:'+strategy, topic, '回顾与取舍：'+topic, '最近我们讨论过：'+raw+'\n'+detail, strategy, '近期聊天·回顾', detail, raw))
+                cards.append(Card(fingerprint+':revisit:'+strategy, topic, '回顾与取舍：'+topic, '最近我们讨论过：'+raw+'\n'+detail, strategy, source+'·回顾', detail, raw))
             return tuple(cards)
         if not candidates:
             return tuple(Card('starter:'+s, '先告诉我你关心什么', t, p, s, '起步建议', p) for s, t, p in (
