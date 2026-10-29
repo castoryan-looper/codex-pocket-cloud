@@ -17,7 +17,7 @@ static KnobHid knobDecoder;
 static BLEClient *knobClient=nullptr;
 static char knobAddress[18]={};
 struct KnobInput {uint8_t action;uint32_t at,epoch;};
-struct KnobReport {uint16_t handle;uint8_t id;};
+struct KnobReport {uint16_t handle;uint8_t id;uint16_t cccd;};
 static KnobReport knobReports[8];static unsigned knobReportCount=0;
 static portMUX_TYPE knobLock=portMUX_INITIALIZER_UNLOCKED;
 struct KnobDiscovery {char address[18],name[49];int rssi;bool hid;};
@@ -42,16 +42,28 @@ static void knobScanResults(JsonDocument &out){
  JsonArray list=out["devices"].to<JsonArray>();
  for(unsigned i=0;i<count;i++){JsonObject row=list.add<JsonObject>();row["address"]=rows[i].address;row["name"]=rows[i].name;row["rssi"]=rows[i].rssi;row["hid"]=rows[i].hid;}
 }
-static void knobNotification(BLERemoteCharacteristic *characteristic,uint8_t *data,size_t length,bool){
+static void knobReceiveHandle(uint16_t handle,const uint8_t *data,size_t length){
  if(!knobConnected||!knobQueue||length>256)return;
  uint8_t id=0;bool found=false;
- for(unsigned i=0;i<knobReportCount;i++)if(knobReports[i].handle==characteristic->getHandle()){id=knobReports[i].id;found=true;break;}
+ for(unsigned i=0;i<knobReportCount;i++)if(knobReports[i].handle==handle){id=knobReports[i].id;found=true;break;}
  if(!found)return;uint8_t actions=knobDecoder.decode(id,data,length);if(actions)knobInputCount++;
  for(uint8_t bit=1;bit<=16;bit<<=1)if(actions&bit){KnobInput input={bit,millis(),knobEpoch};xQueueSend(knobQueue,&input,0);}
 }
+static void knobNotification(BLERemoteCharacteristic *characteristic,uint8_t *data,size_t length,bool){knobReceiveHandle(characteristic->getHandle(),data,length);}
+#if defined(CONFIG_NIMBLE_ENABLED)
+// The bundled client dispatches notifications through a UUID-keyed map, losing
+// duplicate 0x2a4d characteristics. Observe notifications by their real handle.
+static ble_gap_event_listener knobGapListener;
+static int knobGapEvent(ble_gap_event *event,void*){
+ if(event->type==BLE_GAP_EVENT_NOTIFY_RX&&knobClient&&event->notify_rx.conn_handle==knobClient->getConnId()){
+  unsigned length=OS_MBUF_PKTLEN(event->notify_rx.om);uint8_t bytes[256];
+  if(length<=sizeof(bytes)){os_mbuf_copydata(event->notify_rx.om,0,length,bytes);knobReceiveHandle(event->notify_rx.attr_handle,bytes,length);}
+ }return 0;
+}
+#endif
 class KnobClientCallbacks:public BLEClientCallbacks{
  void onConnect(BLEClient*)override{}
- void onDisconnect(BLEClient*)override{knobConnected=false;knobStatus=1;if(knobDetail==7)knobDetail=17;knobEpoch++;imageDirty=true;}
+ void onDisconnect(BLEClient*)override{knobConnected=false;if(knobDetail==7){knobDetail=17;knobStatus=1;}else if(knobDetail>=8)knobStatus=4;knobEpoch++;imageDirty=true;}
 };
 static KnobClientCallbacks knobClientCallbacks;
 static void knobSaveAddress(const char *address){
@@ -59,6 +71,7 @@ static void knobSaveAddress(const char *address){
  Preferences storage;if(storage.begin("pocket",false)){if(address[0])storage.putString("bt_knob",address);else storage.remove("bt_knob");storage.end();}
 }
 static bool knobFail(unsigned reason){knobDetail=reason;knobConnected=false;if(knobClient->isConnected())knobClient->disconnect();return false;}
+#include "knob_gatt.h"
 static bool knobBind(BLEAdvertisedDevice &device){
  knobDetail=2;
  if(!knobClient->connect(device.getAddress(),device.getAddressType(),7000))return knobFail(8);
@@ -76,21 +89,39 @@ static bool knobBind(BLEAdvertisedDevice &device){
  if(descriptor.length()>2048||!knobDecoder.parse((const uint8_t*)descriptor.c_str(),descriptor.length()))return knobFail(12);
  knobReportCount=0;
  auto chars=hid->getCharacteristicsByHandle();
+#if defined(CONFIG_NIMBLE_ENABLED)
+ uint16_t serviceEnd=knobHidServiceEnd(hid->getHandle());if(!serviceEnd)return knobFail(13);
+#endif
  if(chars)for(auto &entry:*chars){auto report=entry.second;
   if(report->getUUID()!=BLEUUID((uint16_t)0x2a4d)||!report->canNotify()||knobReportCount==8)continue;
+#if defined(CONFIG_NIMBLE_ENABLED)
+  uint16_t end=serviceEnd;auto next=chars->upper_bound(report->getHandle());if(next!=chars->end())end=next->first-2;
+  uint8_t id;uint16_t cccd;if(!knobReadReference(report,end,id,cccd))continue;
+  knobReports[knobReportCount++]={report->getHandle(),id,cccd};
+#else
   auto reference=report->getDescriptor(BLEUUID((uint16_t)0x2908));if(!reference)continue;
   String ref=reference->readValue();if(ref.length()!=2||(uint8_t)ref[1]!=1)continue;
-  knobReports[knobReportCount++]={report->getHandle(),(uint8_t)ref[0]};
+  knobReports[knobReportCount++]={report->getHandle(),(uint8_t)ref[0],0};
+#endif
  }
  if(!knobReportCount)return knobFail(13);
  knobDetail=6;
  knobEpoch++;xQueueReset(knobQueue);knobConnected=true;
- for(auto &entry:*chars){auto report=entry.second;for(unsigned i=0;i<knobReportCount;i++)if(report->getHandle()==knobReports[i].handle)report->registerForNotify(knobNotification);}
+ for(auto &entry:*chars){auto report=entry.second;for(unsigned i=0;i<knobReportCount;i++)if(report->getHandle()==knobReports[i].handle){
+#if defined(CONFIG_NIMBLE_ENABLED)
+ if(!knobEnableNotifications(knobReports[i].cccd))return knobFail(13);
+#else
+ report->registerForNotify(knobNotification);
+#endif
+ }}
  if(!knobClient->isConnected())return knobFail(14);
  knobSaveAddress(device.getAddress().toString().c_str());knobStatus=3;knobDetail=7;imageDirty=true;return true;
 }
 static void knobTask(void*){
  BLEDevice::init("Codex Pocket");
+#if defined(CONFIG_NIMBLE_ENABLED)
+ ble_gap_event_listener_register(&knobGapListener,knobGapEvent,nullptr);
+#endif
  #if defined(CONFIG_NIMBLE_ENABLED)
  // Arduino ESP32 3.3.0's NimBLE security setters reference undefined
  // static members. Configure the public NimBLE host fields directly.

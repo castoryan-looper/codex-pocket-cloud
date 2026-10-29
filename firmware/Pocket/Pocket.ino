@@ -183,7 +183,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.10.2";
+  doc["firmware"] = "codex-pocket-0.10.3";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -584,7 +584,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.10.2";
+      hello["firmware"]="codex-pocket-0.10.3";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       deviceLocationStatus(hello);
