@@ -130,14 +130,34 @@ class RecommendationInteractionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError): await self.p.action('rec_a')
             setattr(self.p, field, original)
 
-    async def test_home_contains_pair_and_skip_never_submits(self):
+    async def test_single_card_feed_advances_and_opening_never_submits(self):
         self.p.submit = AsyncMock()
-        self.assertEqual([x[1] for x in self.p.menu_items()][:3], ['rec_a', 'rec_b', 'rec_skip'])
-        before = self.p.recommendation_cards
-        await self.p.action('rec_skip')
-        self.assertNotEqual(before, self.p.recommendation_cards)
+        self.assertEqual(self.p.menu_items()[0][1], 'rec_open')
+        first = self.p.recommendation_cards[0]
+        second = self.p.recommendation_cards[1]
+        await self.p.action('b2_click')
+        self.assertEqual(self.p.recommendation_index, 1)
+        self.assertIn(first.id, self.p.recommendations.feedback['seen'])
+        self.assertNotIn(second.id, self.p.recommendations.feedback['seen'])
+        await self.p.action('b1_click')
+        self.assertEqual(self.p.recommendation_reader['card'], 1)
         self.p.submit.assert_not_awaited()
         self.assertEqual(len(self.p.render().tobytes()), 5000)
+
+    async def test_feed_advances_pair_and_status_is_accessible(self):
+        self.p.submit = AsyncMock()
+        await self.p.action('b2_click')
+        await self.p.action('b2_click')
+        self.assertEqual(self.p.recommendation_index, 0)
+        self.assertEqual(self.p.recommendation_generation, 1)
+        await self.p.action('b2_long')
+        self.assertEqual(self.p.page, 1)
+        self.p.submit.assert_not_awaited()
+
+    async def test_running_task_keeps_stop_control(self):
+        self.p.turn = 'turn-1'
+        await self.p.action('b2_long')
+        self.p.rpc.call.assert_awaited_with('turn/interrupt', {'threadId': self.p.thread, 'turnId': 'turn-1'})
 
 
 if __name__ == '__main__':

@@ -324,6 +324,7 @@ class Pocket:
         self.chat_last_attempt = -900
         self.recommendations = Feed(self.runtime / "recommendation-feedback.json")
         self.recommendation_cards = self.recommendations.pair()
+        self.recommendation_index = 0
         self.recommendation_reader = None
         self.recommendation_generation = 0
         self.chat_task = None
@@ -450,7 +451,7 @@ class Pocket:
             actions += [('返回任务详情' if reader['context'] else '查看话题摘录', 'rec_context'), ('换看 B' if reader['card']==0 else '换看 A', 'rec_other'), ('返回推荐', 'rec_back')]
             return actions
         if self.is_idle_dashboard():
-            return [('打开 A', 'rec_a'), ('打开 B', 'rec_b'), ('换一组', 'rec_skip'), ('设备状态', 'rec_status')]
+            return [('查看详情', 'rec_open')]
         if self.page and not self.turn and not self.draft:
             return [('返回推荐', 'rec_back'), ('切换页面', 'page'), ('刷新额度', 'refresh')]
         return [('切换页面', 'page'), ('继续未完成工作', 'continue'), ('停止任务', 'stop'), ('刷新额度', 'refresh')]
@@ -459,8 +460,11 @@ class Pocket:
         payload = payload or {}
         async with self.action_lock:
             if action == 'b2_click':
-                self.menu = (self.menu + 1) % len(self.menu_items())
-                self.dirty = True
+                if self.is_idle_dashboard() and not self.recommendation_reading():
+                    await self.recommendation_action('rec_feed_next')
+                else:
+                    self.menu = (self.menu + 1) % len(self.menu_items())
+                    self.dirty = True
             elif action == 'b1_click':
                 selected = self.menu_items()[self.menu % len(self.menu_items())][1]
                 await self.execute(selected, payload)
@@ -472,6 +476,8 @@ class Pocket:
             await self.recommendation_action(action)
         elif action == 'b2_long' and self.recommendation_reading():
             self.recommendation_reader = None; self.menu = 0; self.dirty = True
+        elif action == 'b2_long' and self.is_idle_dashboard():
+            await self.recommendation_action('rec_status')
         elif action in ('stop', 'b2_long'):
             if self.turn:
                 await self.rpc.call('turn/interrupt', {'threadId': self.thread, 'turnId': self.turn})
@@ -802,6 +808,7 @@ class Pocket:
             self.recommendations.update(result.get('data'))
             if before != self.recommendations.topics and self.recommendation_reader is None:
                 self.recommendation_cards = self.recommendations.pair()
+                self.recommendation_index = 0
                 self.menu = 0
             self.chat_advice_at = time.monotonic()
             self.dirty = True
@@ -823,9 +830,20 @@ class Pocket:
     async def recommendation_action(self, action):
         if self.turn or self.draft or self.approvals or self.voice_busy:
             raise ValueError('请先处理当前任务、语音或审批')
-        if action in ('rec_a', 'rec_b'):
+        if action in ('rec_a', 'rec_b', 'rec_open'):
             if not self.is_idle_dashboard(): raise ValueError('请先返回待机推荐页')
-            self.recommendation_reader = {'card': int(action=='rec_b'), 'page': 0, 'context': False}
+            index = self.recommendation_index if action == 'rec_open' else int(action=='rec_b')
+            self.recommendation_index = index
+            self.recommendation_reader = {'card': index, 'page': 0, 'context': False}
+        elif action == 'rec_feed_next':
+            if not self.is_idle_dashboard() or self.recommendation_reading(): raise ValueError('请先返回待机推荐页')
+            self.recommendations.record([self.recommendation_cards[self.recommendation_index]])
+            if self.recommendation_index == 0:
+                self.recommendation_index = 1
+            else:
+                self.recommendation_cards = self.recommendations.pair()
+                self.recommendation_index = 0
+                self.recommendation_generation += 1
         elif action == 'rec_back':
             self.recommendation_reader = None; self.page = 0
         elif action == 'rec_status':
@@ -833,6 +851,7 @@ class Pocket:
         elif action == 'rec_skip':
             self.recommendations.record(self.recommendation_cards)
             self.recommendation_cards = self.recommendations.pair()
+            self.recommendation_index = 0
             self.recommendation_generation += 1
         elif not self.recommendation_reading():
             raise ValueError('请先打开 A 或 B 的任务详情')
@@ -843,13 +862,15 @@ class Pocket:
         elif action == 'rec_context':
             self.recommendation_reader['context'] = not self.recommendation_reader['context']; self.recommendation_reader['page'] = 0
         elif action == 'rec_other':
-            self.recommendation_reader = {'card': 1-self.recommendation_reader['card'], 'page': 0, 'context': False}
+            self.recommendation_index = 1-self.recommendation_reader['card']
+            self.recommendation_reader = {'card': self.recommendation_index, 'page': 0, 'context': False}
         elif action == 'rec_run':
             if self.recommendation_reader['context']: raise ValueError('请返回任务详情再执行')
             card = self.recommendation_cards[self.recommendation_reader['card']]
             self.recommendation_reader = None
-            self.recommendations.record(self.recommendation_cards, chosen=card)
+            self.recommendations.record([card], chosen=card)
             self.recommendation_cards = self.recommendations.pair()
+            self.recommendation_index = 0
             try:
                 await self.submit(card.prompt)
             except Exception:
@@ -1010,11 +1031,11 @@ class Pocket:
             city = location['city'] if location else ('定位中/未知' if automatic else '天气')
             text(8,58,fit(city,11,100),11)
             text(110,58,(temperature if weather else '--°C')+' '+(weather_description(weather['code']) if weather else ''),11)
-            for index, card in enumerate(self.recommendation_cards):
-                y = 98+index*33
-                d.rounded_rectangle((6,y,194,y+30),radius=4,outline=0)
-                text(11,y,('A ' if index==0 else 'B ')+fit(card.title.split('：',1)[0],11,164),11)
-                text(12,y+14,fit(card.topic,11,176),11)
+            card = self.recommendation_cards[self.recommendation_index]
+            d.rounded_rectangle((6,96,194,160),radius=4,outline=0)
+            text(11,99,fit(card.source+' · '+card.title.split('：',1)[0],11,174),11)
+            for row, line in enumerate(paginate(card.topic, lambda value: ui_font(14).getlength(value), width=174, rows=2)[0]):
+                text(11,117+row*18,line,14)
         else:
             text(8,29,self.status[:10],20)
             age = int(time.monotonic()-self.last_event)
@@ -1034,7 +1055,7 @@ class Pocket:
         d.line((6,166,194,166),fill=0)
         selected = self.menu_items()[self.menu % len(self.menu_items())][0]
         text(8,170,'> '+selected,13)
-        text(8,188,'PWR 选择 / BOOT 确认' if idle or self.recommendation_reading() else 'PWR 选择   BOOT 执行',10)
+        text(8,188,'PWR 下一条 BOOT 详情' if idle and not self.recommendation_reading() else 'PWR 选择 / BOOT 确认' if self.recommendation_reading() else 'PWR 选择   BOOT 执行',10)
         return im
 
     async def tick(self):
