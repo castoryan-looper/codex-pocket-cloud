@@ -222,17 +222,14 @@ void disconnectedImage() {
   xSemaphoreGive(imageMutex);
 }
 
-void packet(const String &line) {
-  if (line.length() > 15000) return;
-  JsonDocument doc;
-  if (deserializeJson(doc, line)) return;
+void packet(const JsonDocument &doc) {
   String type = doc["type"] | "";
   if (type == "frame") {
-    String data = doc["data"] | "";
+    const char *data = doc["data"] | "";
     uint8_t decoded[5000];
     size_t length = 0;
     if (mbedtls_base64_decode(decoded, sizeof(decoded), &length,
-        (const unsigned char *)data.c_str(), data.length()) != 0 || length != 5000) return;
+        (const unsigned char *)data, strlen(data)) != 0 || length != 5000) return;
     xSemaphoreTake(imageMutex, portMAX_DELAY);
     memcpy(desiredImage, decoded, 5000);
     pendingHash = doc["hash"] | "";
@@ -246,7 +243,7 @@ void packet(const String &line) {
     String recommendationView=doc["recommendationView"]|"";
     remoteRecommendationUi=recommendationView.length()>0;remoteRecommendationReader=recommendationView=="reader";
     remoteMulaw8k=false;
-    for(JsonVariant codec : doc["audioCodecs"].as<JsonArray>())
+    for(JsonVariantConst codec : doc["audioCodecs"].as<JsonArrayConst>())
       if(String(codec.as<const char*>())=="mulaw8k")remoteMulaw8k=true;
     String state=doc["state"]|"";
     // Ignore delayed cloud "recording" screens until local capture/upload is over.
@@ -604,7 +601,7 @@ void setupNetwork() {
     } else if (type == WStype_TEXT && length < 15000) {
       JsonDocument msg;
       if (!deserializeJson(msg, payload, length) && String(msg["type"] | "") == "frame")
-        packet(String((char *)payload).substring(0, length));
+        packet(msg);
     }
   });
   if (tlsEnabled) socketClient.beginSslWithCA(remoteHost.c_str(), remotePort, remotePath.c_str(), rootCa.c_str());
