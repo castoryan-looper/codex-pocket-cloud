@@ -104,7 +104,7 @@ class RecommendationInteractionTests(unittest.IsolatedAsyncioTestCase):
         await self.p.action('rec_b')
         prompt = self.p.recommendation_cards[1].prompt
         await self.p.action('rec_run')
-        self.p.submit.assert_awaited_once_with(prompt)
+        self.p.submit.assert_awaited_once_with(prompt, source='recommendation')
         with self.assertRaises(ValueError): await self.p.action('rec_run')
 
     async def test_delivery_failure_preserves_exact_task_as_draft(self):

@@ -30,6 +30,7 @@ from functools import lru_cache
 from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
 from PIL import Image, ImageDraw, ImageFont
 from recommendations import Feed, paginate
+from harness import DEVELOPER_INSTRUCTIONS, task_record
 
 ROOT = Path(__file__).resolve().parent
 ICONS = json.loads((ROOT/'icons.json').read_text('utf-8'))
@@ -291,6 +292,7 @@ class Pocket:
         self.rpc = Rpc(self.notification)
         self.thread = self.config.get('thread_id')
         self.turn = None
+        self.task = task_record()
         self.status = '启动中'
         self.detail = '正在连接 Codex'
         self.last_event = time.monotonic()
@@ -352,7 +354,8 @@ class Pocket:
         account = await self.rpc.call('account/read', {'refreshToken': False})
         if not account.get('account'):
             raise RuntimeError('Codex CLI 未登录。请运行 codex login 后重启。')
-        params = {'cwd': self.config['cwd'], 'approvalPolicy': 'on-request', 'sandbox': 'workspace-write'}
+        params = {'cwd': self.config['cwd'], 'approvalPolicy': 'on-request', 'sandbox': 'workspace-write',
+                  'developerInstructions': DEVELOPER_INSTRUCTIONS}
         if self.thread:
             try:
                 result = await self.rpc.call('thread/resume', dict(params, threadId=self.thread))
@@ -388,6 +391,7 @@ class Pocket:
         if 'id' in msg:
             if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput'):
                 self.approvals.append(msg)
+                self.task = task_record('awaiting_approval', summary='等待用户确认', turn_id=self.turn, source=self.task['source'])
                 self.changed('等待确认', p.get('command') or p.get('reason') or '请在管理网页查看完整请求')
             else:
                 # Unsupported permission/auth/tool requests must never be silently accepted.
@@ -395,6 +399,7 @@ class Pocket:
             return
         if method == 'turn/started':
             self.turn = p['turn']['id']
+            self.task = task_record('running', summary='Codex 已开始执行', turn_id=self.turn, source=self.task['source'])
             self.reply = ''
             self.changed('工作中', 'Codex 已开始执行')
         elif method == 'turn/completed':
@@ -402,6 +407,9 @@ class Pocket:
             self.approvals.clear()
             turn = p.get('turn', {})
             state = turn.get('status')
+            state_name = {'completed':'completed', 'interrupted':'stopped', 'failed':'failed'}.get(state, 'unknown')
+            self.task = task_record(state_name, summary=(turn.get('error') or {}).get('message') or self.reply[-400:],
+                                    turn_id=turn.get('id'), source=self.task['source'])
             self.changed({'completed': '已完成', 'interrupted': '已停止', 'failed': '出错'}.get(state, state),
                          (turn.get('error') or {}).get('message') or self.reply[-400:] or '本轮已结束')
         elif method == 'item/started':
@@ -532,20 +540,27 @@ class Pocket:
         self.approvals.pop(0)
         self.menu = 0
         self.changed('工作中', '已提交确认结果')
+        self.task = task_record('running', summary='已提交确认结果', turn_id=self.turn, source=self.task['source'])
 
-    async def submit(self, text):
+    async def submit(self, text, *, source='direct'):
         if not text:
             raise ValueError('任务不能为空')
         if self.turn:
             raise ValueError('当前任务正在执行；请先停止或等待完成')
         self.changed('正在提交', text)
+        self.task = task_record('submitting', summary='正在提交任务', source=source)
         params = {'threadId': self.thread, 'input': [{'type': 'text', 'text': text}]}
         if os.environ.get('POCKET_EXTERNAL_SANDBOX') == 'docker':
             # Docker supplies the outer boundary; do not require nested Linux namespaces.
             params['sandboxPolicy'] = {'type': 'externalSandbox', 'networkAccess': 'enabled'}
-        result = await self.rpc.call('turn/start', params)
+        try:
+            result = await self.rpc.call('turn/start', params)
+        except Exception:
+            self.task = task_record('delivery_unknown', summary='未确认送达，请检查后再重试', source=source)
+            raise
         if result['turn']['status'] == 'inProgress' and self.status == '正在提交':
             self.turn = result['turn']['id']
+            self.task = task_record('running', summary='任务已提交', turn_id=self.turn, source=source)
             self.changed('工作中', '任务已提交')
 
     async def device_packet(self, msg, source):
@@ -873,7 +888,7 @@ class Pocket:
             self.recommendation_cards = self.recommendations.pair()
             self.recommendation_index = 0
             try:
-                await self.submit(card.prompt)
+                await self.submit(card.prompt, source='recommendation')
             except Exception:
                 # Delivery may be uncertain: preserve the exact task for explicit retry, never auto-send twice.
                 self.draft = card.prompt
@@ -952,7 +967,7 @@ class Pocket:
         mobile_ca = ''.join(p.read_text('utf-8') for p in (roots/'gtsr4.pem', roots/'isrgrootx1.pem') if p.exists())
         device = dict(self.device)
         device['bridgeConnected'] = bool(self.peers) and time.time()-device.get('frameAck',0)<20
-        return {'status': self.status, 'detail': self.detail, 'threadId': self.thread, 'turnId': self.turn,
+        return {'status': self.status, 'detail': self.detail, 'threadId': self.thread, 'turnId': self.turn, 'task': self.task,
                 'reply': self.reply, 'draft': self.draft, 'approvals': self.approvals, 'quota': self.remaining(),
                 'quotaUpdatedAt': self.rate_at, 'tokens': self.tokens, 'context': self.context,
                 'device': device, 'cwd': self.config['cwd'], 'noProgressSeconds': int(time.monotonic()-self.last_event),

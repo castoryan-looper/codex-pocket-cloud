@@ -167,6 +167,8 @@ sudo bash deploy/install.sh --domain pocket.example.com
 
 ## 执行权限与边界
 
+硬件会话的执行指令和事件状态模型见 [Pocket Harness](HARNESS.md)。它不覆盖持久工作区中的用户 `AGENTS.md`；`completed` 是 Codex 轮次状态，验证情况不会根据回复文本自动推断。
+
 默认工作目录是服务器的 `/var/lib/codex-pocket/workspace`，使用 workspace-write 与 on-request 审批。任务不能访问你家电脑的本地项目，除非你另行同步或挂载项目。批准命令需要通过私有管理控制台；设备支持拒绝和停止。此版本不提供任意公网文件浏览或免审批准。
 
 此项目并未实现 OpenAI 托管 `codex cloud exec --env ...` 任务适配器。如果需要该模式，需要另外配置 Codex Cloud 项目环境；不能把当前服务器上的 app-server 误认为官方托管环境。

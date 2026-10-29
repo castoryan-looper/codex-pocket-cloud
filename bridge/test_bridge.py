@@ -115,6 +115,44 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(p.turn)
         self.assertEqual(p.status,'已完成')
         self.assertEqual(p.detail,'完成')
+        self.assertEqual(p.task['state'],'completed')
+        self.assertEqual(p.task['validation'],'not_reported')
+        self.assertEqual(p.task['turnId'],'turn-1')
+
+    async def test_task_state_comes_from_events_and_approval(self):
+        p=self.p
+        await p.notification({'method':'turn/started','params':{'threadId':p.thread,'turn':{'id':'turn-1'}}})
+        self.assertEqual(p.task['state'],'running')
+        await p.notification({'id':7,'method':'item/commandExecution/requestApproval','params':{'threadId':p.thread,'command':'example'}})
+        self.assertEqual(p.task['state'],'awaiting_approval')
+        await p.notification({'method':'turn/completed','params':{'threadId':p.thread,'turn':{'id':'turn-1','status':'failed','error':{'message':'failed'}}}})
+        self.assertEqual(p.task['state'],'failed')
+        self.assertEqual(p.task['summary'],'failed')
+        self.assertEqual(p.task['validation'],'not_reported')
+
+    async def test_submission_failure_is_not_reported_as_success(self):
+        self.p.rpc.call.side_effect=TimeoutError('uncertain')
+        with self.assertRaises(TimeoutError): await self.p.submit('test',source='recommendation')
+        self.assertEqual(self.p.task['state'],'delivery_unknown')
+        self.assertEqual(self.p.task['source'],'recommendation')
+        self.assertEqual(self.p.snapshot()['task']['validation'],'not_reported')
+
+    async def test_start_and_resume_include_pocket_guidance(self):
+        async def run_case(thread):
+            p=self.p
+            p.thread=thread
+            p.rpc.start=AsyncMock()
+            p.rpc.call=AsyncMock(side_effect=lambda method,params: {'account':{'type':'chatgpt'}} if method=='account/read' else {'thread':{'id':'thread-1'}} if method in ('thread/start','thread/resume') else {})
+            p.refresh_limits=AsyncMock()
+            p.config['speech_backend']='windows'
+            with patch('bridge.asyncio.create_task',side_effect=lambda coro: coro.close()):
+                await p.start()
+            method='thread/resume' if thread else 'thread/start'
+            args=next(call.args[1] for call in p.rpc.call.await_args_list if call.args[0]==method)
+            self.assertIn('developerInstructions',args)
+            self.assertIn('浏览和跳过不是授权',args['developerInstructions'])
+        await run_case(None)
+        await run_case('existing-thread')
 
     async def test_foreign_thread_ignored(self):
         await self.p.notification({'method':'turn/started','params':{'threadId':'another','turn':{'id':'wrong'}}})
