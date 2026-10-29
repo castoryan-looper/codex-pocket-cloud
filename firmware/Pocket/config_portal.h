@@ -129,7 +129,7 @@ static bool portalAuthorized() {
 static int configFailure(JsonDocument &out,int code,const char *error){out["error"]=error;return code;}
 static void deviceConfig(JsonDocument &d){
  describeKnownWifi(d);
- d["firmware"]="codex-pocket-0.10.3";d["ssid"]=wifiSsid;d["host"]=remoteHost;d["port"]=remotePort;d["tls"]=tlsEnabled;d["ca"]=rootCa;
+ d["firmware"]="codex-pocket-0.10.4";d["ssid"]=wifiSsid;d["host"]=remoteHost;d["port"]=remotePort;d["tls"]=tlsEnabled;d["ca"]=rootCa;
  d["tokenConfigured"]=remoteToken.length()>0;d["holdMs"]=holdMs;d["recordSeconds"]=recordSeconds;d["refreshMinutes"]=refreshMinutes;
 }
 // Scans run asynchronously. Disconnect STA briefly to avoid driver busy errors,
@@ -177,14 +177,14 @@ static void deviceStatus(JsonDocument &d){
  d["configurationTransport"]=HWCDC::isPlugged()?"usb":portalActive?"hotspot":wifi?"lan":"none";
  d["configurationHotspotActive"]=(bool)portalActive;d["configurationMode"]=(bool)configModeActive;
  deviceLocationStatus(d);
- d["firmware"]="codex-pocket-0.10.3";d["wifiScanning"]=(wifiScanPhase==1 || wifiScanPhase==2 || wifiAutoPhase!=0);d["usbConnected"]=HWCDC::isPlugged();d["wifiConnected"]=wifi;d["wifiReason"]=(int)lastWifiDisconnectReason;d["configuredSsid"]=wifiSsid;
+ d["firmware"]="codex-pocket-0.10.4";d["wifiScanning"]=(wifiScanPhase==1 || wifiScanPhase==2 || wifiAutoPhase!=0);d["usbConnected"]=HWCDC::isPlugged();d["wifiConnected"]=wifi;d["wifiReason"]=(int)lastWifiDisconnectReason;d["configuredSsid"]=wifiSsid;
  d["connectedSsid"]=wifi?WiFi.SSID():"";d["ssidImageReady"]=ssidBitmapValid;d["ip"]=WiFi.localIP().toString();d["gateway"]=WiFi.gatewayIP().toString();
  if(wifi)d["rssi"]=WiFi.RSSI();else d["rssi"]=nullptr;
  if(wifi && netConnected)d["internetReachable"]=true;else d["internetReachable"]=nullptr;
  d["internetDetail"]=wifi && netConnected?"设备已连通云端加密服务":wifi?"Wi-Fi 已连接，外网尚未验证":"尚未连接 Wi-Fi";
  d["cloudConnected"]=wifi && netConnected && online;d["cloudTransportConnected"]=wifi && netConnected;d["host"]=remoteHost;d["port"]=remotePort;
  d["chip"]=ESP.getChipModel();d["cores"]=ESP.getChipCores();d["cpuMHz"]=getCpuFrequencyMhz();d["flashBytes"]=ESP.getFlashChipSize();
- d["freeHeap"]=ESP.getFreeHeap();d["uptimeSeconds"]=millis()/1000;d["mac"]=WiFi.macAddress();d["battery"]=localBattery;
+ d["freeHeap"]=ESP.getFreeHeap();d["largestFreeHeap"]=ESP.getMaxAllocHeap();d["uptimeSeconds"]=millis()/1000;d["mac"]=WiFi.macAddress();d["battery"]=localBattery;
  d["audioStorageReady"]=audioStoreReady;d["audioStorageFree"]=audioStoreReady?FFat.freeBytes():0;
  d["recording"]=(bool)recording;d["uploadPending"]=(bool)uploadPending;d["uploadProgress"]=(unsigned)uploadProgress;
  d["audioBytes"]=(unsigned)audioBytes;d["audioError"]=audioFailure;d["uploadRetries"]=(unsigned)uploadRetries;d["audioEndSent"]=(bool)audioEndSent;d["uploadCodec"]=remoteMulaw8k?"mulaw8k":"pcm16";d["syntheticUpload"]=(bool)syntheticUpload;
@@ -247,6 +247,7 @@ static void loopUsbConfig(){
   else if(method=="bluetooth_scan_start")out["status"]=knobScanStart(payload);
   else if(method=="bluetooth_scan_results")knobScanResults(payload);
   else if(method=="bluetooth_pair"||method=="bluetooth_forget")out["status"]=knobCommand(method=="bluetooth_forget",payload,String(req["body"]["address"]|""));
+  else if(method=="test_reconnect"){if(recording||uploadPending||captureRequested)out["status"]=configFailure(payload,409,"设备忙，请稍后重试");else{cloudReconnectRequested=true;payload["message"]="已请求重连云端";}}
   else if(method=="test_upload"){
    if(recording || uploadPending || syntheticRequested || remoteVoiceBusy || !netConnected || !online)out["status"]=configFailure(payload,409,"请等待设备云端在线且空闲");
    else{syntheticRequested=true;payload["message"]="已开始无语音测试上传";}

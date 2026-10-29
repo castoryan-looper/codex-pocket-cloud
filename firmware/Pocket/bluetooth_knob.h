@@ -79,6 +79,24 @@ static bool knobBind(BLEAdvertisedDevice &device){
  knobDetail=3;
  if(!knobClient->secureConnection())return knobFail(9);
  knobDetail=4;
+#if defined(CONFIG_NIMBLE_ENABLED)
+ if(!knobHidServiceEnd(0))return knobFail(10);
+ if(!knobDiscoverCharacteristics())return knobFail(11);
+ uint16_t mapHandle=0;for(unsigned i=0;i<knobGattCharacteristicCount;i++)if(knobGattCharacteristics[i].uuid==0x2a4b)mapHandle=knobGattCharacteristics[i].handle;
+ knobDetail=5;if(!mapHandle||!knobReadReportMap(mapHandle))return knobFail(11);
+ if(!knobDecoder.parse(knobGatt.bytes,knobGatt.length))return knobFail(12);
+ knobReportCount=0;
+ for(unsigned i=0;i<knobGattCharacteristicCount&&knobReportCount<8;i++){
+  auto &row=knobGattCharacteristics[i];if(row.uuid!=0x2a4d||!(row.properties&0x10))continue;
+  uint16_t end=i+1<knobGattCharacteristicCount?knobGattCharacteristics[i+1].declaration-1:knobGatt.serviceEnd;
+  uint8_t id;uint16_t cccd;if(!knobReadReferenceHandle(row.handle,end,id,cccd))continue;
+  knobReports[knobReportCount++]={row.handle,id,cccd};
+ }
+ if(!knobReportCount)return knobFail(13);
+ knobDetail=6;knobEpoch++;xQueueReset(knobQueue);
+ for(unsigned i=0;i<knobReportCount;i++)if(!knobEnableNotifications(knobReports[i].cccd))return knobFail(13);
+ if(!knobClient->isConnected())return knobFail(14);knobConnected=true;
+#else
  BLERemoteService *hid=knobClient->getService(BLEUUID((uint16_t)0x1812));
  if(!hid)return knobFail(10);
  auto map=hid->getCharacteristic(BLEUUID((uint16_t)0x2a4b));
@@ -115,6 +133,7 @@ static bool knobBind(BLEAdvertisedDevice &device){
 #endif
  }}
  if(!knobClient->isConnected())return knobFail(14);
+#endif
  knobSaveAddress(device.getAddress().toString().c_str());knobStatus=3;knobDetail=7;imageDirty=true;return true;
 }
 static void knobTask(void*){

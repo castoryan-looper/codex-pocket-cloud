@@ -24,6 +24,7 @@ struct ble_gatt_error{int status;};struct mbuf{unsigned len;uint8_t data[2];};
 struct ble_gatt_attr{mbuf *om;};
 #define OS_MBUF_PKTLEN(x) ((x)->len)
 void os_mbuf_copydata(mbuf *m,int,unsigned len,uint8_t *out){memcpy(out,m->data,len);}
+struct ble_gatt_chr{uint16_t def_handle,val_handle;uint8_t properties;struct {struct {int type;} u;struct {uint16_t value;} u16;} uuid;};
 struct ble_gatt_dsc{uint16_t handle;struct {struct {int type;} u;struct {uint16_t value;} u16;} uuid;};
 struct {uint16_t getConnId(){return 7;}void disconnect(){}} client;
 auto knobClient=&client;
@@ -40,9 +41,11 @@ int ble_gattc_disc_all_dscs(uint16_t conn,uint16_t start,uint16_t end,Discover c
 }
 int ble_gattc_read(uint16_t conn,uint16_t handle,Value cb,void *arg){assert(handle==43);mbuf data{mode==2?1u:2u,{3,static_cast<uint8_t>(mode==3?2:1)}};ble_gatt_attr attr{&data};ble_gatt_error ok{0};cb(conn,&ok,&attr,arg);return 0;}
 int ble_gattc_write_flat(uint16_t conn,uint16_t handle,const void *data,uint16_t len,Value cb,void *arg){assert(conn==7&&handle==44&&len==2);auto bytes=static_cast<const uint8_t*>(data);assert(bytes[0]==1&&bytes[1]==0);writes++;if(mode==4)return 5;ble_gatt_error ok{0};cb(conn,&ok,nullptr,arg);return 0;}
+int ble_gattc_disc_all_chrs(uint16_t conn,uint16_t start,uint16_t end,int(*cb)(uint16_t,const ble_gatt_error*,const ble_gatt_chr*,void*),void *arg){assert(start==30&&end==48);ble_gatt_error ok{0};ble_gatt_chr chr{};chr.def_handle=40;chr.val_handle=42;chr.properties=0x10;chr.uuid.u.type=16;chr.uuid.u16.value=0x2a4d;cb(conn,&ok,&chr,arg);ble_gatt_error done{BLE_HS_EDONE};cb(conn,&done,nullptr,arg);return 0;}
+int ble_gattc_read_long(uint16_t conn,uint16_t handle,uint16_t,Value cb,void *arg){mbuf data{2,{1,2}};ble_gatt_attr attr{&data};ble_gatt_error ok{0};cb(conn,&ok,&attr,arg);cb(conn,&ok,&attr,arg);ble_gatt_error done{BLE_HS_EDONE};cb(conn,&done,nullptr,arg);return 0;}
 '''+ '#include "'+header+'"\n'+r'''
 int main(){BLERemoteCharacteristic report;uint8_t id=0;uint16_t cccd=0;
- assert(knobHidServiceEnd(30)==48);assert(knobHidServiceEnd(31)==0);assert(knobReadReference(&report,48,id,cccd));assert(id==3&&cccd==44&&observedEnd==48);assert(knobEnableNotifications(cccd));assert(writes==1);
+ assert(knobHidServiceEnd(30)==48);assert(knobHidServiceEnd(31)==0);assert(knobHidServiceEnd(0)==48);assert(knobDiscoverCharacteristics());assert(knobGattCharacteristicCount==1&&knobGattCharacteristics[0].handle==42);assert(knobReadReportMap(42)&&knobGatt.length==4&&knobGatt.bytes[2]==1);assert(knobReadReference(&report,48,id,cccd));assert(id==3&&cccd==44&&observedEnd==48);assert(knobEnableNotifications(cccd));assert(writes==1);
  mode=1;assert(!knobReadReference(&report,48,id,cccd));mode=2;assert(!knobReadReference(&report,48,id,cccd));mode=3;assert(!knobReadReference(&report,48,id,cccd));mode=4;assert(!knobEnableNotifications(44));
  assert(!knobReadReference(&report,42,id,cccd));
 }

@@ -59,6 +59,7 @@ static esp_io_expander_handle_t exio;
 static String wifiSsid, wifiPass, remoteHost, remotePath, remoteToken, rootCa;
 static bool tlsEnabled = true, wifiConfigured = false, bridgeConfigured = false;
 static volatile bool netConnected=false;
+static volatile bool cloudReconnectRequested=false;
 static volatile int lastWifiDisconnectReason=0;
 static uint16_t remotePort = 443;
 static volatile bool imageDirty = false;
@@ -183,7 +184,7 @@ void event(const char *action) {
 void telemetry(bool hello = false) {
   JsonDocument doc;
   doc["type"] = hello ? "hello" : "telemetry";
-  doc["firmware"] = "codex-pocket-0.10.3";
+  doc["firmware"] = "codex-pocket-0.10.4";
   doc["wifiConnected"] = WiFi.status()==WL_CONNECTED;
   doc["usbConnected"] = HWCDC::isPlugged();
   float volts = Get_VbatVoltage();
@@ -532,6 +533,7 @@ void transportProbe() {
 // TLS handshakes and Wi-Fi socket writes must not block physical button sampling.
 void networkTask(void *) {
   for(;;) {
+    if(cloudReconnectRequested&&!recording&&!uploadPending&&!captureRequested){cloudReconnectRequested=false;socketClient.disconnect();}
     if(bridgeConfigured && wifiConfigured && WiFi.status()==WL_CONNECTED) socketClient.loop();
     networkProgressAt=millis();
     char *queued=nullptr;
@@ -584,7 +586,7 @@ void setupNetwork() {
       netConnected = true;
       JsonDocument hello;
       hello["type"]="hello"; hello["token"]=remoteToken;
-      hello["firmware"]="codex-pocket-0.10.3";
+      hello["firmware"]="codex-pocket-0.10.4";
       hello["wifiConnected"]=WiFi.status()==WL_CONNECTED;
       hello["usbConnected"]=HWCDC::isPlugged();
       deviceLocationStatus(hello);
