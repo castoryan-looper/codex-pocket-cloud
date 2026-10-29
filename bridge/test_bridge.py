@@ -203,6 +203,23 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         await p.action('knob_back');await p.action('knob_feed')
         p.decide.assert_not_awaited();p.submit.assert_not_awaited();p.rpc.call.assert_not_awaited()
 
+    async def test_windows_speech_preference_on_linux_uses_whisper(self):
+        p=self.p;p.config['speech_backend']='windows';p.whisper_transcribe=lambda data:'测试语音';p.submit=AsyncMock()
+        with patch.object(bridge.os,'name','posix'),patch('bridge.asyncio.create_subprocess_exec',new_callable=AsyncMock) as process:
+            self.assertEqual(p.speech_backend(),'whisper')
+            await p.transcribe(bytes(6400))
+            process.assert_not_awaited()
+        p.submit.assert_awaited_once_with('测试语音')
+        self.assertFalse(p.voice_busy)
+        self.assertEqual(p.config['speech_backend'],'windows')
+
+    def test_speech_backend_respects_platform_and_explicit_whisper(self):
+        p=self.p;p.config['speech_backend']='windows'
+        with patch.object(bridge.os,'name','nt'):self.assertEqual(p.speech_backend(),'windows')
+        with patch.object(bridge.os,'name','posix'):self.assertEqual(p.speech_backend(),'whisper')
+        p.config['speech_backend']='whisper'
+        with patch.object(bridge.os,'name','nt'):self.assertEqual(p.speech_backend(),'whisper')
+
     async def test_foreign_thread_ignored(self):
         await self.p.notification({'method':'turn/started','params':{'threadId':'another','turn':{'id':'wrong'}}})
         self.assertIsNone(self.p.turn)

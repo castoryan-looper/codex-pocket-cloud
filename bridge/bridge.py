@@ -344,6 +344,11 @@ class Pocket:
         self.recommendation_generation = 0
         self.chat_task = None
 
+    def speech_backend(self):
+        # A state volume may have been copied from a Windows installation.
+        # Keep the saved preference, but never launch PowerShell on Linux.
+        return 'windows' if self.config.get('speech_backend') == 'windows' and os.name == 'nt' else 'whisper'
+
     def save(self):
         tmp = self.config_path.with_suffix('.tmp')
         with os.fdopen(os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600),'w',encoding='utf-8') as output:
@@ -400,7 +405,7 @@ class Pocket:
         self.changed('待命', '旧会话不可恢复，已备份并新建会话；未重放任务' if recovered else '按住 BOOT 说话；短按执行菜单')
         await self.refresh_limits()
         self.tasks = [asyncio.create_task(self.tick())]
-        if self.config.get('speech_backend') != 'windows':
+        if self.speech_backend() != 'windows':
             self.tasks.append(asyncio.create_task(self.prewarm_whisper()))
         LOG.info('Hardware session: %s', self.thread)
 
@@ -691,7 +696,7 @@ class Pocket:
         path = self.runtime / 'last-recording.wav'
         try:
             started = time.monotonic()
-            if self.config.get('speech_backend') == 'windows':
+            if self.speech_backend() == 'windows':
                 with wave.open(str(path), 'wb') as wav:
                     wav.setnchannels(1)
                     wav.setsampwidth(2)
