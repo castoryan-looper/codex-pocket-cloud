@@ -10,6 +10,7 @@
 static volatile bool knobConnected=false,knobScanning=false,knobForgetRequested=false;
 static volatile uint32_t knobPairUntil=0,knobEpoch=0;
 static volatile uint32_t knobInputCount=0;
+static volatile unsigned knobDetail=0;
 static volatile unsigned knobStatus=0; // 0 unpaired, 1 reconnecting, 2 scanning, 3 ready, 4 unsupported/error
 static QueueHandle_t knobQueue=nullptr;
 static KnobHid knobDecoder;
@@ -50,23 +51,29 @@ static void knobNotification(BLERemoteCharacteristic *characteristic,uint8_t *da
 }
 class KnobClientCallbacks:public BLEClientCallbacks{
  void onConnect(BLEClient*)override{}
- void onDisconnect(BLEClient*)override{knobConnected=false;knobStatus=1;knobEpoch++;imageDirty=true;}
+ void onDisconnect(BLEClient*)override{knobConnected=false;knobStatus=1;if(knobDetail==7)knobDetail=17;knobEpoch++;imageDirty=true;}
 };
 static KnobClientCallbacks knobClientCallbacks;
 static void knobSaveAddress(const char *address){
  portENTER_CRITICAL(&knobLock);strlcpy(knobAddress,address,sizeof(knobAddress));portEXIT_CRITICAL(&knobLock);
  Preferences storage;if(storage.begin("pocket",false)){if(address[0])storage.putString("bt_knob",address);else storage.remove("bt_knob");storage.end();}
 }
+static bool knobFail(unsigned reason){knobDetail=reason;knobConnected=false;if(knobClient->isConnected())knobClient->disconnect();return false;}
 static bool knobBind(BLEAdvertisedDevice &device){
- if(!knobClient->connect(device.getAddress(),device.getAddressType(),7000))return false;
+ knobDetail=2;
+ if(!knobClient->connect(device.getAddress(),device.getAddressType(),7000))return knobFail(8);
  // HID report characteristics commonly require an encrypted bonded link.
- if(!knobClient->secureConnection()){knobClient->disconnect();return false;}
+ knobDetail=3;
+ if(!knobClient->secureConnection())return knobFail(9);
+ knobDetail=4;
  BLERemoteService *hid=knobClient->getService(BLEUUID((uint16_t)0x1812));
- if(!hid){knobClient->disconnect();return false;}
+ if(!hid)return knobFail(10);
  auto map=hid->getCharacteristic(BLEUUID((uint16_t)0x2a4b));
- if(!map){knobClient->disconnect();return false;}
+ if(!map)return knobFail(11);
+ knobDetail=5;
  String descriptor=map->readValue();
- if(descriptor.length()>2048||!knobDecoder.parse((const uint8_t*)descriptor.c_str(),descriptor.length())){knobClient->disconnect();return false;}
+ if(!descriptor.length())return knobFail(11);
+ if(descriptor.length()>2048||!knobDecoder.parse((const uint8_t*)descriptor.c_str(),descriptor.length()))return knobFail(12);
  knobReportCount=0;
  auto chars=hid->getCharacteristicsByHandle();
  if(chars)for(auto &entry:*chars){auto report=entry.second;
@@ -75,11 +82,12 @@ static bool knobBind(BLEAdvertisedDevice &device){
   String ref=reference->readValue();if(ref.length()!=2||(uint8_t)ref[1]!=1)continue;
   knobReports[knobReportCount++]={report->getHandle(),(uint8_t)ref[0]};
  }
- if(!knobReportCount){knobClient->disconnect();return false;}
+ if(!knobReportCount)return knobFail(13);
+ knobDetail=6;
  knobEpoch++;xQueueReset(knobQueue);knobConnected=true;
  for(auto &entry:*chars){auto report=entry.second;for(unsigned i=0;i<knobReportCount;i++)if(report->getHandle()==knobReports[i].handle)report->registerForNotify(knobNotification);}
- if(!knobClient->isConnected()){knobConnected=false;return false;}
- knobSaveAddress(device.getAddress().toString().c_str());knobStatus=3;imageDirty=true;return true;
+ if(!knobClient->isConnected())return knobFail(14);
+ knobSaveAddress(device.getAddress().toString().c_str());knobStatus=3;knobDetail=7;imageDirty=true;return true;
 }
 static void knobTask(void*){
  BLEDevice::init("Codex Pocket");
@@ -102,7 +110,7 @@ static void knobTask(void*){
 #else
  esp_ble_remove_bond_device(address.getNative());
 #endif
- }knobSaveAddress("");knobStatus=0;imageDirty=true;}
+ }knobSaveAddress("");knobStatus=0;knobDetail=16;imageDirty=true;}
   if(knobDiscoveryState==1){
    if(recording||uploadPending||captureRequested){knobDiscoveryState=4;}
    else{
@@ -121,7 +129,7 @@ static void knobTask(void*){
    }
   }
   bool pairing=knobPairUntil&&(int32_t)(knobPairUntil-millis())>0;
-  if(!pairing&&!knobConnected&&!knobAddress[0]&&knobStatus==2)knobStatus=0;
+  if(!pairing&&!knobConnected&&!knobAddress[0]&&knobStatus==2){knobStatus=4;knobDetail=15;}
   if(!knobConnected && (pairing||knobAddress[0]) && !recording&&!uploadPending&&!captureRequested){
    knobScanning=true;knobStatus=pairing?2:1;imageDirty=true;
    BLEScanResults *results=scan->start(3,false);knobScanning=false;
@@ -131,7 +139,7 @@ static void knobTask(void*){
     // Pair only by explicit 60s user request and the manufacturer's advertised name.
     if(pairing){if(!address.equalsIgnoreCase(knobSelectedAddress))continue;}else if(!saved)continue;
     if(knobForgetRequested||recording||uploadPending||captureRequested)break;
-    if(knobBind(device)){knobPairUntil=0;break;}knobStatus=4;imageDirty=true;
+    if(knobBind(device)){knobPairUntil=0;break;}knobStatus=4;if(pairing)knobPairUntil=0;imageDirty=true;break;
    }scan->clearResults();
   }vTaskDelay(pdMS_TO_TICKS(knobConnected?500:5000));
  }
@@ -143,6 +151,8 @@ static void initKnob(){
  knobStatus=knobAddress[0]?1:0;
 }
 static void knobStatusJson(JsonDocument &d){
+ const char *details[]={"","正在搜索所选设备，请按一下旋钮唤醒","正在建立蓝牙连接","正在加密并绑定旋钮","正在读取 HID 服务","正在解析旋钮键值","正在订阅旋转和按压事件","连接成功，可以旋转和按压","蓝牙连接失败，请断开其他主机并唤醒后重试","加密绑定失败，可能需要清除旋钮的旧配对","该设备未提供 BLE HID 服务","无法读取 HID 报告描述符","旋钮 HID 键值格式暂不支持","没有可订阅的 HID 输入报告","配对过程中蓝牙连接断开","60秒内未再次发现所选设备，请唤醒后重新搜索","已忘记旋钮","旋钮已断开，等待自动重连"};
+ d["bluetoothDetail"]=details[knobDetail<18?knobDetail:0];
  const char *states[]={"unpaired","reconnecting","pairing","connected","unsupported_or_failed"};
  d["bluetoothInputCount"]=(uint32_t)knobInputCount;
  d["bluetoothConnected"]=(bool)knobConnected;d["bluetoothScanning"]=(bool)knobScanning;d["bluetoothState"]=states[knobStatus<5?knobStatus:4];
@@ -158,6 +168,6 @@ static int knobCommand(bool forget,JsonDocument &out,const String &selected=""){
   if(knobConnected){out["error"]="旋钮已连接，请先忘记设备再重新配对";return 409;}bool found=false;
   portENTER_CRITICAL(&knobLock);for(unsigned i=0;i<knobDiscoveredCount;i++)if(selected.equalsIgnoreCase(knobDiscovered[i].address)){strlcpy(knobSelectedAddress,knobDiscovered[i].address,sizeof(knobSelectedAddress));found=true;break;}portEXIT_CRITICAL(&knobLock);
   if(!found){out["error"]="请先搜索并选择列表中的蓝牙设备";return 400;}
-  knobPairUntil=millis()+60000;}
+  knobPairUntil=millis()+60000;knobStatus=2;knobDetail=1;}
  out["message"]=forget?"已请求忘记旋钮；再次使用需重新配对。":"正在配对所选设备，请保持旋钮唤醒并断开其他主机。";return 200;
 }
