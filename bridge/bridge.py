@@ -33,6 +33,7 @@ from PIL import Image, ImageDraw, ImageFont
 from recommendations import Feed, paginate, choice_label
 from harness import DEVELOPER_INSTRUCTIONS, task_record
 from goal_flow import GoalFlow
+from round_display import round_packet
 import conversation_memory
 
 ROOT = Path(__file__).resolve().parent
@@ -324,6 +325,8 @@ class Pocket:
         self.page = 0
         self.device = {}
         self.peers = {}
+        self.peer_profiles = {}
+        self.round_detail_page = 0
         self.audio = {}
         self.audio_codecs = {}
         self.voice_busy = False
@@ -568,7 +571,11 @@ class Pocket:
                 await self.execute(action, payload)
 
     async def execute(self, action, payload):
-        if action.startswith('rec_') or action in ('goal_review','goal_finish'):
+        if action in ('round_next','round_prev'):
+            from round_display import task_pages
+            self.round_detail_page=max(0,min(len(task_pages(self,ui_font))-1,self.round_detail_page+(1 if action=='round_next' else -1)))
+            self.dirty=True
+        elif action.startswith('rec_') or action in ('goal_review','goal_finish'):
             await self.recommendation_action(action)
         elif action == 'b2_long' and self.recommendation_reading():
             self.recommendation_reader = None; self.menu = 0; self.dirty = True
@@ -661,6 +668,7 @@ class Pocket:
     async def device_packet(self, msg, source):
         kind = msg.get('type')
         if kind == 'hello':
+            self.peer_profiles[source] = 'taiji360' if msg.get('displayProfile')=='taiji360' else 'legacy'
             self.device = {'source': 'wifi' if source != 'usb' else 'usb', 'connectionId':source, 'lastSeen': time.time(), **{k: msg[k] for k in ('battery', 'millivolts', 'firmware', 'rssi', 'wifiConnected', 'usbConnected', 'configurationMode', 'configurationUrl', 'configurationSsid') if k in msg}}
             self.accept_location(msg.get('location'))
             self.dirty = True
@@ -1211,9 +1219,13 @@ class Pocket:
                     packet = {'type':'frame', 'data':base64.b64encode(frame).decode(), 'hash':hashlib.sha256(frame).hexdigest()[:12],
                               'state':self.status,'voiceBusy':self.voice_busy,'draftReady':bool(self.draft),
                               'audioCodecs':['pcm16','mulaw8k'],'voiceAutoSubmit':True,'idleDashboard':self.is_idle_dashboard(),'recommendationView':'reader' if self.recommendation_reading() else 'home' if self.is_idle_dashboard() else ''}
-                    for peer in list(self.peers.values()):
+                    native_packet = None
+                    for source,peer in list(self.peers.items()):
                         with contextlib.suppress(Exception):
-                            await peer.send_json(packet)
+                            if self.peer_profiles.get(source)=='taiji360':
+                                if native_packet is None:native_packet=round_packet(self,packet,ui_font)
+                                await peer.send_json(native_packet)
+                            else:await peer.send_json(packet)
                     self.render().save(self.runtime/'screen.png')
                     last_frame_at = now
                     self.dirty = False
@@ -1240,6 +1252,7 @@ class Pocket:
             await ws.close(code=1008)
         finally:
             self.peers.pop(source, None)
+            self.peer_profiles.pop(source, None)
             self.audio_codecs.pop(source, None)
             if self.audio.pop(source, None) is not None:
                 self.changed('录音中断','Wi-Fi 连接断开，请重新录音')

@@ -28,6 +28,8 @@
 
 # A/B 同屏近期话题推荐
 
+Taiji Knob 32（ESP32-S3 360×360）通过 hello.displayProfile=taiji360 协商独立圆屏布局；旧 C6 仍使用 200×200 帧。圆屏帧有界 RLE 压缩，任务长文支持 round_next/round_prev 只读翻页；左下选项切换菜单，触摸菜单确认。旋钮/触摸接入位于 codex-pocket 的 taiji-knob32 构建目标。具体硬件与烧录说明见该仓库 devices/taiji-knob-32/README.md。
+
 主待机页同时显示 A/B 两个短选项，当前选项用箭头与加粗边框标识。旋转或 PWR 短按切换 A/B，不自动换组；按住顺时针可换组。BOOT 或旋钮按下进入一屏确认，再按下开始执行。保留当地时间、城市天气，目标/话题占一行；额度移至状态页，PWR 长按进入设备状态。
 
 ## 两键交互
