@@ -38,8 +38,12 @@ def render_round(p,font):
     def text(x,y,value,size=18,width=260):d.text((x,y),fit(value,size,width),font=font(size),fill=1)
     def center(y,value,size=18,width=260):
         value=fit(value,size,width);d.text(((360-font(size).getlength(value))/2,y),value,font=font(size),fill=1)
+    # Code-native Codex terminal mark; the device supplies the colored tile.
+    d.line([(109,30),(115,36),(109,42)],fill=1,width=2)
+    d.line([(119,42),(126,42)],fill=1,width=2)
+    text(140,27,'CODEX',20,112)
     battery=p.device.get('battery')
-    center(28,'CODEX POCKET'+(f' · {battery}%' if isinstance(battery,(int,float)) and battery>=0 else ''),14)
+    if isinstance(battery,(int,float)) and battery>=0:text(244,34,f'{battery}%',11,42)
     location=p.current_location();weather=p.current_weather()
     try:clock=datetime.now(ZoneInfo(location['timezone'])).strftime('%H:%M') if location else '--:--'
     except (KeyError,ValueError):clock='--:--'
@@ -63,20 +67,26 @@ def render_round(p,font):
             center(187,selected,17,190)
             center(232,'了解详情',15)
     elif idle:
-        center(80,'目标：'+p.recommendation_cards[p.recommendation_index].topic,16)
+        center(80,p.recommendation_cards[p.recommendation_index].topic,17,246)
         for i,card in enumerate(p.recommendation_cards):
             y=114+i*72;selected=i==p.recommendation_index
             d.rounded_rectangle((54,y,306,y+60),16,outline=1,width=3 if selected else 1)
-            text(70,y+18,'AB'[i],18,22)
+            text(70,y+10,'AB'[i],28,26)
             text(103,y+16,choice_label(card),22,191)
-        center(258,'旋转选择 · 轻触确认',12)
+        center(251,'转动选 A/B · 左滑换一组',12)
     else:
         center(80,p.status,22)
         pages=task_pages(p,font);index=min(p.round_detail_page,len(pages)-1)
         for row,line in enumerate(pages[index]):text(64,110+row*26,line,18,232)
         center(220,f'{index+1}/{len(pages)} · 旋转翻页',12)
         center(246,p.menu_items()[p.menu%len(p.menu_items())][0],16)
-    text(62,285,'选项' if view==3 else '返回',14,48);center(285,'按住说话',15,110);text(270,285,'设置',14,42)
+    text(61,289,'选项' if view==3 else '换一组' if view==0 else '返回',12,42)
+    text(267,289,'设置',12,38)
+    # Spacious 144 x 50 voice target matches the native touch hit region.
+    d.rounded_rectangle((176,276,184,289),4,outline=1,width=2)
+    d.arc((172,281,188,293),0,180,fill=1,width=2)
+    d.line([(180,293),(180,296)],fill=1,width=2)
+    center(299,'按住说话',14,128)
     # No content beyond the circular bezel safe area.
     mask=Image.new('1',im.size,0);ImageDraw.Draw(mask).ellipse((7,7,353,353),fill=1)
     im=ImageChops.logical_and(im,mask)
