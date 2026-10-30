@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+from collections import deque
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
@@ -305,6 +306,9 @@ class Pocket:
         self.rpc = Rpc(self.notification)
         self.thread = self.config.get('thread_id')
         self.turn = None
+        # RPC notifications can be replayed after a later turn has started.
+        # Bound deduplication independently of goal history (including no-goal turns).
+        self.completed_turns = deque(maxlen=100)
         self.task = task_record()
         self.status = '启动中'
         self.detail = '正在连接 Codex'
@@ -443,14 +447,21 @@ class Pocket:
                 await self.rpc.send({'id': msg['id'], 'error': {'code': -32601, 'message': 'Unsupported by hardware client'}})
             return
         if method == 'turn/started':
+            if p['turn']['id'] in self.completed_turns:
+                return
             self.turn = p['turn']['id']
             self.task = task_record('running', summary='Codex 已开始执行', turn_id=self.turn, source=self.task['source'])
             self.reply = ''
             self.changed('工作中', 'Codex 已开始执行')
         elif method == 'turn/completed':
+            turn = p.get('turn', {})
+            turn_id = turn.get('id')
+            if turn_id in self.completed_turns or (self.turn and turn_id != self.turn):
+                return
+            if turn_id:
+                self.completed_turns.append(turn_id)
             self.turn = None
             self.approvals.clear()
-            turn = p.get('turn', {})
             state = turn.get('status')
             state_name = {'completed':'completed', 'interrupted':'stopped', 'failed':'failed'}.get(state, 'unknown')
             self.task = task_record(state_name, summary=(turn.get('error') or {}).get('message') or self.reply[-400:],
