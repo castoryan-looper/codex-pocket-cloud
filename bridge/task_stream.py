@@ -278,7 +278,10 @@ class TaskStream:
             else:await self.p.rpc.send({'id':msg['id'],'error':{'code':-32601,'message':'Unsupported by task stream'}})
         elif method=='turn/started':
             if j['state'] not in ('completed','failed','stopped'):j['turn']=p['turn']['id'];j['state']='running'
-        elif method=='item/agentMessage/delta':j['reply']=(j['reply']+p.get('delta',''))[-12000:]
+        elif method=='item/started':
+            item=p.get('item') or {};j['detail']={'commandExecution':'正在执行检查','fileChange':'正在修改文件','webSearch':'正在搜索资料','reasoning':'正在分析','agentMessage':'正在整理回复'}.get(item.get('type'),'正在处理任务')
+        elif method=='item/agentMessage/delta':
+            j['reply']=(j['reply']+p.get('delta',''))[-12000:];j['detail']=j['reply'][-90:];self.dirty();return True
         elif method=='item/completed':
             if p.get('item',{}).get('type')=='agentMessage':j['reply']=p['item'].get('text',j['reply'])[-12000:]
         elif method=='turn/completed':
@@ -290,7 +293,9 @@ class TaskStream:
                 action='goal_'+j['strategy'] if j['strategy'] in ('verify','advance') else j['strategy']
                 self.p.goal_flow.finish(turn.get('status','unknown'),j['reply'],(turn.get('error') or {}).get('message',''),j['turn'],action=action);self.p.goal_followup_ready=True
             self.ranker.learn(Card(j['cardId'],j['topic'],j['title'],j['prompt'],j['strategy'],'任务流'),0,outcome=j['state']);self.kick()
-        elif method=='serverRequest/resolved':j['approvals']=[a for a in j['approvals'] if a['id']!=p.get('requestId')]
+        elif method=='serverRequest/resolved':
+            j['approvals']=[a for a in j['approvals'] if a['id']!=p.get('requestId')]
+            if not j['approvals'] and j['state']=='awaiting_approval':j['state']='running';j['detail']='请求已处理，继续执行'
         self.save();self.dirty();return True
     async def decide(self,item):
         owner=next((v for k,v in self.owners() if k==item['owner']),None)
