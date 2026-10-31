@@ -69,11 +69,11 @@ class GoalFlow:
         if not self.active:self.start(card.context or card.topic,'用户选择的近期话题')
         self.active['last_action']=card.strategy;self.save()
 
-    def finish(self, status, reply, error='', turn_id=None):
+    def finish(self, status, reply, error='', turn_id=None, action=None):
         if not self.active:return False
         if turn_id and any(row.get('turnId')==turn_id for g in [self.active]+self.data['archive'] for row in g['results']):return False
         row={'turnId':turn_id,'status':status,'summary':str(reply or '')[-3000:],
-            'error':str(error or '')[:1200],'action':self.active.get('last_action',''),'at':time.time(),'verification':'not_reported'}
+            'error':str(error or '')[:1200],'action':self.active.get('last_action','') if action is None else action,'at':time.time(),'verification':'not_reported'}
         self.active['results']=(self.active['results']+[row])[-30:]
         self.active['revision']+=1;self.active['variation']=0;self.save();return True
 

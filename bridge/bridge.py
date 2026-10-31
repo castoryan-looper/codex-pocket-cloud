@@ -30,7 +30,8 @@ from functools import lru_cache
 
 from aiohttp import web, WSMsgType, ClientSession, ClientTimeout
 from PIL import Image, ImageDraw, ImageFont
-from recommendations import Feed, paginate, choice_label
+from recommendations import Feed, paginate, choice_label, Card
+from task_stream import TaskStream, LIVE
 from harness import DEVELOPER_INSTRUCTIONS, task_record
 from goal_flow import GoalFlow
 from round_display import round_packet
@@ -326,9 +327,11 @@ class Pocket:
         self.device = {}
         self.peers = {}
         self.peer_profiles = {}
+        self.peer_streams = {}
         self.round_detail_page = 0
         self.audio = {}
         self.audio_codecs = {}
+        self.audio_contexts = {}
         self.voice_busy = False
         self.whisper_model = None
         self.whisper_lock = threading.Lock()
@@ -353,6 +356,7 @@ class Pocket:
         self.recommendation_reader = None
         self.recommendation_generation = 0
         self.chat_task = None
+        self.stream = TaskStream(self)
 
     def recommendation_pair(self):
         return self.goal_flow.pair() or self.goal_flow.closed_pair() or self.recommendations.pair()
@@ -437,6 +441,7 @@ class Pocket:
         self.dirty = True
 
     async def notification(self, msg):
+        if await self.stream.notification(msg):return
         method, p = msg.get('method', ''), msg.get('params') or {}
         if p.get('threadId') and p['threadId'] != self.thread:
             return
@@ -534,6 +539,8 @@ class Pocket:
     async def action(self, action, payload=None):
         payload = payload or {}
         async with self.action_lock:
+            if isinstance(action,str) and action.startswith('stream_'):
+                await self.stream.action(action,payload);return
             if action in ('knob_left', 'knob_right'):
                 direction = 1 if action == 'knob_right' else -1
                 if self.is_idle_dashboard() and not self.recommendation_reading():
@@ -639,6 +646,9 @@ class Pocket:
     async def submit(self, text, *, source='direct'):
         if not text:
             raise ValueError('任务不能为空')
+        if any(j['state'] in LIVE|{'queued'} for j in self.stream.jobs):
+            ident='voice:'+secrets.token_hex(8)
+            await self.stream.enqueue(Card(ident,text[:48],text[:24],text,'direct','语音任务'));self.changed('待命','语音任务已加入队列');return
         if self.turn:
             raise ValueError('当前任务正在执行；请先停止或等待完成')
         had_goal=bool(self.goal_flow.active)
@@ -669,6 +679,7 @@ class Pocket:
         kind = msg.get('type')
         if kind == 'hello':
             self.peer_profiles[source] = 'taiji360' if msg.get('displayProfile')=='taiji360' else 'legacy'
+            self.peer_streams[source] = self.peer_profiles[source]=='taiji360' and msg.get('taskStream')==1
             self.device = {'source': 'wifi' if source != 'usb' else 'usb', 'connectionId':source, 'lastSeen': time.time(), **{k: msg[k] for k in ('battery', 'millivolts', 'firmware', 'rssi', 'wifiConnected', 'usbConnected', 'configurationMode', 'configurationUrl', 'configurationSsid') if k in msg}}
             self.accept_location(msg.get('location'))
             self.dirty = True
@@ -679,7 +690,10 @@ class Pocket:
             self.dirty = True
         elif kind == 'event':
             try:
-                await self.action(msg.get('action'))
+                action=msg.get('action','')
+                if isinstance(action,str) and action.startswith('stream_') and not self.peer_streams.get(source):return
+                payload=msg.get('payload') if isinstance(msg.get('payload'),dict) else {}
+                await self.action(action,payload)
             except Exception as exc:
                 self.changed(detail=str(exc))
         elif kind == 'audio_start':
@@ -691,6 +705,7 @@ class Pocket:
                 self.changed('录音失败', '设备音频格式不受支持')
                 return
             self.draft = ''
+            self.audio_contexts[source]=self.stream.capture_voice_target() if self.peer_streams.get(source) else None
             self.audio[source] = bytearray()
             self.audio_codecs[source] = codec
             self.changed('录音中', f'松开 BOOT 结束，最长 {msg.get("maxSeconds",20)} 秒')
@@ -706,6 +721,7 @@ class Pocket:
                     self.audio_codecs.pop(source, None)
                     self.changed('录音失败', '录音超出 20 秒上限，请重试')
         elif kind == 'audio_end':
+            stream_target=self.audio_contexts.pop(source,None)
             data = self.audio.pop(source, None)
             codec = self.audio_codecs.pop(source, 'pcm16')
             if data is not None:
@@ -716,15 +732,19 @@ class Pocket:
                 elif msg.get('bytes') is not None and msg['bytes'] != len(data) * (4 if codec == 'mulaw8k' else 1):
                     self.changed('录音失败','音频传输不完整，请重试')
                 else:
-                    asyncio.create_task(self.transcribe(decode_mulaw8k(data) if codec == 'mulaw8k' else bytes(data)))
+                    pcm=decode_mulaw8k(data) if codec=='mulaw8k' else bytes(data)
+                    asyncio.create_task(self.transcribe(pcm,stream_target=stream_target) if stream_target else self.transcribe(pcm))
+        elif kind == 'stream_presence':
+            if self.peer_streams.get(source) and not msg.get('configurationMode',False):self.stream.acknowledge(source,msg.get('streamToken'))
         elif kind == 'frame_ack':
+            if self.peer_streams.get(source) and not msg.get('configurationMode',False):self.stream.acknowledge(source,msg.get('streamToken'))
             self.device['frameAck'] = time.time()
             self.device['frameHash'] = msg.get('hash')
             self.device.update({k:msg[k] for k in ('wifiConnected','usbConnected','configurationMode') if k in msg})
         elif kind == 'diagnostic':
             self.device['diagnostic'] = {k:v for k,v in msg.items() if k != 'type'}
 
-    async def transcribe(self, data):
+    async def transcribe(self, data, stream_target=None):
         if self.voice_busy:
             self.changed(detail='上一段语音仍在识别，请稍候')
             return
@@ -765,6 +785,8 @@ class Pocket:
             if not text:
                 raise ValueError(f'录到 {len(data)/32000:.1f} 秒，但未识别出文字。请在“录音中”出现后说话，松开结束')
             text = text[:4000]
+            if stream_target:
+                self.stream.voice_answer(stream_target,text);self.changed(detail="答案已识别，请在任务流读完并双击提交");return
             recognized_at = time.monotonic()
             try:
                 async with self.action_lock:
@@ -1084,7 +1106,7 @@ class Pocket:
         mobile_ca = ''.join(p.read_text('utf-8') for p in (roots/'gtsr4.pem', roots/'isrgrootx1.pem') if p.exists())
         device = dict(self.device)
         device['bridgeConnected'] = bool(self.peers) and time.time()-device.get('frameAck',0)<20
-        return {'goal':self.goal_flow.snapshot(), 'status': self.status, 'detail': self.detail, 'threadId': self.thread, 'turnId': self.turn, 'task': self.task,
+        return {'taskStream':self.stream.snapshot(), 'goal':self.goal_flow.snapshot(), 'status': self.status, 'detail': self.detail, 'threadId': self.thread, 'turnId': self.turn, 'task': self.task,
                 'reply': self.reply, 'draft': self.draft, 'approvals': self.approvals, 'quota': self.remaining(),
                 'quotaUpdatedAt': self.rate_at, 'tokens': self.tokens, 'context': self.context,
                 'device': device, 'cwd': self.config['cwd'], 'noProgressSeconds': int(time.monotonic()-self.last_event),
@@ -1213,18 +1235,20 @@ class Pocket:
                 if now-last_limits > 120:
                     last_limits = now
                     await self.refresh_limits()
+                if any(j['state']=='queued' for j in self.stream.jobs):self.stream.kick()
                 if now-last_frame_at > (0.35 if self.dirty else 4):
                     frame = self.render().tobytes()
                     # Even identical screens carry heartbeat. E-paper only refreshes changed pixels.
                     packet = {'type':'frame', 'data':base64.b64encode(frame).decode(), 'hash':hashlib.sha256(frame).hexdigest()[:12],
                               'state':self.status,'voiceBusy':self.voice_busy,'draftReady':bool(self.draft),
                               'audioCodecs':['pcm16','mulaw8k'],'voiceAutoSubmit':True,'idleDashboard':self.is_idle_dashboard(),'recommendationView':'reader' if self.recommendation_reading() else 'home' if self.is_idle_dashboard() else ''}
-                    native_packet = None
+                    native_packets = {}
                     for source,peer in list(self.peers.items()):
                         with contextlib.suppress(Exception):
                             if self.peer_profiles.get(source)=='taiji360':
-                                if native_packet is None:native_packet=round_packet(self,packet,ui_font)
-                                await peer.send_json(native_packet)
+                                streaming=bool(self.peer_streams.get(source))
+                                if streaming not in native_packets:native_packets[streaming]=round_packet(self,packet,ui_font,stream=streaming)
+                                await peer.send_json(native_packets[streaming])
                             else:await peer.send_json(packet)
                     self.render().save(self.runtime/'screen.png')
                     last_frame_at = now
@@ -1253,6 +1277,8 @@ class Pocket:
         finally:
             self.peers.pop(source, None)
             self.peer_profiles.pop(source, None)
+            self.peer_streams.pop(source,None)
+            self.audio_contexts.pop(source,None)
             self.audio_codecs.pop(source, None)
             if self.audio.pop(source, None) is not None:
                 self.changed('录音中断','Wi-Fi 连接断开，请重新录音')
@@ -1292,6 +1318,14 @@ class Pocket:
             return web.json_response({'ok': True})
         except Exception as exc:
             return web.json_response({'error':str(exc)}, status=400)
+
+    async def stream_decision(self,request):
+        self.check_console(request)
+        try:
+            msg=await request.json()
+            async with self.action_lock:await self.stream.console_decide(msg)
+            return web.json_response({'ok':True})
+        except Exception as exc:return web.json_response({'error':str(exc)},status=400)
 
     async def connection_package(self, request):
         self.check_console(request)
@@ -1343,7 +1377,7 @@ class Pocket:
         app = web.Application(client_max_size=conversation_memory.MAX_BYTES)
         app.add_routes([web.get('/',self.console),web.get('/device',self.websocket),web.get('/healthz',self.health),
                         web.get('/api/state',self.state),web.get('/api/screen',self.preview),
-                        web.post('/api/action',self.command),web.get('/api/connection',self.connection_package),
+                        web.post('/api/action',self.command),web.post('/api/task-stream/decision',self.stream_decision),web.get('/api/connection',self.connection_package),
                         web.post('/api/dashboard-context',self.update_dashboard_context),web.post('/context-import',self.import_conversation)])
         return app
 

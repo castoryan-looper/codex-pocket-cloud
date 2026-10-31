@@ -28,7 +28,7 @@ def pack_bitmap(data):
         out.append(i-start-1);out.extend(data[start:i])
     return bytes(out)
 
-def render_round(p,font):
+def render_round(p,font,stream=False):
     im=Image.new('1',(360,360),0);d=ImageDraw.Draw(im)
     def fit(value,size,width):
         value=str(value)
@@ -49,7 +49,21 @@ def render_round(p,font):
     except (KeyError,ValueError):clock='--:--'
     center(52,clock+' · '+(location['city'] if location else '定位中')+(f' {weather["temperature"]:.0f}°C' if weather else ''),13)
     reading=p.recommendation_reading();idle=p.is_idle_dashboard();view=2 if reading and p.recommendation_expanded() else 1 if reading else 0 if idle else 3
-    if reading:
+    stream_meta={}
+    if stream:
+        item,index,total=p.stream.current();view=4
+        kinds={'recommendation':'为你推荐','decision':'需要你决定','review':'先读请求详情','job':'任务进度','draft':'语音草稿','notice':'任务流','status':'执行中','question':'请回答这个问题','stop':'任务操作'}
+        pending=sum(len(state.get('approvals',[])) for _,state in p.stream.owners())
+        header=('待决 '+str(pending)+' 项' if pending else kinds.get(item['kind'],'任务流'))
+        center(77,header+' · '+str(index+1)+'/'+str(total),14)
+        center(106,item['title'],23,248)
+        body_pages=paginate(item.get('body',''),lambda t:font(16).getlength(t),width=240,rows=4)
+        for row,line in enumerate(body_pages[0][:4]):text(60,145+row*21,line,16,240)
+        center(235,p.stream.notice or item.get('label') or '上下滑继续',13,238)
+        center(253,'上下滑浏览 · 双击确认',11)
+        selection={'recommendation':0,'decision':1,'review':1,'job':2,'status':2}.get(item['kind'],3)
+        stream_meta={'streamToken':p.stream.token,'roundSelection':selection}
+    elif reading:
         reader=p.recommendation_reader;card=p.recommendation_cards[reader['card']]
         if p.recommendation_expanded():
             center(78,'目标档案' if reader['context'] else '详细说明',18)
@@ -80,7 +94,7 @@ def render_round(p,font):
         for row,line in enumerate(pages[index]):text(64,110+row*26,line,18,232)
         center(220,f'{index+1}/{len(pages)} · 旋转翻页',12)
         center(246,p.menu_items()[p.menu%len(p.menu_items())][0],16)
-    text(61,289,'选项' if view==3 else '换一组' if view==0 else '返回',12,42)
+    text(61,289,str(sum(j['state'] in ('running','awaiting_approval') for j in p.stream.jobs))+'运行' if view==4 else '选项' if view==3 else '换一组' if view==0 else '返回',12,42)
     text(267,289,'设置',12,38)
     # Spacious 144 x 50 voice target matches the native touch hit region.
     d.rounded_rectangle((176,276,184,289),4,outline=1,width=2)
@@ -90,10 +104,10 @@ def render_round(p,font):
     # No content beyond the circular bezel safe area.
     mask=Image.new('1',im.size,0);ImageDraw.Draw(mask).ellipse((7,7,353,353),fill=1)
     im=ImageChops.logical_and(im,mask)
-    return im,{'roundView':view,'roundSelection':p.recommendation_index,'roundExpanded':bool(reading and p.recommendation_expanded()),'roundBusy':bool(p.turn or p.draft or p.approvals or p.voice_busy),'roundCanRecord':not bool(p.draft or p.approvals or p.voice_busy)}
+    return im,{'roundView':view,'roundSelection':p.recommendation_index,'roundExpanded':bool(reading and p.recommendation_expanded()),'roundBusy':bool(p.turn or p.draft or p.approvals or p.voice_busy),'roundCanRecord':not bool(p.draft or p.approvals or p.voice_busy),**stream_meta}
 
-def round_packet(p,packet,font):
-    image,metadata=render_round(p,font);packed=pack_bitmap(image.tobytes())
+def round_packet(p,packet,font,stream=False):
+    image,metadata=render_round(p,font,stream=stream);packed=pack_bitmap(image.tobytes())
     result=dict(packet,**metadata)
     if len(packed)<=9600:
         result.pop('data',None);result['roundRle']=base64.b64encode(packed).decode()

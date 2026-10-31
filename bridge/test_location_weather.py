@@ -11,6 +11,7 @@ class LocationWeatherTests(unittest.IsolatedAsyncioTestCase):
         self.p = bridge.Pocket.__new__(bridge.Pocket)
         self.p.device = {}
         self.p.peer_profiles = {}
+        self.p.peer_streams = {}
         self.p.location_at = 0
         self.p.weather = None
         self.p.weather_at = 0
