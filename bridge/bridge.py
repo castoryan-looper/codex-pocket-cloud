@@ -34,7 +34,7 @@ from recommendations import Feed, paginate, choice_label, Card
 from task_stream import TaskStream, LIVE
 from harness import DEVELOPER_INSTRUCTIONS, task_record
 from goal_flow import GoalFlow
-from round_display import round_packet
+from round_display import round_packet, stream_preview_packets
 import conversation_memory
 
 ROOT = Path(__file__).resolve().parent
@@ -328,6 +328,7 @@ class Pocket:
         self.peers = {}
         self.peer_profiles = {}
         self.peer_streams = {}
+        self.peer_smooth = {}
         self.round_detail_page = 0
         self.audio = {}
         self.audio_codecs = {}
@@ -680,6 +681,7 @@ class Pocket:
         if kind == 'hello':
             self.peer_profiles[source] = 'taiji360' if msg.get('displayProfile')=='taiji360' else 'legacy'
             self.peer_streams[source] = self.peer_profiles[source]=='taiji360' and msg.get('taskStream')==1
+            self.peer_smooth[source]=self.peer_streams[source] and msg.get('streamPrefetch')==1
             self.device = {'source': 'wifi' if source != 'usb' else 'usb', 'connectionId':source, 'lastSeen': time.time(), **{k: msg[k] for k in ('battery', 'millivolts', 'firmware', 'rssi', 'wifiConnected', 'usbConnected', 'configurationMode', 'configurationUrl', 'configurationSsid') if k in msg}}
             self.accept_location(msg.get('location'))
             self.dirty = True
@@ -1242,13 +1244,18 @@ class Pocket:
                     packet = {'type':'frame', 'data':base64.b64encode(frame).decode(), 'hash':hashlib.sha256(frame).hexdigest()[:12],
                               'state':self.status,'voiceBusy':self.voice_busy,'draftReady':bool(self.draft),
                               'audioCodecs':['pcm16','mulaw8k'],'voiceAutoSubmit':True,'idleDashboard':self.is_idle_dashboard(),'recommendationView':'reader' if self.recommendation_reading() else 'home' if self.is_idle_dashboard() else ''}
-                    native_packets = {}
+                    native_packets = {};preview_packets={}
                     for source,peer in list(self.peers.items()):
                         with contextlib.suppress(Exception):
                             if self.peer_profiles.get(source)=='taiji360':
                                 streaming=bool(self.peer_streams.get(source))
-                                if streaming not in native_packets:native_packets[streaming]=round_packet(self,packet,ui_font,stream=streaming)
-                                await peer.send_json(native_packets[streaming])
+                                dense=bool(self.peer_smooth.get(source));variant=(streaming,dense)
+                                if variant not in native_packets:native_packets[variant]=round_packet(self,packet,ui_font,stream=streaming,dense=dense)
+                                await peer.send_json(native_packets[variant])
+                                if dense:
+                                    anchor=native_packets[variant].get('streamToken')
+                                    if anchor not in preview_packets:preview_packets[anchor]=stream_preview_packets(self,ui_font,anchor)
+                                    for preview in preview_packets[anchor]:await peer.send_json(preview)
                             else:await peer.send_json(packet)
                     self.render().save(self.runtime/'screen.png')
                     last_frame_at = now
@@ -1278,6 +1285,7 @@ class Pocket:
             self.peers.pop(source, None)
             self.peer_profiles.pop(source, None)
             self.peer_streams.pop(source,None)
+            self.peer_smooth.pop(source,None)
             self.audio_contexts.pop(source,None)
             self.audio_codecs.pop(source, None)
             if self.audio.pop(source, None) is not None:

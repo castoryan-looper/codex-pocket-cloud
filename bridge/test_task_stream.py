@@ -179,4 +179,24 @@ class TaskStreamTests(unittest.IsolatedAsyncioTestCase):
         await s.enqueue(self.card('new'));await self.flush()
         self.assertIn(live,s.jobs);self.assertEqual(len(s.jobs),40)
 
+    async def test_neighbor_previews_do_not_move_focus_learn_or_authorize(self):
+        from round_display import stream_preview_packets
+        s=self.p.stream;s.current();token=s.token;key=s.key;before=list(s.ranker.data['events'])
+        packets=stream_preview_packets(self.p,ui_font,token)
+        self.assertTrue(packets)
+        for packet in packets:
+            self.assertEqual(packet['type'],'stream_preview');self.assertEqual(packet['anchor'],token)
+            self.assertNotIn('streamToken',packet);self.assertLess(len(json.dumps(packet).encode()),15000)
+        self.assertEqual(s.key,key);self.assertEqual(s.token,token);self.assertEqual(s.ranker.data['events'],before)
+        self.p.rpc.call.assert_not_awaited()
+        self.assertEqual(stream_preview_packets(self.p,ui_font,'stale-token'),[])
+    async def test_dense_layout_is_negotiated_without_changing_old_frame(self):
+        packet={'type':'frame','data':'legacy','hash':'x'}
+        dense=round_packet(self.p,packet,ui_font,stream=True,dense=True)
+        self.assertEqual(dense['streamLayout'],2);self.assertFalse(dense['streamHasPrev'])
+        self.assertLess(len(json.dumps(dense,ensure_ascii=False).encode()),15000)
+        old=round_packet(self.p,packet,ui_font,stream=True);self.assertNotIn('streamLayout',old)
+        await self.p.device_packet({'type':'hello','displayProfile':'taiji360','taskStream':1,'streamPrefetch':1},'smooth')
+        self.assertTrue(self.p.peer_smooth['smooth'])
+
 if __name__=='__main__':unittest.main()

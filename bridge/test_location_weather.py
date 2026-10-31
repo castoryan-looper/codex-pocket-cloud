@@ -12,6 +12,7 @@ class LocationWeatherTests(unittest.IsolatedAsyncioTestCase):
         self.p.device = {}
         self.p.peer_profiles = {}
         self.p.peer_streams = {}
+        self.p.peer_smooth = {}
         self.p.location_at = 0
         self.p.weather = None
         self.p.weather_at = 0
