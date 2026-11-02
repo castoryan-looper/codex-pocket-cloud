@@ -1,0 +1,2 @@
+# Separate layer so enabling voice can reuse the existing Whisper dependency layer.
+aiortc==1.14.0

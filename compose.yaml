@@ -1,6 +1,10 @@
 name: codex-pocket
 services:
   gateway:
+    networks:
+      default:
+      radio:
+        aliases: [pocket-backend]
     build:
       context: .
       target: gateway
@@ -53,6 +57,9 @@ services:
       - caddy_data:/data
       - caddy_config:/config
       - public_ca:/trust
+networks:
+  radio:
+    name: codex-pocket-radio
 volumes:
   gateway_state:
   workspace:
