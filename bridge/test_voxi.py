@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
 
-from voxi import VoiceSession, VoxiRadio, VoiceFailure, diagnostic_reason, frameless_session_update
+from voxi import VoiceSession, VoxiRadio, VoiceFailure, diagnostic_reason, frameless_session_update, create_input_track
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -51,8 +51,10 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         finally:await voice.stop()
 
     async def test_buffer_until_release_and_submit_v3_audio_with_silence(self):
-        import base64
-        ws=Socket();voice=VoiceSession(ws,'unused');voice.events=Channel()
+        class CaptureTrack:
+            def submit(self,data):self.data=data
+            def stop(self):pass
+        ws=Socket();voice=VoiceSession(ws,'unused');voice.events=Channel();voice.input_track=CaptureTrack()
         await voice.on_event({'type':'session.updated','session':{}})
         self.assertTrue(voice.ready)
         await voice.control({'type':'ptt_down'})
@@ -65,14 +67,60 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         await voice.pcm(original)
         self.assertEqual(voice.events.packets,[])
         await voice.control({'type':'ptt_up'})
-        self.assertTrue(all(p['type']=='input_audio.append' for p in voice.events.packets))
-        submitted=b''.join(base64.b64decode(p['audio']) for p in voice.events.packets)
-        self.assertEqual(submitted,original+bytes(38400))
+        self.assertEqual(voice.events.packets,[])
+        self.assertEqual(voice.input_track.data,original+bytes(38400))
         self.assertFalse(voice.ready)
         self.assertEqual(ws.packets[-1],{'type':'thinking'})
         await voice.on_event({'type':'turn.done','turn':{'role':'assistant'}})
         self.assertTrue(voice.generation_done)
         await voice.stop()
+
+    @unittest.skipUnless(importlib.util.find_spec('aiortc'), 'Optional native voice dependencies not installed')
+    async def test_microphone_track_emits_paced_24k_mono_audio_and_silence(self):
+        from fractions import Fraction
+        track=create_input_track()
+        try:
+            silent=await track.recv()
+            self.assertEqual(silent.sample_rate,24000)
+            self.assertEqual(silent.samples,480)
+            self.assertEqual(silent.time_base,Fraction(1,24000))
+            track.submit(bytes([1,0])*480)
+            with self.assertRaises(RuntimeError):track.submit(bytes(960))
+            audio=await track.recv()
+            self.assertEqual(bytes(audio.planes[0])[:960],bytes([1,0])*480)
+            self.assertEqual(audio.pts-silent.pts,480)
+            self.assertEqual(track.emitted_bytes,960)
+            tail=await track.recv()
+            self.assertEqual(bytes(tail.planes[0])[:960],bytes(960))
+        finally:track.stop()
+
+    @unittest.skipUnless(importlib.util.find_spec('aiortc'), 'Optional native voice dependencies not installed')
+    async def test_queued_microphone_audio_traverses_real_webrtc_rtp(self):
+        from aiortc import RTCPeerConnection,RTCConfiguration
+        a=RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        b=RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        track=create_input_track();remote=asyncio.get_running_loop().create_future()
+        @b.on('track')
+        def got_track(received):
+            if not remote.done():remote.set_result(received)
+        try:
+            a.addTrack(track)
+            await a.setLocalDescription(await a.createOffer())
+            await b.setRemoteDescription(a.localDescription)
+            await b.setLocalDescription(await b.createAnswer())
+            await a.setRemoteDescription(b.localDescription)
+            received=await asyncio.wait_for(remote,5)
+            track.submit(bytes([0xe8,3])*4800)
+            async def heard():
+                for _ in range(40):
+                    frame=await received.recv()
+                    raw=bytes(frame.planes[0])[:frame.samples*len(frame.layout.channels)*2]
+                    if any(abs(int.from_bytes(raw[i:i+2],'little',signed=True))>50 for i in range(0,len(raw),2)):return True
+                return False
+            self.assertTrue(await asyncio.wait_for(heard(),5))
+            self.assertGreater(track.emitted_bytes,0)
+        finally:
+            await a.close();await b.close()
 
     async def test_reject_non_device_access_before_starting_cli(self):
         radio = VoxiRadio(SimpleNamespace(config={'device_token':'test'}),'unused')

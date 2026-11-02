@@ -130,10 +130,37 @@ class VoiceRpc:
         await asyncio.gather(*self.tasks, return_exceptions=True)
 
 
+def create_input_track():
+    from aiortc import AudioStreamTrack
+    from av import AudioFrame
+    from fractions import Fraction
+    class InputTrack(AudioStreamTrack):
+        def __init__(self):
+            super().__init__()
+            self.payload=b'';self.offset=0;self.samples=0;self.clock=None;self.emitted_bytes=0
+        def submit(self, data):
+            if len(data)>30*48000+38400 or len(data)%2:raise ValueError('Invalid/overlong RTC audio')
+            if self.offset<len(self.payload):raise RuntimeError('Previous RTC upload is still active')
+            self.payload=bytes(data);self.offset=0
+        async def recv(self):
+            loop=asyncio.get_running_loop()
+            if self.clock is None:self.clock=loop.time()
+            await asyncio.sleep(max(0,self.clock+self.samples/24000-loop.time()))
+            block=self.payload[self.offset:self.offset+960]
+            self.offset+=len(block);self.emitted_bytes+=len(block)
+            if self.offset>=len(self.payload):self.payload=b'';self.offset=0
+            frame=AudioFrame(format='s16',layout='mono',samples=480)
+            frame.planes[0].update(block.ljust(960,b'\0'))
+            frame.sample_rate=24000;frame.pts=self.samples;frame.time_base=Fraction(1,24000)
+            self.samples+=480
+            return frame
+    return InputTrack()
+
+
 class VoiceSession:
     def __init__(self, ws, binary):
         self.ws, self.binary = ws, binary
-        self.rpc = self.peer = self.events = self.workspace = None
+        self.rpc = self.peer = self.events = self.workspace = self.input_track = None
         self.answer = None
         self.ready = self.recording = self.allow_output = self.outputting = False
         self.bytes = self.played = 0
@@ -188,12 +215,11 @@ class VoiceSession:
             'ephemeral': True, 'developerInstructions': 'Voice conversation only. Do not use tools, files, agents or shell commands.'
         }))['thread']['id']
         self.peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-        self.peer.addTransceiver('audio', direction='recvonly')
+        self.input_track=create_input_track()
+        self.peer.addTrack(self.input_track)
         self.events = self.peer.createDataChannel('oai-events')
         @self.events.on('open')
         def opened():
-            # Input travels as ordered PCM events over the RTC data channel.
-            # PTT explicitly commits; no VAD timeout and no silent RTP input.
             # Only configure fields defined by the Frameless Bidi protocol.
             # Audio is buffered until PTT release; do not disable server VAD.
             self.event(frameless_session_update())
@@ -332,22 +358,14 @@ class VoiceSession:
             self.lookback.clear()
             self.ready = False
             await self.send({'type': 'busy'})
-            # Release submits the complete utterance, then 800ms of silence.
-            # v3 has input_audio.append; it has no public Realtime commit/create.
-            import base64
-            audio = bytes(self.pending_audio) + bytes(38400)
+            # AVAS WebRTC accepts microphone media over RTP, never audio
+            # append JSON on its data channel. Release queues real-time media.
+            self.input_track.submit(bytes(self.pending_audio)+bytes(38400))
             self.pending_audio.clear()
-            for offset in range(0, len(audio), 9600):
-                deadline = time.monotonic()+10
-                while self.events and self.events.bufferedAmount > 96000:
-                    if time.monotonic()>deadline: raise RuntimeError('Voice upload backpressure timeout')
-                    await asyncio.sleep(.01)
-                self.event({'type':'input_audio.append','audio':base64.b64encode(audio[offset:offset+9600]).decode()})
-                await asyncio.sleep(0)
             await self.send({'type': 'thinking'})
             turn = self.turn
             async def response_timeout():
-                await asyncio.sleep(30)
+                await asyncio.sleep(self.bytes/48000+30)
                 if turn == self.turn and self.allow_output and not self.ws.closed:
                     await self.send({'type': 'error', 'message': 'Codex voice response timed out'})
                     await self.ws.close()
@@ -373,6 +391,8 @@ class VoiceSession:
         if self.peer:
             peer, self.peer = self.peer, None
             await peer.close()
+        if self.input_track:
+            self.input_track.stop();self.input_track=None
         if self.rpc:
             rpc, self.rpc = self.rpc, None
             await rpc.close()
