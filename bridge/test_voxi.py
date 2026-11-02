@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from voxi import VoiceSession, VoxiRadio
+from voxi import VoiceSession, VoxiRadio, VoiceFailure, diagnostic_reason
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -82,3 +82,18 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('m=application',peer.localDescription.sdp)
         finally:
             await peer.close()
+
+
+class DiagnosticTests(unittest.TestCase):
+    def test_error_categories_preserve_reason_without_credentials(self):
+        reason=diagnostic_reason('HTTP 403 forbidden token=secret-token-value https://private.example/path?sdp=private')
+        self.assertIn('access-denied',reason)
+        self.assertIn('http-403',reason)
+        self.assertNotIn('secret',reason)
+        self.assertNotIn('private',reason)
+    def test_rpc_code_retained_and_arbitrary_text_removed(self):
+        error=VoiceFailure('rpc',-32602,'Invalid params: voice not supported for version v1 secret-credential')
+        self.assertIn('-32602',str(error))
+        self.assertIn('unsupported',str(error))
+        self.assertIn('voice',str(error))
+        self.assertNotIn('secret',str(error))

@@ -9,12 +9,43 @@ import contextlib
 import hmac
 import json
 import logging
+import re
 import tempfile
 import time
 from collections import deque
 
 from aiohttp import web, WSMsgType
 LOG = logging.getLogger('pocket.voxi')
+
+
+def diagnostic_reason(value):
+    """Retain error categories, never arbitrary RPC text, SDP or credentials."""
+    text = str(value).lower()
+    labels = []
+    groups = {
+        'authentication': ('unauthorized', 'authentication', 'login', '401'),
+        'access-denied': ('forbidden', 'permission', 'entitlement', '403'),
+        'rate-limit': ('rate limit', 'quota', '429'),
+        'invalid-parameters': ('invalid param', 'invalid request', '-32602'),
+        'unsupported': ('unsupported', 'not supported', 'unknown variant', 'unknown field'),
+        'voice': ('voice',), 'version': ('version',), 'transport': ('transport',),
+        'timeout': ('timed out', 'timeout'),
+        'network': ('connection', 'connect error', 'dns', 'tls', 'certificate', 'network'),
+        'service-error': ('500', '502', '503', '504'),
+        'sdp': ('sdp',), 'feature-disabled': ('not enabled', 'feature', 'disabled'),
+    }
+    for label, matches in groups.items():
+        if any(word in text for word in matches): labels.append(label)
+    statuses = sorted(set(re.findall(r'(?<![0-9])(?:400|401|403|404|408|429|500|502|503|504)(?![0-9])', text)))
+    return ','.join(labels + ['http-'+code for code in statuses]) or 'unclassified'
+
+
+class VoiceFailure(RuntimeError):
+    def __init__(self, source, code, detail):
+        self.source = source if source in ('rpc', 'notification') else 'runtime'
+        self.code = code if isinstance(code, int) else None
+        self.reason = diagnostic_reason(detail)
+        super().__init__(f'{self.source} code={self.code} reason={self.reason}')
 
 
 class VoiceRpc:
@@ -64,7 +95,8 @@ class VoiceRpc:
                     future = self.pending.get(packet['id'])
                     if future and not future.done():
                         if 'error' in packet:
-                            future.set_exception(RuntimeError('Codex RPC rejected request; verify CLI version and voice entitlement'))
+                            error = packet.get('error') or {}
+                            future.set_exception(VoiceFailure('rpc', error.get('code'), error.get('message', '')))
                         else:
                             future.set_result(packet.get('result', {}))
                 elif 'id' in packet:
@@ -128,7 +160,7 @@ class VoiceSession:
             self.answer.set_result(params['sdp'])
         elif method in ('thread/realtime/error', 'thread/realtime/closed'):
             if self.answer and not self.answer.done():
-                self.answer.set_exception(RuntimeError('Codex native voice unavailable for this login/runtime'))
+                self.answer.set_exception(VoiceFailure('notification', params.get('code'), params.get('error', params.get('message', params.get('reason', '')))))
             else:
                 await self.send({'type': 'error', 'message': 'Codex native voice session closed; check account support'})
                 await self.ws.close()
@@ -354,9 +386,10 @@ class VoxiRadio:
                     await session.control(event)
         except Exception as error:
             self.retry_after = time.monotonic()+30
-            LOG.warning('Native voice failed during %s (%s); retry delayed 30s', session.phase, type(error).__name__)
+            detail = str(error) if isinstance(error, VoiceFailure) else diagnostic_reason(error)
+            LOG.warning('Native voice failed during %s (%s) %s; retry delayed 30s', session.phase, type(error).__name__, detail)
             with contextlib.suppress(Exception):
-                await session.send({'type': 'error', 'message': 'Native Codex voice unavailable; check CLI/account and server egress'})
+                await session.send({'type': 'error', 'message': f'Native voice failed at {session.phase}: {detail}'})
         finally:
             await session.stop()
             await ws.close()
