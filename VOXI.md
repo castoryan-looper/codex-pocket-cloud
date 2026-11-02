@@ -14,4 +14,4 @@ aiortc==1.14.0 放在 bridge/requirements-voxi.txt，作为独立 Docker 层安�
 
 测试覆盖 PTT/短按/打断、鉴权、空工具配置确认与本地 SDP 协商；真实账号和语音延迟仍待部署验证。
 
-原生语音兼容性：固定 CLI 0.163.0 的 WebRTC 使用 version=v1，音色使用该版本 v1 默认的 cove。marin 是 v2 音色，不能与 v1 组合，否则在 SDP 协商阶段返回 unsupported voice。
+原生语音兼容性：固定 CLI 0.163.0 的 WebRTC 使用 version=v3、音色 cove。CLI 中 v3 会生成服务端要求的 OpenAI-Alpha: quicksilver=v2；v1 生成旧 quicksilver=v1。CLI 的 version=v2 是另一条协议，不能与 quicksilver=v2 请求头版本混为一谈。marin 不属于 v3 音色列表。

@@ -32,7 +32,7 @@ def diagnostic_reason(value):
         'timeout': ('timed out', 'timeout'),
         'network': ('connection', 'connect error', 'dns', 'tls', 'certificate', 'network'),
         'service-error': ('500', '502', '503', '504'),
-        'sdp': ('sdp',), 'feature-disabled': ('not enabled', 'feature', 'disabled'),
+        'sdp': ('sdp',), 'protocol-header': ('quicksilver', 'alpha_header'), 'feature-disabled': ('not enabled', 'feature', 'disabled'),
     }
     for label, matches in groups.items():
         if any(word in text for word in matches): labels.append(label)
@@ -209,8 +209,9 @@ class VoiceSession:
                   '偶尔说收到或完毕，不要每句重复。不要模拟电流声，不要执行任务或使用工具。听不清就请求重说。身份被问及时如实说明是AI。')
         await self.rpc.call('thread/realtime/start', {'threadId': self.thread,
             'transport': {'type': 'webrtc', 'sdp': self.peer.localDescription.sdp},
-            # Codex 0.163.0 lists cove for v1; marin belongs to v2.
-            'outputModality': 'audio', 'version': 'v1', 'voice': 'cove', 'prompt': prompt,
+            # Codex v3 maps to the AVAS-required quicksilver=v2 alpha header.
+            # cove is supported by v3; marin belongs to the separate v2 API.
+            'outputModality': 'audio', 'version': 'v3', 'voice': 'cove', 'prompt': prompt,
             'includeStartupContext': False, 'clientManagedHandoffs': True})
         answer = await asyncio.wait_for(self.answer, 40)
         await self.peer.setRemoteDescription(RTCSessionDescription(sdp=answer, type='answer'))

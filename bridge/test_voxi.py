@@ -3,7 +3,7 @@ import json
 import importlib.util
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 from voxi import VoiceSession, VoxiRadio, VoiceFailure, diagnostic_reason
 from aiohttp import web
@@ -24,6 +24,32 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(importlib.util.find_spec('aiortc'), 'Optional native voice dependencies not installed')
+    async def test_webrtc_selects_cli_v3_for_avas_quicksilver_v2(self):
+        from aiortc import RTCPeerConnection
+        voice=VoiceSession(Socket(),'unused')
+        calls=[]
+        class Rpc:
+            def __init__(self,binary,notify):self.notify=notify
+            async def start(self):pass
+            async def close(self):pass
+            async def call(self,method,params):
+                calls.append((method,params))
+                if method=='thread/start':return {'thread':{'id':'fixture'}}
+                if method=='thread/realtime/start':
+                    await self.notify({'method':'thread/realtime/sdp','params':{'threadId':'fixture','sdp':'answer-fixture'}})
+                    voice.ready=True
+                return {}
+        try:
+            with patch('voxi.VoiceRpc',Rpc),patch.object(RTCPeerConnection,'setRemoteDescription',new=AsyncMock()):
+                await voice.start()
+            params=next(params for method,params in calls if method=='thread/realtime/start')
+            self.assertEqual(params['version'],'v3')
+            self.assertEqual(params['voice'],'cove')
+            self.assertEqual(params['transport']['type'],'webrtc')
+            self.assertEqual(voice.phase,'ready')
+        finally:await voice.stop()
+
     async def test_ptt_short_press_manual_commit_and_interruption(self):
         ws = Socket()
         voice = VoiceSession(ws, 'unused')
