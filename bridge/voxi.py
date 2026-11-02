@@ -8,11 +8,13 @@ import asyncio
 import contextlib
 import hmac
 import json
+import logging
 import tempfile
 import time
 from collections import deque
 
 from aiohttp import web, WSMsgType
+LOG = logging.getLogger('pocket.voxi')
 
 
 class VoiceRpc:
@@ -104,6 +106,7 @@ class VoiceSession:
         self.last_voice = time.monotonic()
         self.turn = 0
         self.response_id = None
+        self.phase = 'new'
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -137,7 +140,9 @@ class VoiceSession:
         await self.send({'type': 'connecting', 'channel': channel})
         self.workspace = tempfile.TemporaryDirectory(prefix='voxi-chat-')
         self.rpc = VoiceRpc(self.binary, self.notification)
+        self.phase = 'account'
         await self.rpc.start()
+        self.phase = 'thread'
         self.thread = (await self.rpc.call('thread/start', {
             'cwd': self.workspace.name, 'approvalPolicy': 'never', 'sandbox': 'read-only',
             'ephemeral': True, 'developerInstructions': 'Voice conversation only. Do not use tools, files, agents or shell commands.'
@@ -166,6 +171,7 @@ class VoiceSession:
                 await self.ws.close()
         await self.peer.setLocalDescription(await self.peer.createOffer())
         self.answer = asyncio.get_running_loop().create_future()
+        self.phase = 'webrtc-sdp'
         names = ['营地一号：沉稳值守员', '巡逻二号：干练的搭档', '夜航三号：安静的老朋友', '探索四号：好奇的队友']
         prompt = ('你是虚构对讲机里的AI伙伴，呼号'+names[channel]+'。用简短自然中文直接回应，通常一到三句，十秒内说完。'
                   '偶尔说收到或完毕，不要每句重复。不要模拟电流声，不要执行任务或使用工具。听不清就请求重说。身份被问及时如实说明是AI。')
@@ -175,9 +181,12 @@ class VoiceSession:
             'includeStartupContext': False, 'clientManagedHandoffs': True})
         answer = await asyncio.wait_for(self.answer, 40)
         await self.peer.setRemoteDescription(RTCSessionDescription(sdp=answer, type='answer'))
+        self.phase = 'manual-ptt-configuration'
         # Do not announce READY until the backend accepts manual PTT configuration.
         for _ in range(200):
-            if self.ready: return
+            if self.ready:
+                self.phase = 'ready'
+                return
             if self.ws.closed: raise RuntimeError('Voice setup failed')
             await asyncio.sleep(.1)
         raise RuntimeError('Codex voice setup timed out; manual PTT was not acknowledged')
@@ -322,12 +331,15 @@ class VoiceSession:
 class VoxiRadio:
     def __init__(self, owner, binary):
         self.owner, self.binary, self.active = owner, binary, False
+        self.retry_after = 0
 
     async def websocket(self, request):
         if request.headers.get('Origin') or not hmac.compare_digest(
                 request.headers.get('Authorization', ''), 'Bearer '+self.owner.config['device_token']):
             raise web.HTTPForbidden()
         if self.active: raise web.HTTPServiceUnavailable(text='One native voice session at a time')
+        if time.monotonic() < self.retry_after:
+            raise web.HTTPServiceUnavailable(text='Native voice retry cooldown', headers={'Retry-After':'30'})
         self.active = True
         ws = web.WebSocketResponse(heartbeat=20,max_msg_size=8192,writer_limit=32768)
         session = VoiceSession(ws, self.binary)
@@ -340,7 +352,9 @@ class VoxiRadio:
                     event = json.loads(packet.data)
                     if not isinstance(event,dict): raise ValueError('Expected object')
                     await session.control(event)
-        except Exception:
+        except Exception as error:
+            self.retry_after = time.monotonic()+30
+            LOG.warning('Native voice failed during %s (%s); retry delayed 30s', session.phase, type(error).__name__)
             with contextlib.suppress(Exception):
                 await session.send({'type': 'error', 'message': 'Native Codex voice unavailable; check CLI/account and server egress'})
         finally:

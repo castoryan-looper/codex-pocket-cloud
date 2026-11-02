@@ -3,9 +3,11 @@ import json
 import importlib.util
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from voxi import VoiceSession, VoxiRadio
 from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 
 class Socket:
@@ -55,6 +57,18 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(web.HTTPForbidden):
                 await radio.websocket(SimpleNamespace(headers=headers))
         self.assertFalse(radio.active)
+
+    async def test_failed_voice_setup_enters_cooldown_without_restarting_cli(self):
+        radio=VoxiRadio(SimpleNamespace(config={'device_token':'test'}),'unused')
+        app=web.Application();app.router.add_get('/voxi',radio.websocket)
+        with patch.object(VoiceSession,'start',side_effect=RuntimeError('fixture')) as start:
+            async with TestClient(TestServer(app)) as client:
+                socket=await client.ws_connect('/voxi',headers={'Authorization':'Bearer test'})
+                self.assertEqual((await socket.receive_json())['type'],'error')
+                await socket.close()
+                response=await client.get('/voxi',headers={'Authorization':'Bearer test'})
+                self.assertEqual(response.status,503)
+                self.assertEqual(start.call_count,1)
 
     @unittest.skipUnless(importlib.util.find_spec('aiortc'), 'Optional native voice dependencies not installed')
     async def test_webrtc_peer_can_negotiate_audio_and_event_channel(self):
