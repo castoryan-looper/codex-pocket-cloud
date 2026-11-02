@@ -105,10 +105,25 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             if not remote.done():remote.set_result(received)
         try:
             a.addTrack(track)
-            await a.setLocalDescription(await a.createOffer())
-            await b.setRemoteDescription(a.localDescription)
-            await b.setLocalDescription(await b.createAnswer())
-            await a.setRemoteDescription(b.localDescription)
+            # Candidate self-tests run with Docker --network none. aioice
+            # excludes loopback by default, so explicitly gather only loopback
+            # in this local test. Production candidate discovery is untouched.
+            with patch('aioice.ice.get_host_addresses',return_value=['127.0.0.1']):
+                await a.setLocalDescription(await a.createOffer())
+                await b.setRemoteDescription(a.localDescription)
+                answer=await b.createAnswer()
+                # Install both peers' ICE credentials before starting loopback
+                # checks: loopback can deliver STUN before setRemoteDescription
+                # completes on the offerer if the answerer starts first.
+                await a.setRemoteDescription(answer)
+                await b.setLocalDescription(answer)
+                transceiver=b.getTransceivers()[0]
+                for candidate in transceiver.sender.transport.transport.iceGatherer.getLocalCandidates():
+                    candidate.sdpMid=transceiver.mid;candidate.sdpMLineIndex=0
+                    await a.addIceCandidate(candidate)
+                await a.addIceCandidate(None)
+            self.assertIn('127.0.0.1',a.localDescription.sdp)
+            self.assertIn('127.0.0.1',b.localDescription.sdp)
             received=await asyncio.wait_for(remote,5)
             track.submit(bytes([0xe8,3])*4800)
             async def heard():
