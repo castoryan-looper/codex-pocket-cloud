@@ -16,4 +16,4 @@ aiortc==1.14.0 放在 bridge/requirements-voxi.txt，作为独立 Docker 层安�
 
 原生语音兼容性：固定 CLI 0.163.0 的 WebRTC 使用 version=v3、音色 cove。CLI 中 v3 会生成服务端要求的 OpenAI-Alpha: quicksilver=v2；v1 生成旧 quicksilver=v1。CLI 的 version=v2 是另一条协议，不能与 quicksilver=v2 请求头版本混为一谈。marin 不属于 v3 音色列表。
 
-AVAS 手动 PTT 配置使用经典扁平 session.update（input_audio_format=pcm16、turn_detection=null、tools=[]），不发送公共 Realtime GA 的 session.type/audio.input。只有 session.updated 确认关闭 VAD 且工具为空才标记 READY。
+AVAS 手动 PTT 配置只发送 session.update 的 turn_detection=null，不发送此服务拒绝的 session.type、tools 等公共 Realtime 字段。只有 session.updated 明确确认关闭 VAD 后才标记 READY；如果回显非空工具列表则拒绝就绪。任务委派通过启动参数 clientManagedHandoffs=true 交给本客户端管理，本客户端不执行委派，并拒绝服务端 RPC 工具/批准请求。

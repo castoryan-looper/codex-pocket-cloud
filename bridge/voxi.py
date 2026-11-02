@@ -50,7 +50,7 @@ class VoiceFailure(RuntimeError):
 
 def manual_ptt_update():
     return {'type': 'session.update', 'session': {
-        'tools': [], 'input_audio_format': 'pcm16', 'turn_detection': None}}
+        'turn_detection': None}}
 
 
 class VoiceRpc:
@@ -191,8 +191,9 @@ class VoiceSession:
         def opened():
             # Input travels as ordered PCM events over the RTC data channel.
             # PTT explicitly commits; no VAD timeout and no silent RTP input.
-            # AVAS accepts the classic flat session schema, not the public
-            # Realtime GA session.type/audio.input shape. pcm16 is 24kHz mono.
+            # AVAS rejects public Realtime session.type/tools fields.
+            # Send only the manual-turn setting. Handoffs stay client-managed;
+            # this client never executes them and rejects server RPC requests.
             self.event(manual_ptt_update())
         @self.events.on('message')
         def message(raw):
@@ -237,7 +238,7 @@ class VoiceSession:
             session = event.get('session', {})
             input_config = session.get('audio', {}).get('input', {})
             manual = ('turn_detection' in input_config and input_config['turn_detection'] is None) or ('turn_detection' in session and session['turn_detection'] is None)
-            if manual and session.get('tools') == []:
+            if manual and ('tools' not in session or session['tools'] == []):
                 self.ready = True
                 await self.send({'type': 'ready', 'channel': self.channel})
         elif kind == 'response.created':

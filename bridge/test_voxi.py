@@ -50,6 +50,17 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(voice.phase,'ready')
         finally:await voice.stop()
 
+    async def test_manual_ack_does_not_require_unsupported_tools_field(self):
+        voice=VoiceSession(Socket(),'unused')
+        await voice.on_event({'type':'session.updated','session':{}})
+        self.assertFalse(voice.ready)
+        await voice.on_event({'type':'session.updated','session':{'turn_detection':{'type':'server_vad'}}})
+        self.assertFalse(voice.ready)
+        await voice.on_event({'type':'session.updated','session':{'turn_detection':None,'tools':[{'name':'unexpected'}]}})
+        self.assertFalse(voice.ready)
+        await voice.on_event({'type':'session.updated','session':{'turn_detection':None}})
+        self.assertTrue(voice.ready)
+
     async def test_ptt_short_press_manual_commit_and_interruption(self):
         ws = Socket()
         voice = VoiceSession(ws, 'unused')
@@ -117,9 +128,9 @@ class SessionContractTests(unittest.TestCase):
         session=packet['session']
         self.assertNotIn('type',session)
         self.assertNotIn('audio',session)
-        self.assertEqual(session['input_audio_format'],'pcm16')
+        self.assertNotIn('input_audio_format',session)
         self.assertIsNone(session['turn_detection'])
-        self.assertEqual(session['tools'],[])
+        self.assertNotIn('tools',session)
 
 
 class DiagnosticTests(unittest.TestCase):
