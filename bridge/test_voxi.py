@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
 
-from voxi import VoiceSession, VoxiRadio, VoiceFailure, diagnostic_reason, manual_ptt_update
+from voxi import VoiceSession, VoxiRadio, VoiceFailure, diagnostic_reason, frameless_session_update
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -50,42 +50,28 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(voice.phase,'ready')
         finally:await voice.stop()
 
-    async def test_manual_ack_does_not_require_unsupported_tools_field(self):
-        voice=VoiceSession(Socket(),'unused')
+    async def test_buffer_until_release_and_submit_v3_audio_with_silence(self):
+        import base64
+        ws=Socket();voice=VoiceSession(ws,'unused');voice.events=Channel()
         await voice.on_event({'type':'session.updated','session':{}})
-        self.assertFalse(voice.ready)
-        await voice.on_event({'type':'session.updated','session':{'turn_detection':{'type':'server_vad'}}})
-        self.assertFalse(voice.ready)
-        await voice.on_event({'type':'session.updated','session':{'turn_detection':None,'tools':[{'name':'unexpected'}]}})
-        self.assertFalse(voice.ready)
-        await voice.on_event({'type':'session.updated','session':{'turn_detection':None}})
-        self.assertTrue(voice.ready)
-
-    async def test_ptt_short_press_manual_commit_and_interruption(self):
-        ws = Socket()
-        voice = VoiceSession(ws, 'unused')
-        voice.events = Channel()
-        await voice.on_event({'type':'session.updated','session':{'audio':{'input':{'turn_detection':{'type':'server_vad'}}}}})
-        self.assertFalse(voice.ready)
-        await voice.on_event({'type':'session.updated','session':{'tools':[],'audio':{'input':{'turn_detection':None}}}})
         self.assertTrue(voice.ready)
         await voice.control({'type':'ptt_down'})
         await voice.pcm(bytes(960))
+        self.assertEqual(voice.events.packets,[])
         await voice.control({'type':'ptt_up'})
-        self.assertEqual(ws.packets[-1], {'type':'idle','reason':'too_short'})
+        self.assertEqual(ws.packets[-1],{'type':'idle','reason':'too_short'})
         await voice.control({'type':'ptt_down'})
-        await voice.pcm(bytes(5760))
+        original=bytes([10,0])*2880
+        await voice.pcm(original)
+        self.assertEqual(voice.events.packets,[])
         await voice.control({'type':'ptt_up'})
-        self.assertEqual([p['type'] for p in voice.events.packets][-2:], ['input_audio_buffer.commit','response.create'])
-        self.assertTrue(voice.allow_output)
-        await voice.begin_audio()
-        stopping = asyncio.create_task(voice.on_event({'type':'output_audio_buffer.stopped'}))
-        await asyncio.sleep(.01)
-        await voice.control({'type':'ptt_down'})
-        await stopping
-        self.assertFalse(voice.outputting)
-        self.assertNotIn({'type':'audio_end'},ws.packets)
-        self.assertEqual(ws.packets[-2:], [{'type':'flush'},{'type':'recording'}])
+        self.assertTrue(all(p['type']=='input_audio.append' for p in voice.events.packets))
+        submitted=b''.join(base64.b64decode(p['audio']) for p in voice.events.packets)
+        self.assertEqual(submitted,original+bytes(38400))
+        self.assertFalse(voice.ready)
+        self.assertEqual(ws.packets[-1],{'type':'thinking'})
+        await voice.on_event({'type':'turn.done','turn':{'role':'assistant'}})
+        self.assertTrue(voice.generation_done)
         await voice.stop()
 
     async def test_reject_non_device_access_before_starting_cli(self):
@@ -122,15 +108,12 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionContractTests(unittest.TestCase):
-    def test_avas_manual_ptt_uses_classic_flat_session_schema(self):
-        packet=manual_ptt_update()
+    def test_avas_update_matches_frameless_bidi_schema(self):
+        packet=frameless_session_update();session=packet['session']
         self.assertEqual(packet['type'],'session.update')
-        session=packet['session']
-        self.assertNotIn('type',session)
-        self.assertNotIn('audio',session)
-        self.assertNotIn('input_audio_format',session)
-        self.assertIsNone(session['turn_detection'])
-        self.assertNotIn('tools',session)
+        self.assertEqual(set(session),{'audio','delegation'})
+        self.assertEqual(session['delegation'],{'type':'client'})
+        self.assertEqual(session['audio'],{'output':{'voice':'cove'}})
 
 
 class DiagnosticTests(unittest.TestCase):

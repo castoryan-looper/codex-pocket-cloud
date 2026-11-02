@@ -48,9 +48,11 @@ class VoiceFailure(RuntimeError):
         super().__init__(f'{self.source} code={self.code} reason={self.reason}')
 
 
-def manual_ptt_update():
+def frameless_session_update():
+    # Exact Frameless Bidi session shape used by Codex 0.163.0.
+    # PTT is enforced locally by withholding all input until release.
     return {'type': 'session.update', 'session': {
-        'turn_detection': None}}
+        'audio': {'output': {'voice': 'cove'}}, 'delegation': {'type': 'client'}}}
 
 
 class VoiceRpc:
@@ -135,6 +137,7 @@ class VoiceSession:
         self.answer = None
         self.ready = self.recording = self.allow_output = self.outputting = False
         self.bytes = self.played = 0
+        self.pending_audio = bytearray()
         self.thread = self.item = None
         self.channel = 0
         self.tasks = set()
@@ -191,10 +194,9 @@ class VoiceSession:
         def opened():
             # Input travels as ordered PCM events over the RTC data channel.
             # PTT explicitly commits; no VAD timeout and no silent RTP input.
-            # AVAS rejects public Realtime session.type/tools fields.
-            # Send only the manual-turn setting. Handoffs stay client-managed;
-            # this client never executes them and rejects server RPC requests.
-            self.event(manual_ptt_update())
+            # Only configure fields defined by the Frameless Bidi protocol.
+            # Audio is buffered until PTT release; do not disable server VAD.
+            self.event(frameless_session_update())
         @self.events.on('message')
         def message(raw):
             try: packet = json.loads(raw)
@@ -222,25 +224,25 @@ class VoiceSession:
             'includeStartupContext': False, 'clientManagedHandoffs': True})
         answer = await asyncio.wait_for(self.answer, 40)
         await self.peer.setRemoteDescription(RTCSessionDescription(sdp=answer, type='answer'))
-        self.phase = 'manual-ptt-configuration'
-        # Do not announce READY until the backend accepts manual PTT configuration.
+        self.phase = 'session-configuration'
+        # Do not announce READY until the backend accepts the Frameless Bidi session configuration.
         for _ in range(200):
             if self.ready:
                 self.phase = 'ready'
                 return
             if self.ws.closed: raise RuntimeError('Voice setup failed')
             await asyncio.sleep(.1)
-        raise RuntimeError('Codex voice setup timed out; manual PTT was not acknowledged')
+        raise RuntimeError('Codex voice setup timed out; session configuration was not acknowledged')
 
     async def on_event(self, event):
         kind = event.get('type')
-        if kind == 'session.updated':
-            session = event.get('session', {})
-            input_config = session.get('audio', {}).get('input', {})
-            manual = ('turn_detection' in input_config and input_config['turn_detection'] is None) or ('turn_detection' in session and session['turn_detection'] is None)
-            if manual and ('tools' not in session or session['tools'] == []):
-                self.ready = True
-                await self.send({'type': 'ready', 'channel': self.channel})
+        if kind in ('session.updated', 'session.started'):
+            # An ACK to our supported update confirms an established session.
+            # No microphone input is submitted before PTT release.
+            self.ready = True
+            await self.send({'type': 'ready', 'channel': self.channel})
+        elif kind == 'turn.done' and event.get('turn', {}).get('role') == 'assistant':
+            self.generation_done = True
         elif kind == 'response.created':
             response = event.get('response', {})
             if response.get('metadata', {}).get('turn') == str(self.turn): self.response_id = response.get('id')
@@ -293,6 +295,8 @@ class VoiceSession:
                             if self.generation_done and time.monotonic()-self.last_voice > 1:
                                 self.outputting = self.allow_output = False
                                 await self.send({'type': 'audio_end'})
+                                self.ready=True
+                                await self.send({'type':'ready','channel':self.channel})
                     self.lookback.append(data)
         except asyncio.CancelledError: raise
         except Exception:
@@ -306,32 +310,40 @@ class VoiceSession:
         elif kind == 'channel':
             channel = event.get('channel')
             if type(channel) is int and 0 <= channel < 4: await self.start(channel)
-        elif kind == 'ptt_down' and self.ready and not self.recording:
+        elif kind == 'ptt_down' and self.ready and not self.recording and not self.allow_output:
             self.turn += 1
             self.response_id = None
             self.recording = True
             self.allow_output = self.outputting = False
             self.bytes = 0
             self.lookback.clear()
-            self.event({'type': 'response.cancel'})
-            self.event({'type': 'output_audio_buffer.clear'})
-            if self.item:
-                self.event({'type': 'conversation.item.truncate', 'item_id': self.item, 'content_index': 0, 'audio_end_ms': self.played})
+            self.pending_audio.clear()
             self.item = None
-            self.event({'type': 'input_audio_buffer.clear'})
             await self.send({'type': 'flush'})
             await self.send({'type': 'recording'})
         elif kind == 'ptt_up' and self.recording:
             self.recording = False
             if self.bytes < 4800:
-                self.event({'type': 'input_audio_buffer.clear'})
+                self.pending_audio.clear()
                 await self.send({'type': 'idle', 'reason': 'too_short'})
                 return
             self.allow_output = True
             self.generation_done = False
             self.lookback.clear()
-            self.event({'type': 'input_audio_buffer.commit'})
-            self.event({'type': 'response.create', 'response': {'metadata': {'turn': str(self.turn)}}})
+            self.ready = False
+            await self.send({'type': 'busy'})
+            # Release submits the complete utterance, then 800ms of silence.
+            # v3 has input_audio.append; it has no public Realtime commit/create.
+            import base64
+            audio = bytes(self.pending_audio) + bytes(38400)
+            self.pending_audio.clear()
+            for offset in range(0, len(audio), 9600):
+                deadline = time.monotonic()+10
+                while self.events and self.events.bufferedAmount > 96000:
+                    if time.monotonic()>deadline: raise RuntimeError('Voice upload backpressure timeout')
+                    await asyncio.sleep(.01)
+                self.event({'type':'input_audio.append','audio':base64.b64encode(audio[offset:offset+9600]).decode()})
+                await asyncio.sleep(0)
             await self.send({'type': 'thinking'})
             turn = self.turn
             async def response_timeout():
@@ -342,18 +354,18 @@ class VoiceSession:
             self.spawn(response_timeout())
 
     async def pcm(self, data):
-        import base64
         if not self.ready or not self.recording: return
         self.bytes += len(data)
         if len(data)%2 or self.bytes > 30*48000: raise ValueError('Invalid/overlong PCM')
-        if self.events.bufferedAmount > 96000: raise ValueError('Voice upload is too slow')
-        self.event({'type': 'input_audio_buffer.append', 'audio': base64.b64encode(data).decode()})
+        self.pending_audio.extend(data)
+
 
     async def stop(self):
         self.ready = self.recording = self.allow_output = self.outputting = False
         # Ignore closure notifications from the old peer while changing channel.
         self.thread = self.item = self.response_id = None
         self.lookback.clear()
+        self.pending_audio.clear()
         self.generation_done = False
         for task in self.tasks: task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
