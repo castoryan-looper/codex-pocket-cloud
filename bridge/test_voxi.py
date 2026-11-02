@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
 
-from voxi import VoiceSession, VoxiRadio, VoiceFailure, diagnostic_reason
+from voxi import VoiceSession, VoxiRadio, VoiceFailure, diagnostic_reason, manual_ptt_update
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -108,6 +108,18 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('m=application',peer.localDescription.sdp)
         finally:
             await peer.close()
+
+
+class SessionContractTests(unittest.TestCase):
+    def test_avas_manual_ptt_uses_classic_flat_session_schema(self):
+        packet=manual_ptt_update()
+        self.assertEqual(packet['type'],'session.update')
+        session=packet['session']
+        self.assertNotIn('type',session)
+        self.assertNotIn('audio',session)
+        self.assertEqual(session['input_audio_format'],'pcm16')
+        self.assertIsNone(session['turn_detection'])
+        self.assertEqual(session['tools'],[])
 
 
 class DiagnosticTests(unittest.TestCase):

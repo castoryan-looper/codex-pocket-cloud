@@ -48,6 +48,11 @@ class VoiceFailure(RuntimeError):
         super().__init__(f'{self.source} code={self.code} reason={self.reason}')
 
 
+def manual_ptt_update():
+    return {'type': 'session.update', 'session': {
+        'tools': [], 'input_audio_format': 'pcm16', 'turn_detection': None}}
+
+
 class VoiceRpc:
     def __init__(self, binary, notify):
         self.binary, self.notify = binary, notify
@@ -186,8 +191,9 @@ class VoiceSession:
         def opened():
             # Input travels as ordered PCM events over the RTC data channel.
             # PTT explicitly commits; no VAD timeout and no silent RTP input.
-            self.event({'type': 'session.update', 'session': {'type': 'realtime', 'tools': [],
-                'audio': {'input': {'format': {'type': 'audio/pcm', 'rate': 24000}, 'turn_detection': None}}}})
+            # AVAS accepts the classic flat session schema, not the public
+            # Realtime GA session.type/audio.input shape. pcm16 is 24kHz mono.
+            self.event(manual_ptt_update())
         @self.events.on('message')
         def message(raw):
             try: packet = json.loads(raw)
