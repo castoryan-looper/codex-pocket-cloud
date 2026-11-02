@@ -209,7 +209,8 @@ class VoiceSession:
                   '偶尔说收到或完毕，不要每句重复。不要模拟电流声，不要执行任务或使用工具。听不清就请求重说。身份被问及时如实说明是AI。')
         await self.rpc.call('thread/realtime/start', {'threadId': self.thread,
             'transport': {'type': 'webrtc', 'sdp': self.peer.localDescription.sdp},
-            'outputModality': 'audio', 'version': 'v1', 'voice': 'marin', 'prompt': prompt,
+            # Codex 0.163.0 lists cove for v1; marin belongs to v2.
+            'outputModality': 'audio', 'version': 'v1', 'voice': 'cove', 'prompt': prompt,
             'includeStartupContext': False, 'clientManagedHandoffs': True})
         answer = await asyncio.wait_for(self.answer, 40)
         await self.peer.setRemoteDescription(RTCSessionDescription(sdp=answer, type='answer'))

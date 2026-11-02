@@ -13,3 +13,5 @@ aiortc==1.14.0 放在 bridge/requirements-voxi.txt，作为独立 Docker 层安�
 升级此仓库 gateway/ingress 后，参见 [Voxi 操作说明](https://github.com/castoryan-looper/Voxi/blob/main/docs/POCKET-BACKEND.md)。首次升级会重建镜像，保留既有命名卷，勿删除账号/模型数据来排查语音权限问题。
 
 测试覆盖 PTT/短按/打断、鉴权、空工具配置确认与本地 SDP 协商；真实账号和语音延迟仍待部署验证。
+
+原生语音兼容性：固定 CLI 0.163.0 的 WebRTC 使用 version=v1，音色使用该版本 v1 默认的 cove。marin 是 v2 音色，不能与 v1 组合，否则在 SDP 协商阶段返回 unsupported voice。
