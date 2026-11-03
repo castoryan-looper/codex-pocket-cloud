@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# Use the bundled BuildKit frontend to avoid an extra Docker Hub fetch.
 FROM node:22-bookworm-slim AS codex
 ARG CODEX_VERSION=0.163.0
 RUN npm install -g "@openai/codex@${CODEX_VERSION}" --omit=dev --no-audit --no-fund
