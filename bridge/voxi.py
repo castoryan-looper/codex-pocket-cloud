@@ -18,6 +18,7 @@ from collections import deque
 
 from aiohttp import web, WSMsgType
 from voxi_config import VoiceSettings, effective_prompt
+from voxi_memory import MemoryStore, device_id
 from voice_recovery import offer_audio_nack, configure_audio_recovery
 LOG = logging.getLogger('pocket.voxi')
 
@@ -164,6 +165,10 @@ def create_input_track():
 class VoiceSession:
     def __init__(self, ws, binary):
         self.ws, self.binary = ws, binary
+        self.memory_store = None
+        self.memory_user = None
+        self.memory_device = None
+        self.memory_capture = None
         self.settings_source = None
         self.settings = VoiceSettings().snapshot()
         self.session_id = secrets.token_hex(4)
@@ -260,6 +265,9 @@ class VoiceSession:
         self.answer = asyncio.get_running_loop().create_future()
         self.phase = 'webrtc-sdp'
         prompt = effective_prompt(self.settings, channel)
+        if self.memory_store and self.memory_user:
+            try:prompt += self.memory_store.context(self.memory_user)
+            except Exception:LOG.warning('Voxi memory context unavailable')
         await self.rpc.call('thread/realtime/start', {'threadId': self.thread,
             'transport': {'type': 'webrtc', 'sdp': self.peer.localDescription.sdp},
             # Codex v3 maps to the AVAS-required quicksilver=v2 alpha header.
@@ -427,6 +435,7 @@ class VoiceSession:
             # append JSON on its data channel. Release queues real-time media.
             self.release_at=time.monotonic()
             self.emitted_baseline=getattr(self.input_track,'emitted_bytes',0)
+            if self.memory_capture: self.memory_capture(self, bytes(self.pending_audio))
             self.input_track.submit(bytes(self.pending_audio)+bytes(38400))
             self.pending_audio.clear()
             await self.send({'type': 'thinking'})
@@ -482,6 +491,72 @@ class VoxiRadio:
         self.max_sessions = max(1,min(4,int(os.environ.get("VOXI_MAX_SESSIONS","2"))))
         self.retry_after = 0
         self.settings = VoiceSettings(getattr(owner, 'runtime', None))
+        try:self.memory = MemoryStore(getattr(owner, 'runtime', None))
+        except Exception:self.memory = None
+        self.memory_tasks = set()
+        self.memory_lock = asyncio.Lock()
+        self.memory_revision = {}
+        self.memory_error = '' if self.memory else '记忆存储无法打开'
+        self.memory_model = None
+
+    def capture_memory(self, session, pcm):
+        uid, identifier = session.memory_user, session.memory_device
+        if not uid or not self.memory:return
+        try:
+            user=self.memory.user(uid)
+            if not user or not user['enabled']:return
+        except Exception:return
+        if len(self.memory_tasks)>=8:
+            self.memory_error = '记忆转写队列已满，本轮未保存'
+            return
+        revision=self.memory_revision.get(uid,0)
+        key=session.session_id+':'+str(session.turn)
+        async def capture():
+            try:
+                async with self.memory_lock:
+                    text=await asyncio.to_thread(self.transcribe_memory,pcm)
+                if self.memory_revision.get(uid,0)==revision:
+                    self.memory.record(uid,identifier,key,text)
+                    self.memory_error=''
+            except Exception as error:
+                self.memory_error='记忆转写失败（'+type(error).__name__+'），语音对讲不受影响'
+                LOG.warning('Voxi memory transcription failed (%s)',type(error).__name__)
+        task=asyncio.create_task(capture());self.memory_tasks.add(task);task.add_done_callback(self.memory_tasks.discard)
+
+    def transcribe_memory(self, pcm):
+        import numpy as np
+        from faster_whisper import WhisperModel
+        from pathlib import Path
+        model_path=Path(os.environ.get('POCKET_MODEL_DIR','/models/whisper-small'))
+        if not (model_path/'model.bin').exists():raise RuntimeError('Whisper model unavailable')
+        if self.memory_model is None:
+            self.memory_model=WhisperModel(str(model_path),device='cpu',compute_type='int8',cpu_threads=1,num_workers=1,local_files_only=True)
+        source=np.frombuffer(pcm,dtype='<i2').astype(np.float32)/32768
+        audio=np.interp(np.arange(0,len(source),1.5),np.arange(len(source)),source).astype(np.float32)
+        segments,_=self.memory_model.transcribe(audio,language='zh',beam_size=1,vad_filter=True,condition_on_previous_text=False)
+        return ''.join(segment.text for segment in segments if segment.no_speech_prob<.6).strip()[:4000]
+
+    async def memory_configuration(self, request):
+        if request.headers.get('Origin') or not hmac.compare_digest(request.headers.get('Authorization',''),'Bearer '+self.owner.config['device_token']):raise web.HTTPForbidden()
+        if not self.memory:raise web.HTTPServiceUnavailable(text='Memory storage unavailable')
+        if request.method=='POST':
+            try:
+                body=await request.json()
+                if not isinstance(body,dict):raise ValueError('无效请求')
+                result=self.memory.change(body)
+                uid=body.get('userId')
+                self.memory_revision[uid]=self.memory_revision.get(uid,0)+1
+                if body.get('action') in ('profile','memory','delete_memory','delete_turn','clear'):
+                    for session in list(self.active):
+                        if session.memory_user==uid:await session.ws.close(code=1012,message=b'Memory context updated')
+                if body.get('action')=='rebind':
+                    # Existing sessions retain no access after ownership changes.
+                    for session in list(self.active):
+                        if session.memory_device==body.get('deviceId'):await session.ws.close(code=1012,message=b'Device owner changed')
+            except (ValueError,TypeError) as error:raise web.HTTPBadRequest(text=str(error))
+        else:result=self.memory.snapshot()
+        result.update({'pendingTranscriptions':len(self.memory_tasks),'lastError':self.memory_error})
+        return web.json_response(result,headers={'Cache-Control':'no-store'})
 
     async def configuration(self, request):
         if request.headers.get('Origin') or not hmac.compare_digest(request.headers.get('Authorization', ''), 'Bearer '+self.owner.config['device_token']):
@@ -507,6 +582,12 @@ class VoxiRadio:
         ws = web.WebSocketResponse(heartbeat=20,max_msg_size=8192,writer_limit=32768)
         session = VoiceSession(ws, self.binary)
         session.settings_source = self.settings
+        identifier=device_id(request.headers.get('X-Voxi-Device-Id'))
+        session.memory_device=identifier
+        try:session.memory_user=self.memory.bind(identifier) if self.memory else None
+        except Exception:session.memory_user=None;self.memory_error='设备用户绑定失败'
+        session.memory_store=self.memory
+        session.memory_capture=self.capture_memory
         self.active.add(session) # reserve before the first await; concurrent admission is bounded
         try:
             await ws.prepare(request)

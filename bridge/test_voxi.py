@@ -95,6 +95,10 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_webrtc_selects_cli_v3_for_avas_quicksilver_v2(self):
         from aiortc import RTCPeerConnection
         voice=VoiceSession(Socket(),'unused')
+        from voxi_memory import MemoryStore
+        memory=MemoryStore();uid=memory.bind('esp32-111111111111');other=memory.bind('esp32-222222222222')
+        memory.record(uid,'esp32-111111111111','one','我喜欢天文学');memory.record(other,'esp32-222222222222','two','我喜欢别人的秘密')
+        voice.memory_store=memory;voice.memory_user=uid
         calls=[]
         class Rpc:
             def __init__(self,binary,notify):self.notify=notify
@@ -111,6 +115,7 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             with patch('voxi.VoiceRpc',Rpc),patch.object(RTCPeerConnection,'setRemoteDescription',new=AsyncMock()):
                 await voice.start()
             params=next(params for method,params in calls if method=='thread/realtime/start')
+            self.assertIn('天文学',params['prompt']);self.assertNotIn('别人的秘密',params['prompt'])
             self.assertEqual(params['version'],'v3')
             self.assertEqual(params['voice'],'cove')
             self.assertEqual(params['transport']['type'],'webrtc')
