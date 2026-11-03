@@ -17,6 +17,8 @@ import time
 from collections import deque
 
 from aiohttp import web, WSMsgType
+from voxi_config import VoiceSettings, effective_prompt
+from voice_recovery import offer_audio_nack, configure_audio_recovery
 LOG = logging.getLogger('pocket.voxi')
 
 
@@ -162,6 +164,8 @@ def create_input_track():
 class VoiceSession:
     def __init__(self, ws, binary):
         self.ws, self.binary = ws, binary
+        self.settings_source = None
+        self.settings = VoiceSettings().snapshot()
         self.session_id = secrets.token_hex(4)
         self.rpc = self.peer = self.events = self.workspace = self.input_track = None
         self.answer = None
@@ -186,6 +190,7 @@ class VoiceSession:
         self.media_receive_gap_max_ms = 0
         self.media_pcm_bytes = 0
         self.media_report_at = 0
+        self.audio_nack = False
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -217,6 +222,7 @@ class VoiceSession:
         from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration
         await self.stop()
         self.channel = channel
+        if self.settings_source: self.settings = self.settings_source.snapshot()
         await self.send({'type': 'connecting', 'channel': channel})
         self.workspace = tempfile.TemporaryDirectory(prefix='voxi-chat-')
         self.rpc = VoiceRpc(self.binary, self.notification)
@@ -249,12 +255,11 @@ class VoiceSession:
             if self.peer and self.peer.connectionState == 'failed':
                 await self.send({'type': 'error', 'message': 'WebRTC connection failed; check server UDP egress'})
                 await self.ws.close()
-        await self.peer.setLocalDescription(await self.peer.createOffer())
+        offer = await self.peer.createOffer()
+        await self.peer.setLocalDescription(offer_audio_nack(offer) if self.settings['audioRetransmission'] else offer)
         self.answer = asyncio.get_running_loop().create_future()
         self.phase = 'webrtc-sdp'
-        names = ['营地一号：沉稳值守员', '巡逻二号：干练的搭档', '夜航三号：安静的老朋友', '探索四号：好奇的队友']
-        prompt = ('你是虚构对讲机里的AI伙伴，呼号'+names[channel]+'。默认用简短自然中文直接回应，通常一到三句。用户明确要求讲故事、详细讲解或长回复时，按要求完整讲完，不受十秒或句数限制；不要为了简短而截断内容。'
-                  '偶尔说收到或完毕，不要每句重复。不要模拟电流声，不要执行任务或使用工具。听不清就请求重说。身份被问及时如实说明是AI。')
+        prompt = effective_prompt(self.settings, channel)
         await self.rpc.call('thread/realtime/start', {'threadId': self.thread,
             'transport': {'type': 'webrtc', 'sdp': self.peer.localDescription.sdp},
             # Codex v3 maps to the AVAS-required quicksilver=v2 alpha header.
@@ -263,6 +268,8 @@ class VoiceSession:
             'includeStartupContext': False, 'clientManagedHandoffs': True})
         answer = await asyncio.wait_for(self.answer, 40)
         await self.peer.setRemoteDescription(RTCSessionDescription(sdp=answer, type='answer'))
+        self.audio_nack = configure_audio_recovery(self.peer, self.settings['audioRecoveryPackets']) if self.settings['audioRetransmission'] else False
+        LOG.info('Native voice audio recovery sessionId=%s nackNegotiated=%s', self.session_id, self.audio_nack)
         self.phase = 'session-configuration'
         # Do not announce READY until the backend accepts the Frameless Bidi session configuration.
         for _ in range(200):
@@ -327,7 +334,7 @@ class VoiceSession:
             stats = await self.peer.getStats()
             rows = [value for value in stats.values() if value.type == 'inbound-rtp' and getattr(value, 'kind', 'audio') == 'audio']
             LOG.info('Native voice media stats %s', json.dumps({
-                'sessionId': self.session_id, 'turn': self.turn, 'packetsReceived': sum(getattr(row, 'packetsReceived', 0) for row in rows),
+                'sessionId': self.session_id, 'turn': self.turn, 'audioNack': self.audio_nack, 'packetsReceived': sum(getattr(row, 'packetsReceived', 0) for row in rows),
                 'packetsLost': sum(getattr(row, 'packetsLost', 0) for row in rows),
                 'maxFrameTimelineGapMs': self.media_gap_max_ms,
                 'maxReceiveGapMs': self.media_receive_gap_max_ms, 'pcmBytes': self.media_pcm_bytes}))
@@ -350,7 +357,7 @@ class VoiceSession:
                         if self.media_last_end is not None:
                             self.media_gap_max_ms = max(self.media_gap_max_ms, round((start-self.media_last_end)*1000))
                         self.media_last_end = start+frame.samples/frame.sample_rate
-                    if now-self.media_report_at >= 10:
+                    if now-self.media_report_at >= self.settings['mediaStatsIntervalSeconds']:
                         self.media_report_at = now
                         self.spawn(self.report_media_stats())
                 for mono in resampler.resample(frame):
@@ -367,7 +374,7 @@ class VoiceSession:
                         if self.outputting:
                             self.media_pcm_bytes += len(data)
                             for i in range(0,len(data),960): await self.ws.send_bytes(data[i:i+960])
-                            if self.generation_done and time.monotonic()-self.last_voice > 1:
+                            if self.generation_done and time.monotonic()-self.last_voice > self.settings['replyEndSilenceMs']/1000:
                                 self.outputting = self.allow_output = False
                                 await self.send({'type': 'audio_end'})
                                 self.ready=True
@@ -428,12 +435,13 @@ class VoiceSession:
 
     async def watch_response(self, turn):
         # Bound stalls, not total story length. Idle RTP silence is not progress.
-        first_deadline = self.release_at + self.bytes / 48000 + 30
+        stall = self.settings['responseIdleTimeoutSeconds']
+        first_deadline = self.release_at + self.bytes / 48000 + stall
         while turn == self.turn and self.allow_output and not self.ws.closed:
-            deadline = first_deadline if self.last_output_at is None else self.last_output_at + 30
+            deadline = first_deadline if self.last_output_at is None else self.last_output_at + stall
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                await self.send({'type': 'error', 'message': 'Codex voice response stalled for 30 seconds'})
+                await self.send({'type': 'error', 'message': f'Codex voice response stalled for {stall} seconds'})
                 await self.ws.close()
                 return
             await asyncio.sleep(remaining)
@@ -473,6 +481,20 @@ class VoxiRadio:
         self.owner, self.binary, self.active = owner, binary, set()
         self.max_sessions = max(1,min(4,int(os.environ.get("VOXI_MAX_SESSIONS","2"))))
         self.retry_after = 0
+        self.settings = VoiceSettings(getattr(owner, 'runtime', None))
+
+    async def configuration(self, request):
+        if request.headers.get('Origin') or not hmac.compare_digest(request.headers.get('Authorization', ''), 'Bearer '+self.owner.config['device_token']):
+            raise web.HTTPForbidden()
+        if request.method == 'POST':
+            try:
+                value = await request.json()
+                self.settings.save(value)
+            except (ValueError, TypeError):
+                raise web.HTTPBadRequest(text='Invalid voice configuration')
+            except OSError:
+                raise web.HTTPInternalServerError(text='Could not persist voice configuration')
+        return web.json_response(self.settings.public(), headers={'Cache-Control':'no-store'})
 
     async def websocket(self, request):
         if request.headers.get('Origin') or not hmac.compare_digest(
@@ -484,6 +506,7 @@ class VoxiRadio:
             raise web.HTTPServiceUnavailable(text='Native voice retry cooldown', headers={'Retry-After':'30'})
         ws = web.WebSocketResponse(heartbeat=20,max_msg_size=8192,writer_limit=32768)
         session = VoiceSession(ws, self.binary)
+        session.settings_source = self.settings
         self.active.add(session) # reserve before the first await; concurrent admission is bounded
         try:
             await ws.prepare(request)
