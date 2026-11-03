@@ -24,6 +24,19 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timing_distinguishes_queued_audio_from_rtp_emission(self):
+        ws=Socket();voice=VoiceSession(ws,'unused');voice.bytes=480000
+        voice.release_at=10;voice.emitted_baseline=9600
+        voice.input_track=SimpleNamespace(emitted_bytes=105600)
+        with patch('voxi.time.monotonic',return_value=14.5):
+            await voice.begin_audio()
+        metrics=next(p for p in ws.packets if p['type']=='timing')
+        self.assertEqual(metrics['recordedMs'],10000)
+        self.assertEqual(metrics['releaseToAudioStartMs'],4500)
+        self.assertEqual(metrics['rtpEmittedMs'],2000)
+        self.assertEqual(metrics['rtpQueuedMs'],10800)
+        self.assertEqual(ws.packets[-1],{'type':'audio_start'})
+
     @unittest.skipUnless(importlib.util.find_spec('av'), 'Optional native voice dependencies not installed')
     async def test_receive_failure_preserves_type_and_peer_without_exception_text(self):
         ws=Socket();ws.close=AsyncMock()

@@ -174,6 +174,8 @@ class VoiceSession:
         self.turn = 0
         self.response_id = None
         self.phase = 'new'
+        self.release_at=None
+        self.emitted_baseline=0
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -299,6 +301,13 @@ class VoiceSession:
         if self.outputting: return
         self.outputting = True
         self.played = 0
+        if self.release_at is not None:
+            metrics={'type':'timing','recordedMs':self.bytes//48,
+                     'releaseToAudioStartMs':round((time.monotonic()-self.release_at)*1000),
+                     'rtpEmittedMs':max(0,getattr(self.input_track,'emitted_bytes',0)-self.emitted_baseline)//48,
+                     'rtpQueuedMs':self.bytes//48+800}
+            LOG.info('Native voice timing %s',json.dumps(metrics))
+            await self.send(metrics)
         await self.send({'type': 'audio_start'})
 
     async def receive_audio(self, track):
@@ -347,6 +356,7 @@ class VoiceSession:
             self.recording = True
             self.allow_output = self.outputting = False
             self.bytes = 0
+            self.release_at=None
             self.lookback.clear()
             self.pending_audio.clear()
             self.item = None
@@ -365,6 +375,8 @@ class VoiceSession:
             await self.send({'type': 'busy'})
             # AVAS WebRTC accepts microphone media over RTP, never audio
             # append JSON on its data channel. Release queues real-time media.
+            self.release_at=time.monotonic()
+            self.emitted_baseline=getattr(self.input_track,'emitted_bytes',0)
             self.input_track.submit(bytes(self.pending_audio)+bytes(38400))
             self.pending_audio.clear()
             await self.send({'type': 'thinking'})
