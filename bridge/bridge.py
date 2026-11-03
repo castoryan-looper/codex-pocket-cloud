@@ -1388,6 +1388,7 @@ class Pocket:
         app.router.add_get('/voxi', self.voxi_radio.websocket)
         app.router.add_get('/voxi/config', self.voxi_radio.configuration)
         app.router.add_post('/voxi/config', self.voxi_radio.configuration)
+        app.router.add_get('/voxi/devices', self.voxi_radio.memory_configuration)
         app.router.add_get('/voxi/memory', self.voxi_radio.memory_configuration)
         app.router.add_post('/voxi/memory', self.voxi_radio.memory_configuration)
         app.add_routes([web.get('/',self.console),web.get('/device',self.websocket),web.get('/healthz',self.health),

@@ -539,13 +539,14 @@ class VoxiRadio:
     async def memory_configuration(self, request):
         if request.headers.get('Origin') or not hmac.compare_digest(request.headers.get('Authorization',''),'Bearer '+self.owner.config['device_token']):raise web.HTTPForbidden()
         if not self.memory:raise web.HTTPServiceUnavailable(text='Memory storage unavailable')
+        if request.method=='GET' and request.path.endswith('/devices'):return web.json_response(self.memory.registry(),headers={'Cache-Control':'no-store'})
         if request.method=='POST':
             try:
                 body=await request.json()
                 if not isinstance(body,dict):raise ValueError('无效请求')
                 result=self.memory.change(body)
                 uid=body.get('userId')
-                self.memory_revision[uid]=self.memory_revision.get(uid,0)+1
+                if body.get('action')!='rename_device':self.memory_revision[uid]=self.memory_revision.get(uid,0)+1
                 if body.get('action') in ('profile','memory','delete_memory','delete_turn','clear'):
                     for session in list(self.active):
                         if session.memory_user==uid:await session.ws.close(code=1012,message=b'Memory context updated')

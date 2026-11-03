@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import sqlite3
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,27 @@ A='esp32-111111111111'
 B='esp32-222222222222'
 
 class MemoryTests(unittest.TestCase):
+    def test_device_name_migration_preserves_identity_and_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'voxi-memory.sqlite3'
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE devices(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,last_seen REAL NOT NULL)')
+                db.execute('INSERT INTO devices VALUES(?,?,?)',(A,'old-user',1))
+            db.close()
+            store=MemoryStore(directory)
+            # Existing binding survives migration; independent display name is new.
+            with sqlite3.connect(path) as db:db.execute("INSERT INTO users(id,name) VALUES('old-user','原用户')")
+            db.close()
+            uid=store.bind(A);store.record(uid,A,'source','我喜欢天文学')
+            store.change({'action':'rename_device','userId':uid,'deviceId':A,'name':'我的床头设备'})
+            restarted=MemoryStore(directory)
+            self.assertEqual(restarted.owner(A),'old-user');self.assertIn('天文学',restarted.context(uid))
+            self.assertEqual(restarted.registry()['devices'][0]['name'],'我的床头设备')
+            self.assertEqual(restarted.registry()['devices'][0]['id'],A)
+            other=store.bind(B)
+            with self.assertRaises(ValueError):store.change({'action':'rename_device','userId':other,'deviceId':A,'name':'错误'})
+            with self.assertRaises(ValueError):store.change({'action':'rename_device','userId':uid,'deviceId':A,'name':''})
+
     def test_isolation_persistence_and_explicit_preferences(self):
         with tempfile.TemporaryDirectory() as directory:
             store=MemoryStore(directory);a=store.bind(A);b=store.bind(B)
