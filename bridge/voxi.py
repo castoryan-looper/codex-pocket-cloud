@@ -176,6 +176,7 @@ class VoiceSession:
         self.phase = 'new'
         self.release_at=None
         self.emitted_baseline=0
+        self.last_output_at = None
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -243,7 +244,7 @@ class VoiceSession:
         self.answer = asyncio.get_running_loop().create_future()
         self.phase = 'webrtc-sdp'
         names = ['营地一号：沉稳值守员', '巡逻二号：干练的搭档', '夜航三号：安静的老朋友', '探索四号：好奇的队友']
-        prompt = ('你是虚构对讲机里的AI伙伴，呼号'+names[channel]+'。用简短自然中文直接回应，通常一到三句，十秒内说完。'
+        prompt = ('你是虚构对讲机里的AI伙伴，呼号'+names[channel]+'。默认用简短自然中文直接回应，通常一到三句。用户明确要求讲故事、详细讲解或长回复时，按要求完整讲完，不受十秒或句数限制；不要为了简短而截断内容。'
                   '偶尔说收到或完毕，不要每句重复。不要模拟电流声，不要执行任务或使用工具。听不清就请求重说。身份被问及时如实说明是AI。')
         await self.rpc.call('thread/realtime/start', {'threadId': self.thread,
             'transport': {'type': 'webrtc', 'sdp': self.peer.localDescription.sdp},
@@ -300,6 +301,7 @@ class VoiceSession:
     async def begin_audio(self):
         if self.outputting: return
         self.outputting = True
+        self.last_output_at = time.monotonic()
         self.played = 0
         if self.release_at is not None:
             metrics={'type':'timing','recordedMs':self.bytes//48,
@@ -323,6 +325,7 @@ class VoiceSession:
                     voiced = any(abs(int.from_bytes(data[i:i+2], 'little', signed=True)) > 32 for i in range(0,len(data),2))
                     if voiced: self.last_voice = time.monotonic()
                     if self.allow_output and not self.recording:
+                        if voiced: self.last_output_at = time.monotonic()
                         if not self.outputting and voiced:
                             await self.begin_audio()
                             for prior in self.lookback: await self.ws.send_bytes(prior)
@@ -357,6 +360,7 @@ class VoiceSession:
             self.allow_output = self.outputting = False
             self.bytes = 0
             self.release_at=None
+            self.last_output_at = None
             self.lookback.clear()
             self.pending_audio.clear()
             self.item = None
@@ -381,12 +385,19 @@ class VoiceSession:
             self.pending_audio.clear()
             await self.send({'type': 'thinking'})
             turn = self.turn
-            async def response_timeout():
-                await asyncio.sleep(self.bytes/48000+30)
-                if turn == self.turn and self.allow_output and not self.ws.closed:
-                    await self.send({'type': 'error', 'message': 'Codex voice response timed out'})
-                    await self.ws.close()
-            self.spawn(response_timeout())
+            self.spawn(self.watch_response(turn))
+
+    async def watch_response(self, turn):
+        # Bound stalls, not total story length. Idle RTP silence is not progress.
+        first_deadline = self.release_at + self.bytes / 48000 + 30
+        while turn == self.turn and self.allow_output and not self.ws.closed:
+            deadline = first_deadline if self.last_output_at is None else self.last_output_at + 30
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await self.send({'type': 'error', 'message': 'Codex voice response stalled for 30 seconds'})
+                await self.ws.close()
+                return
+            await asyncio.sleep(remaining)
 
     async def pcm(self, data):
         if not self.ready or not self.recording: return

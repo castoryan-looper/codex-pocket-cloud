@@ -24,6 +24,35 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_response_keeps_running_while_audio_progresses(self):
+        ws = Socket(); ws.close = AsyncMock()
+        voice = VoiceSession(ws, 'unused'); voice.turn = 1; voice.allow_output = True
+        voice.release_at = 0; voice.bytes = 240000; voice.last_output_at = 6
+        clock = [6.0]; ticks = []
+        async def advance(delay):
+            clock[0] += delay; ticks.append(clock[0])
+            voice.last_output_at = clock[0]
+            if len(ticks) == 5: voice.allow_output = False
+        with patch('voxi.time.monotonic', side_effect=lambda: clock[0]), patch('voxi.asyncio.sleep', side_effect=advance):
+            await voice.watch_response(1)
+        self.assertGreater(clock[0], 120)
+        self.assertFalse(ws.packets); ws.close.assert_not_awaited()
+
+    async def test_response_stall_closes_without_indefinite_wait(self):
+        ws = Socket(); ws.close = AsyncMock()
+        voice = VoiceSession(ws, 'unused'); voice.turn = 1; voice.allow_output = True
+        voice.release_at = 0; voice.bytes = 240000; voice.last_output_at = 100
+        with patch('voxi.time.monotonic', return_value=131):
+            await voice.watch_response(1)
+        self.assertIn('stalled', ws.packets[-1]['message']); ws.close.assert_awaited_once()
+
+    async def test_previous_turn_watchdog_cannot_close_current_turn(self):
+        ws = Socket(); ws.close = AsyncMock()
+        voice = VoiceSession(ws, 'unused'); voice.turn = 2; voice.allow_output = True
+        voice.release_at = 0; voice.bytes = 240000
+        await voice.watch_response(1)
+        self.assertFalse(ws.packets); ws.close.assert_not_awaited()
+
     async def test_timing_distinguishes_queued_audio_from_rtp_emission(self):
         ws=Socket();voice=VoiceSession(ws,'unused');voice.bytes=480000
         voice.release_at=10;voice.emitted_baseline=9600
