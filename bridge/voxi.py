@@ -194,6 +194,7 @@ class VoiceSession:
         if method == 'thread/realtime/sdp' and self.answer and not self.answer.done():
             self.answer.set_result(params['sdp'])
         elif method in ('thread/realtime/error', 'thread/realtime/closed'):
+            LOG.warning('Native voice upstream %s reason=%s',method,diagnostic_reason(params.get('error',params.get('message',params.get('reason','')))))
             if self.answer and not self.answer.done():
                 self.answer.set_exception(VoiceFailure('notification', params.get('code'), params.get('error', params.get('message', params.get('reason', '')))))
             else:
@@ -325,9 +326,13 @@ class VoiceSession:
                                 await self.send({'type':'ready','channel':self.channel})
                     self.lookback.append(data)
         except asyncio.CancelledError: raise
-        except Exception:
+        except Exception as error:
+            # Do not log arbitrary exception text, URLs or credentials.
+            state = self.peer.connectionState if self.peer else 'none'
+            LOG.warning('Native voice audio receive failed (%s) peer=%s outputting=%s generation_done=%s',
+                        type(error).__name__, state, self.outputting, self.generation_done)
             if not self.ws.closed:
-                await self.send({'type': 'error', 'message': 'WebRTC audio receive failed'})
+                await self.send({'type': 'error', 'message': f'WebRTC audio receive failed ({type(error).__name__}; peer={state})'})
                 await self.ws.close()
 
     async def control(self, event):

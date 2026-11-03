@@ -24,6 +24,18 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(importlib.util.find_spec('av'), 'Optional native voice dependencies not installed')
+    async def test_receive_failure_preserves_type_and_peer_without_exception_text(self):
+        ws=Socket();ws.close=AsyncMock()
+        voice=VoiceSession(ws,'unused');voice.peer=SimpleNamespace(connectionState='connected')
+        track=SimpleNamespace(recv=AsyncMock(side_effect=RuntimeError('secret-url-and-credential')))
+        with self.assertLogs('pocket.voxi',level='WARNING') as logs:
+            await voice.receive_audio(track)
+        self.assertIn('RuntimeError',ws.packets[-1]['message'])
+        self.assertIn('peer=connected',ws.packets[-1]['message'])
+        self.assertNotIn('secret',repr(ws.packets)+repr(logs.output))
+        ws.close.assert_awaited_once()
+
     @unittest.skipUnless(importlib.util.find_spec('aiortc'), 'Optional native voice dependencies not installed')
     async def test_webrtc_selects_cli_v3_for_avas_quicksilver_v2(self):
         from aiortc import RTCPeerConnection
