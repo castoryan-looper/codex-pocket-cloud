@@ -9,7 +9,9 @@ import contextlib
 import hmac
 import json
 import logging
+import os
 import re
+import secrets
 import tempfile
 import time
 from collections import deque
@@ -160,6 +162,7 @@ def create_input_track():
 class VoiceSession:
     def __init__(self, ws, binary):
         self.ws, self.binary = ws, binary
+        self.session_id = secrets.token_hex(4)
         self.rpc = self.peer = self.events = self.workspace = self.input_track = None
         self.answer = None
         self.ready = self.recording = self.allow_output = self.outputting = False
@@ -310,7 +313,7 @@ class VoiceSession:
         self.last_output_at = time.monotonic()
         self.played = 0
         if self.release_at is not None:
-            metrics={'type':'timing','recordedMs':self.bytes//48,
+            metrics={'type':'timing','sessionId':self.session_id,'recordedMs':self.bytes//48,
                      'releaseToAudioStartMs':round((time.monotonic()-self.release_at)*1000),
                      'rtpEmittedMs':max(0,getattr(self.input_track,'emitted_bytes',0)-self.emitted_baseline)//48,
                      'rtpQueuedMs':self.bytes//48+800}
@@ -324,7 +327,7 @@ class VoiceSession:
             stats = await self.peer.getStats()
             rows = [value for value in stats.values() if value.type == 'inbound-rtp' and getattr(value, 'kind', 'audio') == 'audio']
             LOG.info('Native voice media stats %s', json.dumps({
-                'turn': self.turn, 'packetsReceived': sum(getattr(row, 'packetsReceived', 0) for row in rows),
+                'sessionId': self.session_id, 'turn': self.turn, 'packetsReceived': sum(getattr(row, 'packetsReceived', 0) for row in rows),
                 'packetsLost': sum(getattr(row, 'packetsLost', 0) for row in rows),
                 'maxFrameTimelineGapMs': self.media_gap_max_ms,
                 'maxReceiveGapMs': self.media_receive_gap_max_ms, 'pcmBytes': self.media_pcm_bytes}))
@@ -467,19 +470,21 @@ class VoiceSession:
 
 class VoxiRadio:
     def __init__(self, owner, binary):
-        self.owner, self.binary, self.active = owner, binary, False
+        self.owner, self.binary, self.active = owner, binary, set()
+        self.max_sessions = max(1,min(4,int(os.environ.get("VOXI_MAX_SESSIONS","2"))))
         self.retry_after = 0
 
     async def websocket(self, request):
         if request.headers.get('Origin') or not hmac.compare_digest(
                 request.headers.get('Authorization', ''), 'Bearer '+self.owner.config['device_token']):
             raise web.HTTPForbidden()
-        if self.active: raise web.HTTPServiceUnavailable(text='One native voice session at a time')
+        if len(self.active)>=self.max_sessions:
+            raise web.HTTPServiceUnavailable(text='Native voice session capacity reached', headers={'Retry-After':'5','X-Voxi-Rejection':'session-limit'})
         if time.monotonic() < self.retry_after:
             raise web.HTTPServiceUnavailable(text='Native voice retry cooldown', headers={'Retry-After':'30'})
-        self.active = True
         ws = web.WebSocketResponse(heartbeat=20,max_msg_size=8192,writer_limit=32768)
         session = VoiceSession(ws, self.binary)
+        self.active.add(session) # reserve before the first await; concurrent admission is bounded
         try:
             await ws.prepare(request)
             await session.start()
@@ -496,7 +501,9 @@ class VoxiRadio:
             with contextlib.suppress(Exception):
                 await session.send({'type': 'error', 'message': f'Native voice failed at {session.phase}: {detail}'})
         finally:
-            await session.stop()
-            await ws.close()
-            self.active = False
+            try:
+                await session.stop()
+            finally:
+                self.active.discard(session)
+                await ws.close()
         return ws

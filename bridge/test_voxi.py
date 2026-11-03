@@ -211,6 +211,36 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 await radio.websocket(SimpleNamespace(headers=headers))
         self.assertFalse(radio.active)
 
+    async def test_two_devices_are_isolated_and_third_is_rejected(self):
+        radio=VoxiRadio(SimpleNamespace(config={'device_token':'test'}),'unused')
+        radio.max_sessions=2
+        async def ready(session,channel=0):
+            await session.send({'type':'ready'})
+        async def control(session,event):
+            session.channel=event['channel']
+            await session.send({'type':'channel','channel':session.channel})
+        app=web.Application();app.router.add_get('/voxi',radio.websocket)
+        with patch.object(VoiceSession,'start',new=ready),patch.object(VoiceSession,'control',new=control),patch.object(VoiceSession,'stop',new=AsyncMock()):
+            async with TestClient(TestServer(app)) as client:
+                headers={'Authorization':'Bearer test'}
+                a=await client.ws_connect('/voxi',headers=headers);await a.receive_json()
+                b=await client.ws_connect('/voxi',headers=headers);await b.receive_json()
+                self.assertEqual(len(radio.active),2)
+                response=await client.get('/voxi',headers=headers)
+                self.assertEqual(response.status,503)
+                self.assertEqual(response.headers['X-Voxi-Rejection'],'session-limit')
+                await a.send_json({'channel':3});self.assertEqual((await a.receive_json())['channel'],3)
+                await b.send_json({'channel':1});self.assertEqual((await b.receive_json())['channel'],1)
+                self.assertEqual(sorted(s.channel for s in radio.active),[1,3])
+                await a.close()
+                for _ in range(30):
+                    if len(radio.active)==1:break
+                    await asyncio.sleep(.01)
+                self.assertEqual(len(radio.active),1)
+                c=await client.ws_connect('/voxi',headers=headers);await c.receive_json()
+                await b.send_json({'channel':2});self.assertEqual((await b.receive_json())['channel'],2)
+                await b.close();await c.close()
+
     async def test_failed_voice_setup_enters_cooldown_without_restarting_cli(self):
         radio=VoxiRadio(SimpleNamespace(config={'device_token':'test'}),'unused')
         app=web.Application();app.router.add_get('/voxi',radio.websocket)
