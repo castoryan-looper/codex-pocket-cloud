@@ -177,6 +177,12 @@ class VoiceSession:
         self.release_at=None
         self.emitted_baseline=0
         self.last_output_at = None
+        self.media_last_end = None
+        self.media_gap_max_ms = 0
+        self.media_last_receive = None
+        self.media_receive_gap_max_ms = 0
+        self.media_pcm_bytes = 0
+        self.media_report_at = 0
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -312,12 +318,38 @@ class VoiceSession:
             await self.send(metrics)
         await self.send({'type': 'audio_start'})
 
+    async def report_media_stats(self):
+        if not self.peer: return
+        try:
+            stats = await self.peer.getStats()
+            rows = [value for value in stats.values() if value.type == 'inbound-rtp' and getattr(value, 'kind', 'audio') == 'audio']
+            LOG.info('Native voice media stats %s', json.dumps({
+                'turn': self.turn, 'packetsReceived': sum(getattr(row, 'packetsReceived', 0) for row in rows),
+                'packetsLost': sum(getattr(row, 'packetsLost', 0) for row in rows),
+                'maxFrameTimelineGapMs': self.media_gap_max_ms,
+                'maxReceiveGapMs': self.media_receive_gap_max_ms, 'pcmBytes': self.media_pcm_bytes}))
+        except Exception as error:
+            LOG.info('Native voice media stats unavailable (%s)', type(error).__name__)
+
     async def receive_audio(self, track):
         from av import AudioResampler
         resampler = AudioResampler(format='s16', layout='mono', rate=24000)
         try:
             while True:
                 frame = await track.recv()
+                now = time.monotonic()
+                if self.allow_output and not self.recording:
+                    if self.media_last_receive is not None:
+                        self.media_receive_gap_max_ms = max(self.media_receive_gap_max_ms, round((now-self.media_last_receive)*1000))
+                    self.media_last_receive = now
+                    if frame.pts is not None and frame.time_base is not None:
+                        start = float(frame.pts*frame.time_base)
+                        if self.media_last_end is not None:
+                            self.media_gap_max_ms = max(self.media_gap_max_ms, round((start-self.media_last_end)*1000))
+                        self.media_last_end = start+frame.samples/frame.sample_rate
+                    if now-self.media_report_at >= 10:
+                        self.media_report_at = now
+                        self.spawn(self.report_media_stats())
                 for mono in resampler.resample(frame):
                     data = bytes(mono.planes[0])[:mono.samples*2]
                     # Fall back to a small PCM onset detector when the transport
@@ -330,6 +362,7 @@ class VoiceSession:
                             await self.begin_audio()
                             for prior in self.lookback: await self.ws.send_bytes(prior)
                         if self.outputting:
+                            self.media_pcm_bytes += len(data)
                             for i in range(0,len(data),960): await self.ws.send_bytes(data[i:i+960])
                             if self.generation_done and time.monotonic()-self.last_voice > 1:
                                 self.outputting = self.allow_output = False
@@ -361,6 +394,9 @@ class VoiceSession:
             self.bytes = 0
             self.release_at=None
             self.last_output_at = None
+            self.media_last_end = self.media_last_receive = None
+            self.media_gap_max_ms = self.media_receive_gap_max_ms = self.media_pcm_bytes = 0
+            self.media_report_at = 0
             self.lookback.clear()
             self.pending_audio.clear()
             self.item = None

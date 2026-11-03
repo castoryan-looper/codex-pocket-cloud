@@ -24,6 +24,19 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_media_stats_only_reports_audio_counters(self):
+        voice=VoiceSession(Socket(),'unused');voice.turn=7
+        voice.media_gap_max_ms=120;voice.media_receive_gap_max_ms=350;voice.media_pcm_bytes=96000
+        voice.peer=SimpleNamespace(getStats=AsyncMock(return_value={
+            'audio':SimpleNamespace(type='inbound-rtp',kind='audio',packetsReceived=200,packetsLost=4),
+            'video':SimpleNamespace(type='inbound-rtp',kind='video',packetsReceived=999,packetsLost=100),
+            'private':SimpleNamespace(type='transport',secret='not-for-logs')}))
+        with self.assertLogs('pocket.voxi',level='INFO') as logs:
+            await voice.report_media_stats()
+        self.assertIn('"packetsLost": 4',logs.output[0])
+        self.assertIn('"maxFrameTimelineGapMs": 120',logs.output[0])
+        self.assertNotIn('not-for-logs',repr(logs.output))
+
     async def test_long_response_keeps_running_while_audio_progresses(self):
         ws = Socket(); ws.close = AsyncMock()
         voice = VoiceSession(ws, 'unused'); voice.turn = 1; voice.allow_output = True
