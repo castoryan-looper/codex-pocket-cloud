@@ -4,8 +4,22 @@ import json
 import os
 from pathlib import Path
 
+VOICE_TASK_INSTRUCTIONS = (
+    'You are a voice assistant with read-only web research. Use web search for current facts, '
+    'including weather, and keep the same thread for follow-up questions. Complete the research '
+    'and return a concise spoken answer with the actual result. Never stop at a promise to look '
+    'something up. Ask for missing locations or dates. If research fails, explain the failure. '
+    'Do not run shell commands, modify files, or perform external actions.'
+)
+
+RESEARCH_PROMPT = (
+    '\n需要天气、新闻或其他实时信息时，将查询委托给 Codex 后端，取得结果后主动继续播报，'
+    '不用等用户再问。过程说明不代表任务完成。沿用同一会话中的城市、日期和查询结果回答追问。'
+    '缺少必要信息先询问；查询失败要明确说明，不编造结果。'
+)
+
 DEFAULTS = {
-    'systemPrompt': '你是虚构对讲机里的AI伙伴。默认用简短自然中文直接回应，通常一到三句。用户明确要求讲故事、详细讲解或长回复时，按要求完整讲完，不受十秒或句数限制；不要为了简短而截断内容。偶尔说收到或完毕，不要每句重复。不要模拟电流声，不要执行任务或使用工具。听不清就请求重说。身份被问及时如实说明是AI。',
+    'systemPrompt': '你是虚构对讲机里的AI伙伴。默认用简短自然中文直接回应，通常一到三句。用户明确要求讲故事、详细讲解或长回复时，按要求完整讲完，不受十秒或句数限制；不要为了简短而截断内容。偶尔说收到或完毕，不要每句重复。不要模拟电流声。听不清就请求重说。身份被问及时如实说明是AI。',
     'channels': [
         {'name': '营地一号', 'persona': '沉稳、熟悉山野的营地值守员。关心对方，但不说教。'},
         {'name': '巡逻二号', 'persona': '干练的巡逻搭档。观察敏锐，回答直接，有一点幽默。'},
@@ -43,7 +57,9 @@ def validate(value):
 
 def effective_prompt(settings, channel):
     selected = settings['channels'][channel]
-    return settings['systemPrompt'] + '\n当前频道呼号：' + selected['name'] + '。\n频道角色：' + selected['persona']
+    # Migrate the exact old built-in restriction for already-saved configurations.
+    prompt = settings['systemPrompt'].replace('不要执行任务或使用工具。', '')
+    return prompt + '\n当前频道呼号：' + selected['name'] + '。\n频道角色：' + selected['persona'] + RESEARCH_PROMPT
 
 class VoiceSettings:
     def __init__(self, directory=None):
@@ -70,6 +86,6 @@ class VoiceSettings:
         return {'settings': self.snapshot(), 'defaults': copy.deepcopy(DEFAULTS),
                 'effectivePrompts': [effective_prompt(self.value, i) for i in range(4)],
                 'runtime': {'voice': 'cove', 'protocol': 'v3', 'model': '由 Codex 原生语音后端选择',
-                            'developerInstructions': 'Voice conversation only. Do not use tools, files, agents or shell commands.'},
+                            'developerInstructions': VOICE_TASK_INSTRUCTIONS},
                 'persistent': self.path is not None,
                 'applies': '保存后在新连接或切换频道时生效；当前故事不会被打断。'}

@@ -12,11 +12,17 @@ aiortc==1.14.0 放在 bridge/requirements-voxi.txt，作为独立 Docker 层安�
 
 升级此仓库 gateway/ingress 后，参见 [Voxi 操作说明](https://github.com/castoryan-looper/Voxi/blob/main/docs/POCKET-BACKEND.md)。首次升级会重建镜像，保留既有命名卷，勿删除账号/模型数据来排查语音权限问题。
 
-测试覆盖 PTT/短按/打断、鉴权、空工具配置确认与本地 SDP 协商；真实账号和语音延迟仍待部署验证。
+测试覆盖 PTT/短按/打断、鉴权、原生查询接续配置与本地 SDP 协商；真实账号和语音延迟仍待部署验证。
 
 原生语音兼容性：固定 CLI 0.163.0 的 WebRTC 使用 version=v3、音色 cove。CLI 中 v3 会生成服务端要求的 OpenAI-Alpha: quicksilver=v2；v1 生成旧 quicksilver=v1。CLI 的 version=v2 是另一条协议，不能与 quicksilver=v2 请求头版本混为一谈。marin 不属于 v3 音色列表。
 
-AVAS v3 的 session.update 使用官方 Frameless Bidi 结构：audio.output.voice=cove、delegation.type=client。该接口拒绝公共 Realtime 的 session.type、tools、turn_detection，因此不再尝试关闭 VAD，也不发送 input_audio_buffer.commit / response.create。任务委派仍通过 clientManagedHandoffs=true 交给本客户端管理，本客户端不执行委派，并拒绝服务端 RPC 工具/批准请求。
+AVAS v3 的 session.update 使用官方 Frameless Bidi 结构：audio.output.voice=cove、delegation.type=client。该接口拒绝公共 Realtime 的 session.type、tools、turn_detection，因此不再尝试关闭 VAD，也不发送 input_audio_buffer.commit / response.create。
+
+实时查询使用 Codex 0.163.0 原生委派，`clientManagedHandoffs=false` 让 app-server 在独立语音线程内执行查询并自动将结果送回语音。该线程启用 live web search、禁用 shell 工具，继续使用只读沙箱及现有登录。天气等实时问题先查询再回答，缺少城市或日期先追问。后续追问沿用同一连接和频道的线程上下文；重连、切台会创建新线程。
+
+过程播报结束后保留查询状态，结果音频可自动开始新一段播放。查询与首次结果等待上限为 180 秒，失败时请求原生语音播报失败说明，超时则发送明确错误并断开以恢复连接。正常结果开始后的语音停滞继续使用 `responseIdleTimeoutSeconds`，完整长回复不受 180 秒总时长限制。已保存提示词中的旧内置句子“不要执行任务或使用工具。”在生成有效提示词时移除，其他用户设置保留。服务端要求客户端执行的工具或批准 RPC 仍被拒绝。
+
+本地回归覆盖查询期间的过程播报、自动续播、同线程追问、失败提示和超时。上线后需用真实账号验证“查某城市天气 → 自动播报结果 → 追问晚上天气”；本地测试无法证明线上账号具备 live search 权限，也无法验证实际天气来源与设备听感。
 
 按住时音频只保存在网关内存（每轮最大 30 秒约 1.44MB），松开才送入模型。尾部静音和服务端结束检测会增加延迟；长语句内的停顿仍可能影响自动分句。回复期间报告 busy，当前模式需等待回复结束再开始下一轮，不支持中途打断。READY 只验证会话建立，不等同真实音频往返测试通过。
 

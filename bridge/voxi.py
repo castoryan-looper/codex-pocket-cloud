@@ -1,7 +1,8 @@
-"""Authenticated, voice-only Codex app-server/WebRTC bridge for Voxi.
+"""Authenticated Codex app-server/WebRTC voice and web research bridge for Voxi.
 
 Uses the official CLI's existing CODEX_HOME login. Does not read/export auth.json,
-run user shell commands, create Codex turns or reuse Pocket's task conversation.
+run user shell commands or reuse Pocket's task conversation. Native realtime
+delegations run on the dedicated, ephemeral voice thread and return automatically.
 The /voxi endpoint is Docker-internal only, not added to the public Caddy routes.
 """
 import asyncio
@@ -17,7 +18,7 @@ import time
 from collections import deque
 
 from aiohttp import web, WSMsgType
-from voxi_config import VoiceSettings, effective_prompt
+from voxi_config import VoiceSettings, effective_prompt, VOICE_TASK_INSTRUCTIONS
 from voxi_memory import MemoryStore, device_id
 from voice_recovery import offer_audio_nack, configure_audio_recovery
 LOG = logging.getLogger('pocket.voxi')
@@ -196,6 +197,12 @@ class VoiceSession:
         self.media_pcm_bytes = 0
         self.media_report_at = 0
         self.audio_nack = False
+        self.research_pending = False
+        self.research_turn = None
+        self.continuation_until = 0
+        self.research_watchdog = None
+        self.research_result_waiting = False
+        self.audio_segment = 0
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -215,6 +222,21 @@ class VoiceSession:
         if params.get('threadId') != self.thread: return
         if method == 'thread/realtime/sdp' and self.answer and not self.answer.done():
             self.answer.set_result(params['sdp'])
+        elif method == 'thread/realtime/itemAdded' and params.get('item', {}).get('type') == 'handoff_request':
+            await self.begin_research()
+        elif method == 'turn/started':
+            await self.begin_research()
+            self.research_turn = params['turn']['id']
+        elif method == 'turn/completed' and params.get('turn', {}).get('id') == self.research_turn:
+            self.research_turn = None
+            self.research_pending = False
+            self.research_result_waiting = True
+            self.generation_done = False
+            self.last_output_at = time.monotonic()
+            if params['turn'].get('status') != 'completed':
+                # Deliver a speakable failure through the existing native voice transport.
+                self.spawn(self.rpc.call('thread/realtime/appendSpeech', {
+                    'threadId': self.thread, 'text': '这次查询没有完成，请稍后重试。'}))
         elif method in ('thread/realtime/error', 'thread/realtime/closed'):
             LOG.warning('Native voice upstream %s reason=%s',method,diagnostic_reason(params.get('error',params.get('message',params.get('reason','')))))
             if self.answer and not self.answer.done():
@@ -236,7 +258,8 @@ class VoiceSession:
         self.phase = 'thread'
         self.thread = (await self.rpc.call('thread/start', {
             'cwd': self.workspace.name, 'approvalPolicy': 'never', 'sandbox': 'read-only',
-            'ephemeral': True, 'developerInstructions': 'Voice conversation only. Do not use tools, files, agents or shell commands.'
+            'ephemeral': True, 'developerInstructions': VOICE_TASK_INSTRUCTIONS,
+            'config': {'web_search': 'live', 'features.shell_tool': False}
         }))['thread']['id']
         self.peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         self.input_track=create_input_track()
@@ -273,7 +296,7 @@ class VoiceSession:
             # Codex v3 maps to the AVAS-required quicksilver=v2 alpha header.
             # cove is supported by v3; marin belongs to the separate v2 API.
             'outputModality': 'audio', 'version': 'v3', 'voice': 'cove', 'prompt': prompt,
-            'includeStartupContext': False, 'clientManagedHandoffs': True})
+            'includeStartupContext': False, 'clientManagedHandoffs': False})
         answer = await asyncio.wait_for(self.answer, 40)
         await self.peer.setRemoteDescription(RTCSessionDescription(sdp=answer, type='answer'))
         self.audio_nack = configure_audio_recovery(self.peer, self.settings['audioRecoveryPackets']) if self.settings['audioRetransmission'] else False
@@ -302,15 +325,23 @@ class VoiceSession:
             if response.get('metadata', {}).get('turn') == str(self.turn): self.response_id = response.get('id')
         elif kind == 'response.output_item.added' and event.get('response_id') == self.response_id:
             self.item = event.get('item', {}).get('id')
-        elif kind == 'output_audio_buffer.started' and self.allow_output and not self.recording:
+        elif kind == 'delegation.created':
+            item = event.get('item', {})
+            if item.get('type') == 'delegation' and item.get('target') == 'client':
+                await self.begin_research()
+        elif kind == 'output_audio_buffer.started' and not self.recording and (
+                self.allow_output or time.monotonic() < self.continuation_until):
+            self.allow_output = True
+            self.ready = False
+            self.generation_done = False
             await self.begin_audio()
         elif kind == 'output_audio_buffer.stopped':
             # Separate RTC media/control channels may deliver the final packet later.
             turn = self.turn
+            segment = self.audio_segment
             await asyncio.sleep(.25)
-            if turn == self.turn and self.outputting:
-                self.outputting = self.allow_output = False
-                await self.send({'type': 'audio_end'})
+            if turn == self.turn and segment == self.audio_segment and self.outputting:
+                await self.end_audio()
         elif kind == 'response.done' and event.get('response', {}).get('id') == self.response_id:
             if event.get('response', {}).get('status') in ('failed', 'incomplete'):
                 await self.send({'type': 'error', 'message': 'Codex native voice response failed or was incomplete'})
@@ -322,10 +353,46 @@ class VoiceSession:
             await self.send({'type': 'error', 'message': 'Codex voice rejected an audio/control event'})
             await self.ws.close()
 
+    async def begin_research(self):
+        if self.recording or self.ws.closed:
+            return
+        self.research_pending = True
+        self.ready = False
+        self.allow_output = True
+        self.generation_done = False
+        if not self.research_watchdog or self.research_watchdog.done():
+            self.continuation_until = time.monotonic() + 180
+            self.research_watchdog = self.spawn(self.watch_research(self.turn))
+        await self.send({'type': 'thinking'})
+
+    async def watch_research(self, turn):
+        await asyncio.sleep(max(0, self.continuation_until - time.monotonic()))
+        if turn != self.turn or self.ws.closed:
+            return
+        if self.research_pending or self.research_result_waiting:
+            await self.send({'type': 'error', 'message': '查询或结果播报超时，请重试'})
+            await self.ws.close()
+
+    async def end_audio(self):
+        self.outputting = False
+        self.allow_output = self.research_pending
+        self.generation_done = False
+        await self.send({'type': 'audio_end'})
+        if self.research_pending:
+            await self.send({'type': 'thinking'})
+        else:
+            self.research_result_waiting = False
+            self.ready = True
+            await self.send({'type': 'ready', 'channel': self.channel})
+
     async def begin_audio(self):
         if self.outputting: return
+        self.audio_segment += 1
+        self.research_result_waiting = False
         self.outputting = True
         self.last_output_at = time.monotonic()
+        if self.release_at is not None and time.monotonic() < self.continuation_until:
+            self.spawn(self.watch_response(self.turn))
         self.played = 0
         if self.release_at is not None:
             metrics={'type':'timing','sessionId':self.session_id,'recordedMs':self.bytes//48,
@@ -374,19 +441,18 @@ class VoiceSession:
                     # omits output_audio_buffer.started. Never play idle RTP silence.
                     voiced = any(abs(int.from_bytes(data[i:i+2], 'little', signed=True)) > 32 for i in range(0,len(data),2))
                     if voiced: self.last_voice = time.monotonic()
-                    if self.allow_output and not self.recording:
+                    if (self.allow_output or time.monotonic() < self.continuation_until) and not self.recording:
                         if voiced: self.last_output_at = time.monotonic()
                         if not self.outputting and voiced:
+                            self.allow_output = True
+                            self.ready = False
                             await self.begin_audio()
                             for prior in self.lookback: await self.ws.send_bytes(prior)
                         if self.outputting:
                             self.media_pcm_bytes += len(data)
                             for i in range(0,len(data),960): await self.ws.send_bytes(data[i:i+960])
                             if self.generation_done and time.monotonic()-self.last_voice > self.settings['replyEndSilenceMs']/1000:
-                                self.outputting = self.allow_output = False
-                                await self.send({'type': 'audio_end'})
-                                self.ready=True
-                                await self.send({'type':'ready','channel':self.channel})
+                                await self.end_audio()
                     self.lookback.append(data)
         except asyncio.CancelledError: raise
         except Exception as error:
@@ -405,6 +471,11 @@ class VoiceSession:
             channel = event.get('channel')
             if type(channel) is int and 0 <= channel < 4: await self.start(channel)
         elif kind == 'ptt_down' and self.ready and not self.recording and not self.allow_output:
+            self.continuation_until = 0
+            self.research_result_waiting = False
+            if self.research_watchdog:
+                self.research_watchdog.cancel()
+                self.research_watchdog = None
             self.turn += 1
             self.response_id = None
             self.recording = True
@@ -447,6 +518,9 @@ class VoiceSession:
         stall = self.settings['responseIdleTimeoutSeconds']
         first_deadline = self.release_at + self.bytes / 48000 + stall
         while turn == self.turn and self.allow_output and not self.ws.closed:
+            if self.research_pending:
+                await asyncio.sleep(1)
+                continue
             deadline = first_deadline if self.last_output_at is None else self.last_output_at + stall
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -469,6 +543,11 @@ class VoiceSession:
         self.lookback.clear()
         self.pending_audio.clear()
         self.generation_done = False
+        self.research_pending = False
+        self.research_turn = None
+        self.continuation_until = 0
+        self.research_watchdog = None
+        self.research_result_waiting = False
         for task in self.tasks: task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks.clear()

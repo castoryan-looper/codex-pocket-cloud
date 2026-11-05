@@ -24,6 +24,109 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_research_survives_filler_and_automatically_plays_result(self):
+        ws = Socket(); voice = VoiceSession(ws, 'unused')
+        voice.thread = 'voice-thread'; voice.turn = 1; voice.allow_output = True
+        try:
+            await voice.on_event({'type': 'delegation.created', 'item': {
+                'id': 'lookup', 'type': 'delegation', 'target': 'client'}})
+            await voice.notification({'method': 'turn/started', 'params': {
+                'threadId': voice.thread, 'turn': {'id': 'research'}}})
+            await voice.begin_audio()
+            await voice.on_event({'type': 'turn.done', 'turn': {'role': 'assistant'}})
+            await voice.end_audio()
+            self.assertTrue(voice.allow_output)
+            self.assertFalse(voice.ready)
+            self.assertEqual(ws.packets[-1]['type'], 'thinking')
+            await voice.notification({'method': 'turn/completed', 'params': {
+                'threadId': voice.thread, 'turn': {'id': 'research', 'status': 'completed'}}})
+            await voice.on_event({'type': 'output_audio_buffer.started'})
+            await voice.on_event({'type': 'turn.done', 'turn': {'role': 'assistant'}})
+            await voice.end_audio()
+            self.assertEqual(sum(p['type'] == 'audio_start' for p in ws.packets), 2)
+            self.assertTrue(voice.ready)
+            self.assertFalse(voice.allow_output)
+            self.assertFalse(voice.research_result_waiting)
+            # The follow-up remains on the same native thread.
+            await voice.control({'type': 'ptt_down'})
+            self.assertEqual(voice.thread, 'voice-thread')
+            self.assertTrue(voice.recording)
+            self.assertEqual(voice.continuation_until, 0)
+        finally:
+            voice.thread = None
+            await voice.stop()
+
+    async def test_late_result_can_start_after_filler_already_finished(self):
+        voice = VoiceSession(Socket(), 'unused')
+        try:
+            await voice.begin_audio()
+            await voice.end_audio()
+            self.assertFalse(voice.allow_output)
+            await voice.begin_research()
+            voice.research_pending = False
+            await voice.begin_audio()
+            await voice.end_audio()
+            # More native audio segments may follow without another PTT.
+            await voice.on_event({'type': 'output_audio_buffer.started'})
+            self.assertTrue(voice.outputting)
+            self.assertTrue(voice.allow_output)
+        finally: await voice.stop()
+
+    async def test_delayed_stop_does_not_end_a_new_audio_segment(self):
+        voice = VoiceSession(Socket(), 'unused')
+        voice.allow_output = True
+        await voice.begin_audio()
+        async def new_segment(_):
+            await voice.end_audio()
+            await voice.begin_audio()
+        with patch('voxi.asyncio.sleep', side_effect=new_segment):
+            await voice.on_event({'type': 'output_audio_buffer.stopped'})
+        self.assertTrue(voice.outputting)
+
+    async def test_research_timeout_reports_failure_and_ignores_old_turn(self):
+        ws = Socket(); ws.close = AsyncMock()
+        voice = VoiceSession(ws, 'unused'); voice.turn = 2
+        voice.research_pending = True; voice.continuation_until = 0
+        await voice.watch_research(1)
+        ws.close.assert_not_awaited()
+        await voice.watch_research(2)
+        self.assertEqual(ws.packets[-1]['type'], 'error')
+        ws.close.assert_awaited_once()
+
+    async def test_research_failure_requests_a_spoken_explanation(self):
+        voice = VoiceSession(Socket(), 'unused')
+        voice.thread = 'voice-thread'; voice.research_turn = 'research'
+        voice.rpc = SimpleNamespace(call=AsyncMock(), close=AsyncMock())
+        await voice.notification({'method': 'turn/completed', 'params': {
+            'threadId': voice.thread, 'turn': {'id': 'research', 'status': 'failed'}}})
+        await asyncio.sleep(0)
+        voice.rpc.call.assert_awaited_once_with('thread/realtime/appendSpeech', {
+            'threadId': 'voice-thread', 'text': '这次查询没有完成，请稍后重试。'})
+        self.assertTrue(voice.research_result_waiting)
+        await voice.stop()
+
+    @unittest.skipUnless(importlib.util.find_spec('av'), 'Optional native voice dependencies not installed')
+    async def test_result_rtp_resumes_without_audio_buffer_started_event(self):
+        from av import AudioFrame
+        ws = Socket(); ws.send_bytes = AsyncMock()
+        voice = VoiceSession(ws, 'unused')
+        frame = AudioFrame(format='s16', layout='mono', samples=480)
+        frame.sample_rate = 24000
+        frame.planes[0].update(bytes([100, 0]) * 480)
+        track = SimpleNamespace(recv=AsyncMock(side_effect=[frame, asyncio.CancelledError()]))
+        try:
+            await voice.begin_research()
+            voice.research_pending = False
+            # The earlier segment has already closed its output gate.
+            await voice.end_audio()
+            self.assertFalse(voice.allow_output)
+            with self.assertRaises(asyncio.CancelledError):
+                await voice.receive_audio(track)
+            ws.send_bytes.assert_awaited()
+            self.assertTrue(voice.outputting)
+            self.assertEqual(ws.packets[-1]['type'], 'audio_start')
+        finally: await voice.stop()
+
     async def test_media_stats_only_reports_audio_counters(self):
         voice=VoiceSession(Socket(),'unused');voice.turn=7
         voice.media_gap_max_ms=120;voice.media_receive_gap_max_ms=350;voice.media_pcm_bytes=96000
@@ -119,6 +222,11 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(params['version'],'v3')
             self.assertEqual(params['voice'],'cove')
             self.assertEqual(params['transport']['type'],'webrtc')
+            self.assertFalse(params['clientManagedHandoffs'])
+            thread = next(params for method, params in calls if method == 'thread/start')
+            self.assertEqual(thread['config']['web_search'], 'live')
+            self.assertFalse(thread['config']['features.shell_tool'])
+            self.assertEqual(thread['sandbox'], 'read-only')
             self.assertEqual(voice.phase,'ready')
         finally:await voice.stop()
 

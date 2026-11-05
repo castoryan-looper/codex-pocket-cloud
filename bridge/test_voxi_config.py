@@ -12,6 +12,15 @@ from voxi import VoxiRadio
 from voxi_config import DEFAULTS, VoiceSettings, effective_prompt, validate
 
 class ConfigurationTests(unittest.TestCase):
+    def test_saved_legacy_prompt_enables_research_without_changing_user_settings(self):
+        settings = VoiceSettings().snapshot()
+        settings['systemPrompt'] = '保留我的角色。不要执行任务或使用工具。'
+        prompt = effective_prompt(settings, 0)
+        self.assertIn('保留我的角色。', prompt)
+        self.assertNotIn('不要执行任务或使用工具。', prompt)
+        self.assertIn('取得结果后主动继续播报', prompt)
+        self.assertEqual(settings['systemPrompt'], '保留我的角色。不要执行任务或使用工具。')
+
     def test_persistence_effective_prompt_and_snapshot_isolation(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = VoiceSettings(directory)
