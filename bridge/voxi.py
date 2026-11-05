@@ -230,8 +230,11 @@ class VoiceSession:
         elif method == 'turn/completed' and params.get('turn', {}).get('id') == self.research_turn:
             self.research_turn = None
             self.research_pending = False
-            self.research_result_waiting = True
-            self.generation_done = False
+            self.research_result_waiting = not self.outputting
+            # Native audio can finish before the backend turn. Preserve its
+            # completion marker so trailing RTP silence can end playback.
+            LOG.info('Native voice research completed sessionId=%s turn=%s speechDone=%s outputting=%s',
+                     self.session_id, self.turn, self.generation_done, self.outputting)
             self.last_output_at = time.monotonic()
             if params['turn'].get('status') != 'completed':
                 # Deliver a speakable failure through the existing native voice transport.
@@ -370,6 +373,8 @@ class VoiceSession:
         if turn != self.turn or self.ws.closed:
             return
         if self.research_pending or self.research_result_waiting:
+            LOG.warning('Native voice timeout sessionId=%s turn=%s phase=research pending=%s waitingAudio=%s',
+                        self.session_id, self.turn, self.research_pending, self.research_result_waiting)
             await self.send({'type': 'error', 'message': '查询或结果播报超时，请重试'})
             await self.ws.close()
 
@@ -524,6 +529,8 @@ class VoiceSession:
             deadline = first_deadline if self.last_output_at is None else self.last_output_at + stall
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                LOG.warning('Native voice timeout sessionId=%s turn=%s phase=response_idle seconds=%s',
+                            self.session_id, self.turn, stall)
                 await self.send({'type': 'error', 'message': f'Codex voice response stalled for {stall} seconds'})
                 await self.ws.close()
                 return

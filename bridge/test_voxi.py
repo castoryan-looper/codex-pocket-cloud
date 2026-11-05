@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import importlib.util
 import unittest
 from types import SimpleNamespace
@@ -24,6 +25,50 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(importlib.util.find_spec('av'), 'Optional native voice dependencies not installed')
+    async def test_trailing_rtp_silence_finishes_speech_after_backend_completion(self):
+        from av import AudioFrame
+        ws = Socket(); ws.send_bytes = AsyncMock()
+        voice = VoiceSession(ws, 'unused')
+        voice.thread = 'voice-thread'; voice.research_turn = 'research'
+        voice.research_pending = voice.allow_output = True
+        frames = []
+        for value in (100, 0):
+            frame = AudioFrame(format='s16', layout='mono', samples=480)
+            frame.sample_rate = 24000
+            frame.planes[0].update(bytes([value, 0]) * 480)
+            frames.append(frame)
+        async def receive():
+            if len(frames) == 1:
+                await voice.on_event({'type': 'turn.done', 'turn': {'role': 'assistant'}})
+                await voice.notification({'method': 'turn/completed', 'params': {
+                    'threadId': voice.thread, 'turn': {'id': 'research', 'status': 'completed'}}})
+                voice.last_voice = time.monotonic() - 2
+            if not frames:
+                raise asyncio.CancelledError()
+            return frames.pop(0)
+        with self.assertRaises(asyncio.CancelledError):
+            await voice.receive_audio(SimpleNamespace(recv=receive))
+        self.assertTrue(voice.ready)
+        self.assertFalse(voice.outputting)
+        self.assertFalse(voice.allow_output)
+        self.assertEqual(ws.packets[-2]['type'], 'audio_end')
+        self.assertEqual(ws.packets[-1]['type'], 'ready')
+
+    async def test_backend_completion_preserves_already_finished_native_speech(self):
+        voice = VoiceSession(Socket(), 'unused')
+        voice.thread = 'voice-thread'; voice.research_turn = 'research'
+        voice.research_pending = True
+        voice.outputting = voice.allow_output = True
+        await voice.on_event({'type': 'turn.done', 'turn': {'role': 'assistant'}})
+        await voice.notification({'method': 'turn/completed', 'params': {
+            'threadId': voice.thread, 'turn': {'id': 'research', 'status': 'completed'}}})
+        self.assertTrue(voice.generation_done)
+        self.assertFalse(voice.research_result_waiting)
+        await voice.end_audio()
+        self.assertTrue(voice.ready)
+        self.assertFalse(voice.allow_output)
+
     async def test_research_survives_filler_and_automatically_plays_result(self):
         ws = Socket(); voice = VoiceSession(ws, 'unused')
         voice.thread = 'voice-thread'; voice.turn = 1; voice.allow_output = True
