@@ -9,6 +9,9 @@ VOICE_TASK_INSTRUCTIONS = (
     'including weather, and keep the same thread for follow-up questions. Complete the research '
     'and return a concise spoken answer with the actual result. Never stop at a promise to look '
     'something up. Ask for missing locations or dates. If research fails, explain the failure. '
+    'For weather, return only conditions, temperature and any essential warning in one or two '
+    'sentences. Omit hourly lists, repeated location/date, introductions, summaries and follow-up '
+    'offers unless the user explicitly requests a detailed forecast. '
     'Do not run shell commands, modify files, or perform external actions.'
 )
 
@@ -16,6 +19,8 @@ RESEARCH_PROMPT = (
     '\n需要天气、新闻或其他实时信息时，将查询委托给 Codex 后端，取得结果后主动继续播报，'
     '不用等用户再问。过程说明不代表任务完成。沿用同一会话中的城市、日期和查询结果回答追问。'
     '缺少必要信息先询问；查询失败要明确说明，不编造结果。'
+    '\n天气查询默认只播报天气、温度和必要提醒，控制在一到两句。不要逐时罗列，'
+    '不重复城市和日期，不加开场白、总结或追问。用户要求详细预报时再展开。'
 )
 
 DEFAULTS = {
