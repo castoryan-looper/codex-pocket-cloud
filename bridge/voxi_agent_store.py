@@ -146,11 +146,23 @@ class AgentStore:
         return task
 
     def approval(self, ident, request=None):
-        if request is not None:
-            with self.db:
-                self.db.execute('INSERT OR REPLACE INTO approvals VALUES(?,?)', (ident,json.dumps(request,ensure_ascii=False)))
         row = self.db.execute('SELECT request FROM approvals WHERE task_id=?', (ident,)).fetchone()
-        return json.loads(row['request']) if row else None
+        pending = json.loads(row['request']) if row else []
+        if isinstance(pending,dict):pending=[pending]
+        if request is not None:
+            if not any(p.get('id')==request.get('id') for p in pending):pending.append(request)
+            with self.db:
+                self.db.execute('INSERT OR REPLACE INTO approvals VALUES(?,?)', (ident,json.dumps(pending,ensure_ascii=False)))
+        return pending[0] if pending else None
+
+    def pop_approval(self, ident, request_id):
+        row=self.db.execute('SELECT request FROM approvals WHERE task_id=?',(ident,)).fetchone()
+        pending=json.loads(row['request']) if row else []
+        if isinstance(pending,dict):pending=[pending]
+        pending=[p for p in pending if p.get('id')!=request_id]
+        with self.db:
+            if pending:self.db.execute('UPDATE approvals SET request=? WHERE task_id=?',(json.dumps(pending,ensure_ascii=False),ident))
+            else:self.db.execute('DELETE FROM approvals WHERE task_id=?',(ident,))
 
     def public_task(self, task, detail=False):
         fields = ('id','user_id','device_id','channel','state','summary','created','updated')

@@ -198,9 +198,10 @@ class AgentHub:
         if params.get('turnId') and task['turn_id'] and params['turnId']!=task['turn_id']:return
         if 'id' in msg:
             if method in ('item/commandExecution/requestApproval','item/fileChange/requestApproval','item/tool/requestUserInput'):
-                self.store.approval(ident,msg)
-                await self.change(ident,state='needs_input' if method.endswith('requestUserInput') else 'awaiting_approval',
-                                  summary='需要补充信息' if method.endswith('requestUserInput') else '需要确认操作')
+                first=self.store.approval(ident,msg)
+                needs_input=first['method'].endswith('requestUserInput')
+                await self.change(ident,state='needs_input' if needs_input else 'awaiting_approval',
+                                  summary='需要补充信息' if needs_input else '需要确认操作')
             else:
                 await self.rpc.send({'id':msg['id'],'error':{'code':-32601,'message':'Unsupported by Voxi task client'}})
             return
@@ -274,10 +275,12 @@ class AgentHub:
             except Exception:
                 await self.change(ident,state='delivery_unknown',summary='确认决定的送达状态未知，请核对执行器后再操作')
                 return self.store.public_task(self.store.task(ident),True)
-            with self.store.db:self.store.db.execute('DELETE FROM approvals WHERE task_id=?',(ident,))
+            self.store.pop_approval(ident,request['id'])
             task=self.store.task(ident)
             if task['state'] not in TERMINAL:
-                task=await self.change(ident,state='running',summary='已提交决定，正在继续')
+                pending=self.store.approval(ident)
+                state='needs_input' if pending and pending['method'].endswith('requestUserInput') else 'awaiting_approval' if pending else 'running'
+                task=await self.change(ident,state=state,summary='仍有请求需要处理' if pending else '已提交决定，正在继续')
             return self.store.public_task(task,True)
         raise ValueError('不支持的任务操作')
 

@@ -159,6 +159,17 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         follow=await self.hub.action(USER,first['id'],'continue',text='continue',request_id='r2')
         current=await self.running(follow['id'])
         self.assertNotEqual(current['turn_id'],first['turn_id'])
+    async def test_parallel_approval_requests_are_presented_and_resolved_one_at_a_time(self):
+        task,_=self.hub.submit(USER,None,1,'r1','work');task=await self.running(task['id'])
+        for ident in (11,12):
+            await self.hub.notification({'id':ident,'method':'item/fileChange/requestApproval','params':{'threadId':task['thread_id']}})
+        self.assertEqual(self.hub.store.approval(task['id'])['id'],11)
+        first=await self.hub.action(USER,task['id'],'approve')
+        self.assertEqual(first['state'],'awaiting_approval')
+        self.assertEqual(self.hub.store.approval(task['id'])['id'],12)
+        await self.hub.action(USER,task['id'],'decline')
+        self.assertEqual([p['id'] for p in self.hub.rpc.sent],[11,12])
+        self.assertIsNone(self.hub.store.approval(task['id']))
 
 
 class EndpointTests(unittest.IsolatedAsyncioTestCase):
