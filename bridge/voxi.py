@@ -203,6 +203,8 @@ class VoiceSession:
         self.research_watchdog = None
         self.research_result_waiting = False
         self.audio_segment = 0
+        self.agent_radio = None
+        self.agent_request_id = None
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -211,7 +213,24 @@ class VoiceSession:
         return task
 
     async def send(self, packet):
+        if packet.get('type') == 'ready' and self.agent_radio:
+            packet = {**packet, **self.agent_radio.channel_info(self)}
         if not self.ws.closed: await self.ws.send_json(packet)
+
+    async def say_agent(self, text):
+        """Use the existing native speech transport; never feed task text to its tool loop."""
+        if self.ws.closed or not self.rpc:return
+        self.ready=False;self.allow_output=True;self.generation_done=False
+        self.release_at=time.monotonic();self.last_output_at=None
+        await self.send({'type':'busy'})
+        try:
+            await asyncio.wait_for(self.rpc.call('thread/realtime/appendSpeech',{'threadId':self.thread,'text':text[:1200]}),15)
+        except Exception:
+            self.allow_output=False;self.ready=False
+            await self.send({'type':'error','message':'Task state is saved; native speech failed. Reconnect and check task status.'})
+            await self.ws.close()
+            raise
+        self.spawn(self.watch_response(self.turn))
 
     def event(self, packet):
         if self.events and self.events.readyState == 'open':
@@ -291,6 +310,12 @@ class VoiceSession:
         self.answer = asyncio.get_running_loop().create_future()
         self.phase = 'webrtc-sdp'
         prompt = effective_prompt(self.settings, channel)
+        route=self.agent_radio.channel_info(self) if self.agent_radio else {}
+        if route:
+            if route['channelMode']=='fast':
+                prompt=self.settings['systemPrompt']+'\n当前频道：'+route['name']+'。这是快问频道：直接回答，必要时只读查询。需要持久执行或修改数据时，请用户切换 Agent 频道。'
+            else:
+                prompt='你是 Voxi 的任务语音播报入口。按提供的播报文本简洁朗读，不添加任务执行过程，不自行调用工具或声称完成其他工作。'
         if self.memory_store and self.memory_user:
             try:prompt += self.memory_store.context(self.memory_user)
             except Exception:LOG.warning('Voxi memory context unavailable')
@@ -482,6 +507,8 @@ class VoiceSession:
                 self.research_watchdog.cancel()
                 self.research_watchdog = None
             self.turn += 1
+            request_id=event.get('requestId')
+            self.agent_request_id=request_id if isinstance(request_id,str) and 1<=len(request_id)<=128 else self.session_id+':'+str(self.turn)
             self.response_id = None
             self.recording = True
             self.allow_output = self.outputting = False
@@ -501,6 +528,12 @@ class VoiceSession:
             if self.bytes < 4800:
                 self.pending_audio.clear()
                 await self.send({'type': 'idle', 'reason': 'too_short'})
+                return
+            if self.agent_radio and self.agent_radio.channel_info(self).get('channelMode') in ('agent','disabled'):
+                self.ready=False
+                await self.send({'type':'thinking'})
+                pcm=bytes(self.pending_audio);self.pending_audio.clear()
+                self.spawn(self.agent_radio.agent_voice(self,pcm))
                 return
             self.allow_output = True
             self.generation_done = False
@@ -584,6 +617,107 @@ class VoxiRadio:
         self.memory_revision = {}
         self.memory_error = '' if self.memory else '记忆存储无法打开'
         self.memory_model = None
+        self.agent = None
+        if getattr(owner,'runtime',None) and getattr(owner,'config',{}).get('cwd'):
+            from voxi_agent import AgentHub
+            from bridge import Rpc
+            self.agent=AgentHub(owner.runtime,owner.config['cwd'],Rpc)
+            self.agent.context_provider=lambda uid:self.memory.context(uid) if self.memory else ''
+            self.agent.listeners.add(self.agent_event)
+
+    def channel_info(self, session):
+        if not self.agent:return {}
+        cfg=self.agent.store.settings(session.memory_user)
+        if not cfg['enabled']:return {}
+        route=cfg['channels'][session.channel]
+        latest=self.agent.store.list_tasks(session.memory_user,session.channel,1) if session.memory_user else []
+        task=latest[0] if latest else None
+        return {'name':route['name'],'channelMode':route['mode'],'agentTasks':True,
+                'taskId':task['id'] if task else '', 'taskState':task['state'] if task else ''}
+
+    async def agent_event(self, task):
+        for session in tuple(self.active):
+            if session.memory_user==task['user_id'] and session.channel==task['channel'] and not session.ws.closed:
+                await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
+
+    async def agent_voice(self, session, pcm):
+        try:
+            if self.channel_info(session).get('channelMode')=='disabled':
+                await session.say_agent('这个频道尚未启用，请切换到其他频道。');return
+            uid=session.memory_user
+            if not uid or not self.memory or self.memory.owner(session.memory_device)!=uid:
+                await session.say_agent('设备还没有绑定用户，请先在管理后台完成绑定。');return
+            async with self.memory_lock:
+                text=await asyncio.to_thread(self.transcribe_memory,pcm)
+            if not text:
+                await session.say_agent('没有听清任务，请再说一次。');return
+            if self.memory.owner(session.memory_device)!=uid:return
+            # ASR work can finish after a channel change. Never submit its old input.
+            if not self.agent.store.settings(uid)['enabled']:raise ValueError('Agent 未启用')
+            self.memory.record(uid,session.memory_device,session.agent_request_id,text)
+            normalized=text.strip().rstrip('。！？!?')
+            tasks=self.agent.store.list_tasks(uid,session.channel,1)
+            task=tasks[0] if tasks else None
+            if normalized in ('查看进度','查询进度','任务进度','读结果','查看结果','任务结果'):
+                if task:
+                    await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
+                    await session.say_agent(task['summary'][:900])
+                else:await session.say_agent('这个频道还没有任务。')
+                return
+            if normalized in ('取消任务','停止任务'):
+                if not task:await session.say_agent('当前没有任务。');return
+                result=await self.agent.action(uid,task['id'],'cancel')
+                await session.say_agent(result['summary']);return
+            if normalized in ('同意执行','批准操作','拒绝操作') and task and task['state']=='awaiting_approval':
+                # Scope confirmation to the selected channel's actual pending request.
+                await self.agent.action(uid,task['id'],'decline' if normalized=='拒绝操作' else 'approve')
+                await session.say_agent('决定已提交。');return
+            if normalized.startswith('继续任务') and task:
+                result=await self.agent.action(uid,task['id'],'continue',request_id=session.agent_request_id,
+                                               text=normalized[4:].strip('，,：: ') or '继续完成此前尚未完成的任务；先核对已有结果，不重复执行已完成的操作。')
+                await session.send({'type':'task_state','taskId':result['id'],'state':result['state'],'summary':result['summary'][:120]})
+            else:
+                result,_=self.agent.submit(uid,session.memory_device,session.channel,session.agent_request_id,text)
+                await session.send({'type':'task_state','taskId':result['id'],'state':result['state'],'summary':result['summary'][:120]})
+            await session.say_agent('任务已保存，我会在后台处理。可以说查看进度、读结果，或者取消任务。')
+        except asyncio.CancelledError:raise
+        except Exception:
+            await session.say_agent('本次操作未能确认，请在管理后台检查任务状态后再重试。')
+
+    async def agent_configuration(self, request):
+        if request.headers.get('Origin') or not hmac.compare_digest(request.headers.get('Authorization',''),'Bearer '+self.owner.config['device_token']):raise web.HTTPForbidden()
+        if not self.agent:raise web.HTTPServiceUnavailable(text='Agent storage unavailable')
+        if request.method=='GET':
+            return web.json_response(self.agent.snapshot(self.memory),headers={'Cache-Control':'no-store'})
+        try:
+            if request.content_length and request.content_length>131072:raise ValueError('请求过大')
+            raw=await request.read()
+            if len(raw)>131072:raise ValueError('请求过大')
+            body=json.loads(raw)
+            if not isinstance(body,dict):raise ValueError('无效请求')
+            action=body.get('action')
+            if action=='settings':self.agent.store.save_settings(body.get('settings'))
+            elif action=='credential':self.agent.store.save_secret(body.get('provider'),body.get('key'))
+            else:
+                uid=body.get('userId')
+                if not isinstance(uid,str) or not self.memory or not self.memory.user(uid):raise ValueError('用户不存在')
+                if action=='channels':self.agent.store.save_settings(body.get('channels'),uid)
+                elif action=='detail':
+                    task=self.agent.store.task(body.get('taskId'),uid)
+                    if not task:raise ValueError('任务不存在')
+                    return web.json_response({'task':self.agent.store.public_task(task,True)},headers={'Cache-Control':'no-store'})
+                elif action=='submit':
+                    task,_=self.agent.submit(uid,None,body.get('channel'),body.get('requestId'),body.get('text'))
+                    return web.json_response({'task':task},headers={'Cache-Control':'no-store'})
+                elif action in ('cancel','approve','decline','answer','continue'):
+                    task=await self.agent.action(uid,body.get('taskId'),action,text=body.get('text'),request_id=body.get('requestId'),answers=body.get('answers'))
+                    return web.json_response({'task':task},headers={'Cache-Control':'no-store'})
+                else:raise ValueError('不支持的操作')
+        except (ValueError,TypeError,KeyError) as error:
+            return web.json_response({'error':str(error)},status=400,headers={'Cache-Control':'no-store'})
+        except OSError:
+            return web.json_response({'error':'配置未能持久保存，请检查存储权限'},status=500)
+        return web.json_response(self.agent.snapshot(self.memory),headers={'Cache-Control':'no-store'})
 
     def capture_memory(self, session, pcm):
         uid, identifier = session.memory_user, session.memory_device
@@ -675,10 +809,13 @@ class VoxiRadio:
         except Exception:session.memory_user=None;self.memory_error='设备用户绑定失败'
         session.memory_store=self.memory
         session.memory_capture=self.capture_memory
+        session.agent_radio=self
         self.active.add(session) # reserve before the first await; concurrent admission is bounded
         try:
             await ws.prepare(request)
             await session.start()
+            if self.agent and self.agent.store.settings()['enabled']:
+                self.agent.start()
             async for packet in ws:
                 if packet.type == WSMsgType.BINARY: await session.pcm(packet.data)
                 elif packet.type == WSMsgType.TEXT:

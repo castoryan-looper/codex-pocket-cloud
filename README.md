@@ -1,5 +1,7 @@
 # Codex Pocket Cloud
 
+Voxi 新增[后台任务与频道管理](VOXI_AGENT.md)：继续沿用本项目现有 Codex 登录，无需新增 API Key；支持 CH0 快问、CH1 Agent、任务持久化、批准、中断与结果查看。初始不改变已有语音频道，需在 Voxi 管理后台启用。
+
 同机 Voxi 对讲机可通过新增的[原生实时语音入口](VOXI.md)复用现有 Codex 登录，无需新增 API Key；需升级容器并验证账号语音权限。
 
 Waveshare ESP32-C6-ePaper-1.54 的 Wi-Fi 语音控制器与个人云端 Codex 网关。

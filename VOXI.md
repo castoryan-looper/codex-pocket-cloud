@@ -1,5 +1,7 @@
 # Voxi 原生实时语音入口
 
+新增的 [Voxi Agent](VOXI_AGENT.md) 在此语音入口之外维护独立后台任务。启用 Agent 频道后，PTT 音频由本地 Whisper 转写再提交，现有语音入口仅播报接收确认及用户主动查询的摘要；FAST 继续使用下述原生语音路径。
+
 此版本为同一服务器上的 [Voxi](https://github.com/castoryan-looper/Voxi) 提供 `/voxi` WebSocket 入口，使用现有官方 Codex 登录建立独立 WebRTC 语音会话，无需新增 API Key。
 
 入口不加入公网 Caddy 路由，只供共享 Docker 网络 `codex-pocket-radio` 使用，主机不新增公开端口；设备 bearer 鉴权与浏览器 Origin 拒绝在协商前执行。网关在该网络中的别名为 `pocket-backend`，桥接端口为 8789。原设备 /device、控制台、任务和登录卷保持原用途。
