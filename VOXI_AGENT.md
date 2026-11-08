@@ -76,11 +76,11 @@ bash deploy/docker.sh up
 
 `voxi_voices.py` 固定Codex0.163 v3目录、中文及英文脚本、常用音色官方风格概括和部分官方语言方向参考。目录未提供逐音色中文／英文质量认证；无资料的声线不凭空标注性别或音高。
 
-`VoicePreview` v4改为25款×2语言分别生成与持久化。每次启动独立WebRTC VoiceSession，完整固定脚本作为指令，并通过原有Codex RPC thread/realtime/appendSpeech发送，保持与设备播报相同的认证通道与数据通道配置。录制的PCM通过已有本地Whisper自动检测语言并转写，检测语言／概率与去标点空白大小写后的脚本匹配才保存。每段WAV的JSON元数据包含脚本、实际转写、语言、置信度和音频SHA256，读取时再次校验。旧版未校验的样音不复用。ASR严格核对不是音色质量或人工听审认证，可能误拒绝正常发音。
+`VoicePreview` v5改为25款×2语言分别生成与持久化。每次启动独立WebRTC VoiceSession，完整固定脚本作为指令，并通过原有Codex RPC thread/realtime/appendSpeech发送，保持与设备播报相同的认证通道与数据通道配置。录制的PCM通过已有本地Whisper自动检测语言并转写，先核对检测语言和概率，再对内容大意判断。逐字一致直接通过，正常改写通过现有Codex登录进行只读、隔离、结构化判断后通过。每段WAV的JSON元数据包含脚本、实际转写、语言、置信度和音频SHA256，读取时再次校验。旧版未校验的样音不复用。ASR严格核对不是音色质量或人工听审认证，可能误拒绝正常发音。
 
 已有状态卷 `<runtime>/voice-previews/<version>/<voice>-<language>.wav` 保存成功单语录音，两个语言都通过时可合播；只有一个通过时只返回该语言和对应实际转写。最长15秒／语言、生成截止80秒，实时会话名额在ASR前释放。缺失／失败按语言补齐，最多两次瞬时重试；账号、额度、ASR模型缺失或存储问题暂停全库，普通点击不解除暂停。
 
-内网POST /voxi/voice-preview支持status、管理员prepare和describe动作，试听只接受固定voice/language。describe把每款style/useCase原子保存到独立descriptions.json，跨样音版本保留；普通用户不可修改。门户voiceSettings包含说明来源、通过的样音语言和逐语言失败原因。音频正文返回真实录音转写，前端拒绝没有核验标记的旧音频。runtime.voicePreviewVersion=4；Voxi部署检查可显示50段核对进度。
+内网POST /voxi/voice-preview支持status、管理员prepare和describe动作，试听只接受固定voice/language。describe把每款style/useCase原子保存到独立descriptions.json，跨样音版本保留；普通用户不可修改。门户voiceSettings包含说明来源、通过的样音语言和逐语言失败原因。音频正文返回真实录音转写，前端拒绝没有核验标记的旧音频。runtime.voicePreviewVersion=5；Voxi部署检查可显示50段核对进度。
 
 v3生产新增证据：全部50段在phase=ready后报speech-failed，故障早于ASR。v4撤回试听直接发送数据通道context.append及在前端session.update里写instructions的改动；固定脚本指令仍保留在后台start。未知speech-failed、提交失败、控制事件拒绝、上游错误、误分派与媒体错误都会停止整库，日志记录安全类别和阶段而非原始消息。
 
@@ -91,3 +91,5 @@ v3生产新增证据：全部50段在phase=ready后报speech-failed，故障早�
 本版面向当前个人／小范围试用环境。每用户目录和应用层所有者校验不构成互不信任租户之间的执行隔离；Docker externalSandbox 沿用现有个人执行环境，CLI 登录也仍是现有账户。**不能把这一版直接作为面向公众收费、共享个人订阅的多租户服务。**
 
 自有 OpenClaw 的本地/云端 HTTP 接入已实现，原生频道插件、服务安装/自动启动、OpenClaw 托管工作器、商业 API 执行和收费账本仍是后续阶段。连接检测、模拟运行和真实用户 OpenClaw 验收分别核对；不生成虚构的 API 费用。
+
+v5内容标准按用户新确认从逐字一致改为大意相近。实际转写作为音频text/transcript返回，referenceText独立提供。候选录音在大意核对前保存，核对服务失败可复用录音重试；候选不公开为通过样音。voxi_voice_validation.py使用既有VoiceRpc认证，临时read-only线程、禁用shell/web、无个人记忆或Agent任务、60秒截止、结构化布尔与原因；拒绝不合法结果和工具事件。判断与具体文案、转写、策略哈希绑定。Docker镜像显式包含新模块，发布检查版本5。真实本机Codex判定中英改写通过、跑题索取密码拒绝；生产音色仍需Cove两段新探测。

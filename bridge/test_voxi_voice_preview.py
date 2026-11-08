@@ -15,6 +15,7 @@ from voxi import VoxiRadio,VoiceSession,frameless_session_update
 from voxi_config import VoiceSettings,DEFAULTS
 from voxi_voice_preview import Capture,VoicePreview,MAX_SECONDS,PreviewError
 from voxi_voices import VOICES,PREVIEW_TEXT,PREVIEW_SEGMENTS,catalog
+from voxi_voice_validation import POLICY
 from voxi_portal import UserPortal
 
 
@@ -34,6 +35,8 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.radio.voice_preview.session_factory=Session
         async def transcribe(pcm,language):return {'text':PREVIEW_SEGMENTS[language],'language':'zh' if language=='zh-CN' else 'en','probability':.99}
         self.radio.voice_preview.transcriber=transcribe
+        async def reject(expected,actual,language):return {'policy':POLICY,'equivalent':False,'reason':'different-meaning'}
+        self.radio.voice_preview.semantic_checker=reject
         async def preview(request):return await self.radio.voice_preview.handle(request)
         app=web.Application();app.router.add_post('/voxi/voice-preview',preview);app.router.add_post('/voxi/portal',UserPortal(self.radio).handle)
         self.client=TestClient(TestServer(app));await self.client.start_server()
@@ -323,6 +326,33 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             s.preview_problem('media-receive',{})
         self.assertEqual(s.preview_failure_code,'control-rejected')
         self.assertNotIn('secret-fixture-value',' '.join(logs.output));self.assertIn('invalid_event',' '.join(logs.output))
+
+    async def test_semantic_paraphrase_is_published_with_actual_transcript_not_reference_script(self):
+        preview=self.radio.voice_preview
+        actual='Hi there. Hope you are having a lovely day.'
+        async def transcribe(pcm,language):return {'text':actual,'language':'en','probability':.99}
+        async def accept(expected,transcript,language):
+            self.assertEqual(transcript,actual);return {'policy':POLICY,'equivalent':True,'reason':'equivalent'}
+        preview.transcriber=transcribe;preview.semantic_checker=accept
+        result=await preview.render('cove',self.uid,'en')
+        self.assertEqual(result['text'],actual);self.assertEqual(result['transcript'],actual)
+        self.assertEqual(result['referenceText'],PREVIEW_SEGMENTS['en'])
+        self.assertEqual(result['segments'][0]['contentMatch'],'semantic')
+        self.assertEqual(VoicePreview(self.radio).stored('cove')['text'],actual)
+        _,path=preview._paths('cove','en');meta=json.loads(path.read_text(encoding='utf-8'))
+        meta['transcript']='A different claim';path.write_text(json.dumps(meta),encoding='utf-8')
+        self.assertIsNone(VoicePreview(self.radio).stored('cove'))
+
+    async def test_review_outage_preserves_candidate_and_retry_does_not_resynthesize(self):
+        preview=self.radio.voice_preview;actual='Hi there, I wish you a lovely day.'
+        async def transcribe(pcm,language):return {'text':actual,'language':'en','probability':.99}
+        async def unavailable(*args):raise RuntimeError('fixture outage')
+        preview.transcriber=transcribe;preview.semantic_checker=unavailable
+        with self.assertRaisesRegex(PreviewError,'semantic-verification-unavailable'):await preview.render('cove',self.uid,'en')
+        self.assertIsNone(preview.stored('cove'));self.assertIsNotNone(preview._read('cove','en',True))
+        async def accept(*args):return {'policy':POLICY,'equivalent':True,'reason':'equivalent'}
+        preview.semantic_checker=accept;await preview.render('cove',self.uid,'en')
+        self.assertEqual(len(self.created),1);self.assertEqual(preview.stored('cove')['text'],actual)
 
 
 class VoiceConfigurationTests(unittest.TestCase):

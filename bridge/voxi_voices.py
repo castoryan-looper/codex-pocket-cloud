@@ -9,7 +9,7 @@ VOICES=('cove','juniper','maple','spruce','ember','vale','breeze','arbor','sol',
 PREVIEW_SEGMENTS={'zh-CN':'你好，很高兴认识你。祝你今天心情愉快。',
                   'en':'Hello, nice to meet you. Have a wonderful day.'}
 PREVIEW_TEXT=' '.join(PREVIEW_SEGMENTS.values())
-LANGUAGE_NOTE='中文、英文分别生成并转写核对，选项只标注已通过核对的样音语言；这不代表口音与自然度评级。'
+LANGUAGE_NOTE='允许自然寒暄与同义改写；核对录音语言和内容大意，网页显示实际转写。参考文案不要求逐字一致，口音与自然度请试听判断。'
 STYLE_SOURCE='https://help.openai.com/en/articles/20001274-chatgpt-voice'
 # Product help describes these voices, but does not specify gender/pitch.
 STYLES={'cove':('沉稳直接','工作答疑、清晰播报'), 'juniper':('开朗有活力','日常交流、轻松陪伴'),
@@ -34,4 +34,4 @@ def catalog(default='cove', selected=''):
                         'useCase':STYLES.get(v,('',''))[1], 'styleSource':'official-summary' if v in STYLES else 'unreviewed',
                         'sourceUrl':STYLE_SOURCE if v in STYLES or v in LOCALES else '',
                         'languageReference':LOCALES.get(v,''), 'previewLanguages':[], 'languageAssessment':'unrated'} for v in VOICES],
-            'previewText':PREVIEW_TEXT,'previewScripts':PREVIEW_SEGMENTS,'languageNote':LANGUAGE_NOTE,'protocol':'v3','previewVersion':4}
+            'previewText':PREVIEW_TEXT,'previewScripts':PREVIEW_SEGMENTS,'languageNote':LANGUAGE_NOTE,'protocol':'v3','previewVersion':5}

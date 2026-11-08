@@ -26,7 +26,7 @@ COPY bridge/bridge.py bridge/harness.py bridge/goal_flow.py bridge/round_display
 COPY bridge/voxi.py bridge/voxi_config.py bridge/voxi_memory.py bridge/voice_recovery.py /app/bridge/
 COPY bridge/voxi_agent.py bridge/voxi_agent_store.py bridge/voxi_openclaw.py /app/bridge/
 COPY bridge/voxi_portal.py /app/bridge/
-COPY bridge/voxi_voices.py bridge/voxi_voice_preview.py /app/bridge/
+COPY bridge/voxi_voices.py bridge/voxi_voice_preview.py bridge/voxi_voice_validation.py /app/bridge/
 COPY deployment-revision.txt /app/deployment-revision.txt
 COPY deploy/export_connection.py /app/deploy/export_connection.py
 COPY assistant-workspace/AGENTS.md /app/default-AGENTS.md

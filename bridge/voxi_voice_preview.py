@@ -14,11 +14,13 @@ import unicodedata
 import wave
 from aiohttp import web
 from voxi_voices import PREVIEW_TEXT,PREVIEW_SEGMENTS,VOICES,validate_voice
+from voxi_voice_validation import POLICY,check_meaning
 
 MAX_SECONDS=15
-LIBRARY_VERSION=hashlib.sha256(('codex-0.163-v3-rpc-speech-split-asr-exact-v4\n'+PREVIEW_TEXT+'\n'+','.join(VOICES)).encode()).hexdigest()[:16]
+LIBRARY_VERSION=hashlib.sha256(('codex-0.163-v3-rpc-asr-meaning-v5\n'+POLICY+'\n'+PREVIEW_TEXT+'\n'+','.join(VOICES)).encode()).hexdigest()[:16]
 ERRORS={
-    'content-mismatch':'录音转写与试听文案不符，未作为有效样音发布',
+    'content-mismatch':'录音内容与参考文案大意不符，未作为有效样音发布',
+    'semantic-verification-unavailable':'录音已保存，大意核对暂不可用；重试将复用录音重新核对',
     'language-mismatch':'录音识别到的语言不符或无法确认，未作为该语言样音发布',
     'verification-unavailable':'本地语音转写模型未就绪，暂时无法核对样音',
     'verification-failed':'语音识别未能完成，未作为有效样音发布',
@@ -37,7 +39,7 @@ ERRORS={
     'unexpected-delegation':'试听被误分派为任务，已停止批量生成',
     'media-receive':'语音媒体接收异常，已停止批量生成',
 }
-BLOCKING_CODES=frozenset(('verification-unavailable','verification-failed','authentication','rate-limit','storage',
+BLOCKING_CODES=frozenset(('verification-unavailable','verification-failed','semantic-verification-unavailable','authentication','rate-limit','storage',
                          'speech-failed','speech-submit-failed','control-rejected','upstream-error',
                          'unexpected-delegation','media-receive'))
 
@@ -64,6 +66,7 @@ class VoicePreview:
     def __init__(self,radio):
         self.radio=radio;self.busy=False;self.worker=None;self.current=None;self.current_language=None;self.waiting=False
         self.session_factory=None;self.transcriber=None  # Controlled fixtures only.
+        self.semantic_checker=None;self.stage=None
         self.failures={};self.ready=set();self.available={};self.descriptions={}
         self.mode='probe'
         runtime=getattr(radio.owner,'runtime',None)
@@ -84,6 +87,10 @@ class VoicePreview:
 
     @staticmethod
     def key(voice,language):return voice+':'+language
+
+    @staticmethod
+    def meaning_hash(language,expected,actual):
+        return hashlib.sha256(json.dumps([POLICY,language,expected,actual],ensure_ascii=False).encode()).hexdigest()
 
     @staticmethod
     def _description(value):
@@ -109,15 +116,24 @@ class VoicePreview:
         path=self.directory/(voice+'-'+language+'.wav')
         return path,path.with_suffix('.json')
 
-    def _read(self,voice,language):
+    def _read(self,voice,language,allow_candidate=False):
         if not self.directory:return None
         try:
             path,meta_path=self._paths(voice,language);meta=json.loads(meta_path.read_text(encoding='utf-8'));script=PREVIEW_SEGMENTS[language]
             if (not isinstance(meta,dict) or meta.get('voice')!=voice or meta.get('language')!=language
-                    or meta.get('text')!=script or meta.get('verification')!='recorded-asr-exact-v1'
+                    or meta.get('text')!=script or meta.get('verification') not in ('recorded-asr-candidate-v1','recorded-asr-meaning-v1')
                     or meta.get('detectedLanguage')!=('zh' if language=='zh-CN' else 'en')
                     or not isinstance(meta.get('languageProbability'),(int,float)) or not .5<=meta['languageProbability']<=1
-                    or not isinstance(meta.get('transcript'),str) or normalized(meta['transcript'])!=normalized(script)):return None
+                    or not isinstance(meta.get('transcript'),str) or not normalized(meta['transcript']) or len(meta['transcript'])>1200):return None
+            if not allow_candidate:
+                if meta['verification']!='recorded-asr-meaning-v1':return None
+                if meta.get('contentMatch')=='exact':
+                    if normalized(meta['transcript'])!=normalized(script):return None
+                elif meta.get('contentMatch')=='semantic':
+                    review=meta.get('meaningCheck') or {}
+                    if (review.get('policy')!=POLICY or review.get('equivalent') is not True or review.get('reason')!='equivalent'
+                            or review.get('contentHash')!=self.meaning_hash(language,script,meta['transcript'])):return None
+                else:return None
             if not 48044<=path.stat().st_size<=MAX_SECONDS*48000+44:return None
             raw=path.read_bytes()
             if hashlib.sha256(raw).hexdigest()!=meta.get('sha256'):return None
@@ -163,10 +179,12 @@ class VoicePreview:
             if pcm:pcm.extend(bytes(16800))
             with wave.open(io.BytesIO(raw),'rb') as wav:pcm.extend(wav.readframes(wav.getnframes()))
         scripts=[c[1] for _,c in clips]
-        return {'voice':voice,'text':' '.join(c['text'] for c in scripts),'transcript':' '.join(c['transcript'] for c in scripts),
+        return {'voice':voice,'text':' '.join(c['transcript'] for c in scripts),'transcript':' '.join(c['transcript'] for c in scripts),
+                'referenceText':' '.join(c['text'] for c in scripts),
                 'audioFormat':'wav','sampleRate':24000,'audioBase64':base64.b64encode(self._wav(pcm)).decode(),
                 'cached':True,'libraryVersion':LIBRARY_VERSION,'languages':[l for l,_ in clips],
-                'verification':'recorded-asr-exact-v1','segments':[{k:c[k] for k in ('language','text','transcript')} for c in scripts]}
+                'verification':'recorded-asr-meaning-v1','segments':[{'language':c['language'],'text':c['transcript'],
+                    'referenceText':c['text'],'transcript':c['transcript'],'contentMatch':c['contentMatch']} for c in scripts]}
 
     def status(self):
         rows=[]
@@ -175,7 +193,9 @@ class VoicePreview:
             for language in PREVIEW_SEGMENTS:
                 failure=self.failures.get(self.key(voice,language))
                 state='ready' if language in available else 'failed' if failure else 'generating' if (voice,language)==(self.current,self.current_language) else 'pending'
-                samples.append({'language':language,'state':state,**({'error':{'code':failure['code'],'message':ERRORS[failure['code']]},'attempts':failure.get('attempts',1)} if failure else {})})
+                candidate=self._read(voice,language,True) if failure and failure['code'] in ('content-mismatch','semantic-verification-unavailable') else None
+                samples.append({'language':language,'state':state,**({'error':{'code':failure['code'],'message':ERRORS[failure['code']]},'attempts':failure.get('attempts',1)} if failure else {}),
+                    **({'actualText':candidate[1]['transcript'],'referenceText':candidate[1]['text']} if candidate else {})})
             state='ready' if voice in self.ready else 'partial' if available else 'generating' if voice==self.current else 'failed' if any(s['state']=='failed' for s in samples) else 'pending'
             rows.append({'id':voice,'state':state,'languages':list(available),'samples':samples})
         blocked=self.blocked()
@@ -186,7 +206,7 @@ class VoicePreview:
                 'failed':sum(any(s['state']=='failed' for s in r['samples']) for r in rows),
                 'running':bool(self.worker and not self.worker.done()),'current':self.current,'currentLanguage':self.current_language,
                 'waitingForCapacity':self.waiting,'persistent':self.directory is not None,'voices':rows,
-                'blockedReason':ERRORS[blocked] if blocked else '', 'mode':self.mode,
+                'blockedReason':ERRORS[blocked] if blocked else '', 'mode':self.mode,'stage':self.stage,
                 'probe':{'voice':'cove','ready':len(probe_languages),'total':len(PREVIEW_SEGMENTS),
                          'languages':probe_languages,'passed':len(probe_languages)==len(PREVIEW_SEGMENTS)}}
 
@@ -258,6 +278,34 @@ class VoicePreview:
         except asyncio.CancelledError:raise
         except Exception as e:raise PreviewError('verification-failed') from e
 
+    async def _finish(self,voice,language,raw,meta,session=None):
+        # Keep a checked-language candidate before semantic review, so review outages
+        # can be retried without paying for the same synthesis again.
+        path,meta_path=self._paths(voice,language)
+        self._write(path,raw);self._write(meta_path,json.dumps(meta,ensure_ascii=False).encode())
+        exact=normalized(meta['transcript'])==normalized(PREVIEW_SEGMENTS[language])
+        self.stage='meaning'
+        if session:session.phase='verifying-meaning'
+        if exact:decision={'policy':POLICY,'equivalent':True,'reason':'equivalent'}
+        else:
+            try:
+                checker=self.semantic_checker
+                decision=await checker(PREVIEW_SEGMENTS[language],meta['transcript'],language) if checker else await check_meaning(
+                    self.radio.binary,PREVIEW_SEGMENTS[language],meta['transcript'],language)
+                if (not isinstance(decision,dict) or decision.get('policy')!=POLICY
+                        or type(decision.get('equivalent')) is not bool
+                        or decision.get('reason') not in ('equivalent','different-meaning','contradiction','uncertain')
+                        or decision['equivalent']!=(decision['reason']=='equivalent')):raise ValueError('Invalid review')
+            except asyncio.CancelledError:raise
+            except Exception as error:raise PreviewError('semantic-verification-unavailable') from error
+        meta['meaningCheck']={**decision,'contentHash':self.meaning_hash(language,PREVIEW_SEGMENTS[language],meta['transcript'])}
+        if not decision['equivalent']:
+            self._write(meta_path,json.dumps(meta,ensure_ascii=False).encode());raise PreviewError('content-mismatch')
+        meta['verification']='recorded-asr-meaning-v1';meta['contentMatch']='exact' if exact else 'semantic'
+        self._write(meta_path,json.dumps(meta,ensure_ascii=False).encode())
+        self.failures.pop(self.key(voice,language),None);self._scan(voice)
+        return self.stored(voice,language)
+
     async def render(self,voice,owner,language=None):
         voice=validate_voice(voice)
         if language is None:
@@ -270,7 +318,11 @@ class VoicePreview:
         from voxi import VoiceSession
         capture=Capture();session=None
         try:
+            candidate=self._read(voice,language,True)
+            if candidate and not (candidate[1].get('meaningCheck') or {}).get('equivalent') is False:
+                return await self._finish(voice,language,*candidate)
             if not self.transcriber and not (Path(os.environ.get('POCKET_MODEL_DIR','/models/whisper-small'))/'model.bin').exists():raise PreviewError('verification-unavailable')
+            self.stage='speech'
             session=(self.session_factory or VoiceSession)(capture,self.radio.binary)
             session.preview_mode=True;session.preview_text=PREVIEW_SEGMENTS[language];session.preview_language=language
             session.voice_override=voice;session.settings_source=self.radio.settings
@@ -283,28 +335,26 @@ class VoicePreview:
             if not capture.complete or len(capture.pcm)<48000:raise PreviewError('incomplete-audio')
             await session.stop();self.radio.active.discard(session)
             session.phase='verifying-audio'
+            self.stage='language'
             recognition=await self._transcribe(bytes(capture.pcm),language)
             if not isinstance(recognition,dict):raise PreviewError('verification-failed')
             if recognition.get('language')!=('zh' if language=='zh-CN' else 'en') or not isinstance(recognition.get('probability'),(int,float)) or not .5<=recognition['probability']<=1:raise PreviewError('language-mismatch')
             transcript=recognition.get('text')
-            if not isinstance(transcript,str) or normalized(transcript)!=normalized(PREVIEW_SEGMENTS[language]):raise PreviewError('content-mismatch')
+            if not isinstance(transcript,str) or not normalized(transcript) or len(transcript)>1200:raise PreviewError('content-mismatch')
             raw=self._wav(capture.pcm)
             meta={'voice':voice,'language':language,'text':PREVIEW_SEGMENTS[language],'transcript':transcript,
-                  'verification':'recorded-asr-exact-v1','detectedLanguage':recognition['language'],
+                  'verification':'recorded-asr-candidate-v1','detectedLanguage':recognition['language'],
                   'languageProbability':recognition['probability'],'sha256':hashlib.sha256(raw).hexdigest()}
-            if self.directory:
-                path,meta_path=self._paths(voice,language);self._write(path,raw);self._write(meta_path,json.dumps(meta,ensure_ascii=False).encode())
-            self.failures.pop(self.key(voice,language),None);self._scan(voice)
-            return self.stored(voice,language)
+            return await self._finish(voice,language,raw,meta,session)
         except asyncio.CancelledError:raise
         except Exception as e:
             code=self.failure_code(e,session,capture)
-            logging.getLogger('pocket.voxi').warning('Voxi preview failed voice=%s language=%s phase=%s reason=%s errorType=%s',voice,language,getattr(session,'phase','unknown'),code,type(e).__name__)
+            logging.getLogger('pocket.voxi').warning('Voxi preview failed voice=%s language=%s phase=%s reason=%s errorType=%s',voice,language,getattr(session,'phase',self.stage or 'unknown'),code,type(e).__name__)
             raise PreviewError(code) from e
         finally:
             if session:
                 with contextlib.suppress(Exception):await session.stop()
-            self.radio.active.discard(session);self.busy=False
+            self.radio.active.discard(session);self.busy=False;self.stage=None
 
     async def handle(self,request):
         r=self.radio
