@@ -212,6 +212,7 @@ class VoiceSession:
         self.preview_text=''
         self.preview_language=''
         self.preview_error_reason=''
+        self.preview_failure_code=None
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -230,19 +231,32 @@ class VoiceSession:
         self.ready=False;self.allow_output=True;self.generation_done=False
         self.release_at=time.monotonic();self.last_output_at=None
         await self.send({'type':'busy'})
+        if self.preview_mode:self.phase='speech-submit'
         try:
-            if self.preview_mode:
-                # A fixed script, no [BACKEND] wrapper or mixed-language context.
-                if not self.events or self.events.readyState!='open':raise RuntimeError('Preview data channel unavailable')
-                self.event({'type':'session.context.append','channel':'speakable','content':[{'type':'input_text','text':text}]})
-            else:
-                await asyncio.wait_for(self.rpc.call('thread/realtime/appendSpeech',{'threadId':self.thread,'text':text[:1200]}),15)
-        except Exception:
+            # Keep preview and device speech on the authenticated Codex RPC path.
+            # A frontend data channel is not interchangeable with this backend writer.
+            await asyncio.wait_for(self.rpc.call('thread/realtime/appendSpeech',{'threadId':self.thread,'text':text[:1200]}),15)
+        except Exception as error:
+            if self.preview_mode:self.preview_problem('speech-submit-failed',getattr(error,'reason',''))
             self.allow_output=False;self.ready=False
-            await self.send({'type':'error','message':'Task state is saved; native speech failed. Reconnect and check task status.'})
+            await self.send({'type':'error','message':'试听播报提交失败，未修改设置。' if self.preview_mode else 'Task state is saved; native speech failed. Reconnect and check task status.'})
             await self.ws.close()
             raise
+        if self.preview_mode:self.phase='speech-await-audio'
         self.spawn(self.watch_response(self.turn))
+
+    def preview_problem(self,category,detail):
+        reason=diagnostic_reason(detail)
+        if self.preview_failure_code is None:
+            self.preview_failure_code=category
+            self.preview_error_reason=reason
+        # Only categories and explicitly known codes; never print upstream messages.
+        value=detail.get('code') if isinstance(detail,dict) else None
+        known={'invalid_request_error','invalid_event','unsupported_event','permission_denied',
+               'unauthorized','invalid_parameters','voice_not_found','rate_limit_exceeded','server_error'}
+        code=value if isinstance(value,int) or isinstance(value,str) and value in known else 'other'
+        LOG.warning('Native voice preview failure sessionId=%s phase=%s category=%s upstreamCode=%s reason=%s',
+                    self.session_id,self.phase,category,code,reason)
 
     def event(self, packet):
         if self.events and self.events.readyState == 'open':
@@ -272,7 +286,7 @@ class VoiceSession:
                 self.spawn(self.rpc.call('thread/realtime/appendSpeech', {
                     'threadId': self.thread, 'text': '这次查询没有完成，请稍后重试。'}))
         elif method in ('thread/realtime/error', 'thread/realtime/closed'):
-            if self.preview_mode:self.preview_error_reason=diagnostic_reason(params.get('error',params.get('message',params.get('reason',''))))
+            if self.preview_mode:self.preview_problem('upstream-error',params.get('error',params.get('message',params.get('reason',''))))
             LOG.warning('Native voice upstream %s reason=%s',method,diagnostic_reason(params.get('error',params.get('message',params.get('reason','')))))
             if self.answer and not self.answer.done():
                 self.answer.set_exception(VoiceFailure('notification', params.get('code'), params.get('error', params.get('message', params.get('reason', '')))))
@@ -306,9 +320,7 @@ class VoiceSession:
         def opened():
             # Only configure fields defined by the Frameless Bidi protocol.
             # Audio is buffered until PTT release; do not disable server VAD.
-            update=frameless_session_update(self.voice)
-            if self.preview_mode:update['session']['instructions']=self.preview_instructions()
-            self.event(update)
+            self.event(frameless_session_update(self.voice))
         @self.events.on('message')
         def message(raw):
             try: packet = json.loads(raw)
@@ -392,13 +404,15 @@ class VoiceSession:
                 await self.end_audio()
         elif kind == 'response.done' and event.get('response', {}).get('id') == self.response_id:
             if event.get('response', {}).get('status') in ('failed', 'incomplete'):
+                if self.preview_mode:self.preview_problem('incomplete-audio',event.get('response',{}).get('error',{}))
                 await self.send({'type': 'error', 'message': 'Codex native voice response failed or was incomplete'})
                 await self.ws.close()
                 return
             self.generation_done = True
         elif kind == 'error':
-            if event.get('error', {}).get('code') in ('response_cancel_not_active', 'input_audio_buffer_commit_empty'): return
-            if self.preview_mode:self.preview_error_reason=diagnostic_reason(event.get('error',{}))
+            detail=event.get('error') if isinstance(event.get('error'),dict) else event
+            if detail.get('code') in ('response_cancel_not_active', 'input_audio_buffer_commit_empty'): return
+            if self.preview_mode:self.preview_problem('control-rejected',detail)
             await self.send({'type': 'error', 'message': 'Codex voice rejected an audio/control event'})
             await self.ws.close()
 
@@ -411,6 +425,7 @@ class VoiceSession:
 
     async def begin_research(self):
         if self.preview_mode:
+            self.preview_problem('unexpected-delegation',{})
             await self.send({'type':'error','message':'Voice preview cannot execute research or tasks'})
             await self.ws.close()
             return
@@ -436,6 +451,7 @@ class VoiceSession:
             await self.ws.close()
 
     async def end_audio(self):
+        if self.preview_mode:self.phase='audio-complete'
         self.outputting = False
         self.allow_output = self.research_pending
         self.generation_done = False
@@ -449,6 +465,7 @@ class VoiceSession:
 
     async def begin_audio(self):
         if self.outputting: return
+        if self.preview_mode:self.phase='capturing-audio'
         self.audio_segment += 1
         self.research_result_waiting = False
         self.outputting = True
@@ -522,6 +539,7 @@ class VoiceSession:
             state = self.peer.connectionState if self.peer else 'none'
             LOG.warning('Native voice audio receive failed (%s) peer=%s outputting=%s generation_done=%s',
                         type(error).__name__, state, self.outputting, self.generation_done)
+            if self.preview_mode:self.preview_problem('media-receive',{})
             if not self.ws.closed:
                 await self.send({'type': 'error', 'message': f'WebRTC audio receive failed ({type(error).__name__}; peer={state})'})
                 await self.ws.close()
@@ -594,6 +612,7 @@ class VoiceSession:
             deadline = first_deadline if self.last_output_at is None else self.last_output_at + stall
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if self.preview_mode:self.preview_problem('timeout',{})
                 LOG.warning('Native voice timeout sessionId=%s turn=%s phase=response_idle seconds=%s',
                             self.session_id, self.turn, stall)
                 await self.send({'type': 'error', 'message': f'Codex voice response stalled for {stall} seconds'})

@@ -126,6 +126,8 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
                 await voice.start()
                 self.assertEqual(next(p for m,p in calls if m=='thread/realtime/start')['voice'],'maple')
                 self.assertEqual(next(p for m,p in calls if m=='thread/start')['config']['web_search'],'disabled')
+                events=[];voice.event=events.append;voice.events.emit('open')
+                self.assertEqual(events,[frameless_session_update('maple')])
         finally:await voice.stop()
 
     async def test_preview_rejects_unexpected_tool_delegation(self):
@@ -170,7 +172,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_playback_is_immediate_and_worker_waits_for_capacity(self):
         preview=self.radio.voice_preview;self.radio.active={1,2}
         r,data=await self.call({'voice':'cove'});self.assertEqual(r.status,409)
-        self.assertIn('后台准备',data['error']);await asyncio.sleep(.02)
+        self.assertIn('验证 Cove',data['error']);await asyncio.sleep(.02)
         self.assertEqual(self.created,[]);self.assertTrue(preview.status()['waitingForCapacity'])
         r,data=await self.call({'action':'status','actorUserId':self.uid});self.assertEqual(r.status,200)
         self.assertEqual(data['total'],25)
@@ -275,15 +277,52 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         await preview.render('cove',self.uid,'en')
         self.assertEqual(len(self.created),count+1);self.assertIn('cove',preview.ready)
 
-    async def test_preview_uses_speakable_data_channel_and_script_prompt_without_backend_wrapper(self):
+    async def test_preview_uses_the_same_authenticated_speech_rpc_as_device_audio(self):
         c=Capture();s=VoiceSession(c,'unused');s.preview_mode=True;s.preview_language='en';s.preview_text=PREVIEW_SEGMENTS['en']
-        s.rpc=SimpleNamespace();sent=[]
+        s.thread='preview-thread';s.rpc=SimpleNamespace(call=AsyncMock(return_value={}));sent=[]
         s.events=SimpleNamespace(readyState='open',send=lambda raw:sent.append(json.loads(raw)))
         s.spawn=lambda coro:coro.close()
         await s.say_agent(s.preview_text)
-        self.assertEqual(sent,[{'type':'session.context.append','channel':'speakable','content':[{'type':'input_text','text':s.preview_text}]}])
+        s.rpc.call.assert_awaited_once_with('thread/realtime/appendSpeech',{'threadId':'preview-thread','text':s.preview_text})
+        self.assertEqual(sent,[]);self.assertEqual(s.phase,'speech-await-audio')
         self.assertIn(s.preview_text,s.preview_instructions());self.assertIn('English',s.preview_instructions())
-        self.assertNotIn('[BACKEND]',str(sent))
+        s.preview_mode=False;await s.say_agent(s.preview_text);self.assertEqual(s.rpc.call.await_count,2)
+
+    async def test_probe_generates_only_two_cove_clips_and_full_generation_requires_probe(self):
+        preview=self.radio.voice_preview
+        r,_=await self.call({'action':'prepare'});self.assertEqual(r.status,409)
+        r,_=await self.call({'action':'probe','actorUserId':self.uid});self.assertEqual(r.status,400)
+        r,_=await self.call({'action':'probe'});self.assertEqual(r.status,200)
+        await preview.worker
+        self.assertEqual(len(self.created),2);self.assertTrue(all(s.voice_override=='cove' for s in self.created))
+        self.assertEqual(preview.status()['probe']['ready'],2);self.assertTrue(preview.status()['probe']['passed'])
+        self.assertEqual(preview.status()['samplesReady'],2)
+
+    async def test_common_protocol_failure_stops_after_first_sample_instead_of_fifty(self):
+        preview=self.radio.voice_preview
+        class Rejected(preview.session_factory):
+            async def say_agent(self,text):
+                self.preview_failure_code='control-rejected';await self.ws.send_json({'type':'error'})
+        preview.session_factory=Rejected;preview.start();await preview.worker
+        self.assertEqual(len(self.created),1);self.assertEqual(preview.blocked(),'control-rejected')
+        preview.start();self.assertEqual(len(self.created),1)
+        self.assertEqual(preview.status()['samplesReady'],0)
+        self.assertEqual(preview.failures['cove:zh-CN']['code'],'control-rejected')
+
+    async def test_probe_script_failure_also_prevents_fanout_even_without_global_error(self):
+        preview=self.radio.voice_preview
+        async def wrong(pcm,language):return {'text':'different' if language=='zh-CN' else PREVIEW_SEGMENTS[language],'language':'zh' if language=='zh-CN' else 'en','probability':.99}
+        preview.transcriber=wrong;preview.start();await preview.worker
+        self.assertEqual(len(self.created),3);self.assertTrue(all(s.voice_override=='cove' for s in self.created))
+        self.assertFalse(preview.status()['probe']['passed']);self.assertEqual(preview.status()['probe']['ready'],1)
+
+    async def test_control_error_preserves_safe_category_and_first_cause(self):
+        s=VoiceSession(Capture(),'unused');s.preview_mode=True
+        with self.assertLogs('pocket.voxi',level='WARNING') as logs:
+            await s.on_event({'type':'error','error':{'code':'invalid_event','message':'private credential is secret-fixture-value'}})
+            s.preview_problem('media-receive',{})
+        self.assertEqual(s.preview_failure_code,'control-rejected')
+        self.assertNotIn('secret-fixture-value',' '.join(logs.output));self.assertIn('invalid_event',' '.join(logs.output))
 
 
 class VoiceConfigurationTests(unittest.TestCase):

@@ -34,4 +34,4 @@ def catalog(default='cove', selected=''):
                         'useCase':STYLES.get(v,('',''))[1], 'styleSource':'official-summary' if v in STYLES else 'unreviewed',
                         'sourceUrl':STYLE_SOURCE if v in STYLES or v in LOCALES else '',
                         'languageReference':LOCALES.get(v,''), 'previewLanguages':[], 'languageAssessment':'unrated'} for v in VOICES],
-            'previewText':PREVIEW_TEXT,'previewScripts':PREVIEW_SEGMENTS,'languageNote':LANGUAGE_NOTE,'protocol':'v3','previewVersion':3}
+            'previewText':PREVIEW_TEXT,'previewScripts':PREVIEW_SEGMENTS,'languageNote':LANGUAGE_NOTE,'protocol':'v3','previewVersion':4}

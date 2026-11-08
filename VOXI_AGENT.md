@@ -76,13 +76,15 @@ bash deploy/docker.sh up
 
 `voxi_voices.py` 固定Codex0.163 v3目录、中文及英文脚本、常用音色官方风格概括和部分官方语言方向参考。目录未提供逐音色中文／英文质量认证；无资料的声线不凭空标注性别或音高。
 
-`VoicePreview` v3改为25款×2语言分别生成与持久化。每次启动独立WebRTC VoiceSession，完整固定脚本作为指令，并通过speakable session.context.append发送，不经过BACKEND包装。录制的PCM通过已有本地Whisper自动检测语言并转写，检测语言／概率与去标点空白大小写后的脚本匹配才保存。每段WAV的JSON元数据包含脚本、实际转写、语言、置信度和音频SHA256，读取时再次校验。旧版未校验的样音不复用。ASR严格核对不是音色质量或人工听审认证，可能误拒绝正常发音。
+`VoicePreview` v4改为25款×2语言分别生成与持久化。每次启动独立WebRTC VoiceSession，完整固定脚本作为指令，并通过原有Codex RPC thread/realtime/appendSpeech发送，保持与设备播报相同的认证通道与数据通道配置。录制的PCM通过已有本地Whisper自动检测语言并转写，检测语言／概率与去标点空白大小写后的脚本匹配才保存。每段WAV的JSON元数据包含脚本、实际转写、语言、置信度和音频SHA256，读取时再次校验。旧版未校验的样音不复用。ASR严格核对不是音色质量或人工听审认证，可能误拒绝正常发音。
 
 已有状态卷 `<runtime>/voice-previews/<version>/<voice>-<language>.wav` 保存成功单语录音，两个语言都通过时可合播；只有一个通过时只返回该语言和对应实际转写。最长15秒／语言、生成截止80秒，实时会话名额在ASR前释放。缺失／失败按语言补齐，最多两次瞬时重试；账号、额度、ASR模型缺失或存储问题暂停全库，普通点击不解除暂停。
 
-内网POST /voxi/voice-preview支持status、管理员prepare和describe动作，试听只接受固定voice/language。describe把每款style/useCase原子保存到独立descriptions.json，跨样音版本保留；普通用户不可修改。门户voiceSettings包含说明来源、通过的样音语言和逐语言失败原因。音频正文返回真实录音转写，前端拒绝没有核验标记的旧音频。runtime.voicePreviewVersion=3；Voxi部署检查可显示50段核对进度。
+内网POST /voxi/voice-preview支持status、管理员prepare和describe动作，试听只接受固定voice/language。describe把每款style/useCase原子保存到独立descriptions.json，跨样音版本保留；普通用户不可修改。门户voiceSettings包含说明来源、通过的样音语言和逐语言失败原因。音频正文返回真实录音转写，前端拒绝没有核验标记的旧音频。runtime.voicePreviewVersion=4；Voxi部署检查可显示50段核对进度。
 
-用户旧日志只证明Cove/Himari就绪后失败，无法据此确定音色不受支持；新版日志增加language和安全reason代码，以区别超长、超时、漏读、语言错误和额度等问题。模拟PCM／识别结果的自动及Chrome验收与生产真实声音听审分开，部署后仍需收听确认。详见Voxi docs/VOICE-PREVIEW.md。
+v3生产新增证据：全部50段在phase=ready后报speech-failed，故障早于ASR。v4撤回试听直接发送数据通道context.append及在前端session.update里写instructions的改动；固定脚本指令仍保留在后台start。未知speech-failed、提交失败、控制事件拒绝、上游错误、误分派与媒体错误都会停止整库，日志记录安全类别和阶段而非原始消息。
+
+启动只执行Cove中文／英文两段探测，成功后才允许管理员prepare全库。probe动作用于单独重试Cove；普通用户不可发起probe或prepare。status含probe.ready/total/passed与mode，Voxi deploy/probe-voice.sh通过现有内网代理请求两段并轮询诊断。未取得生产真实probe结果前，不能把模拟PCM测试通过等同于真实语音链路通过。详见Voxi docs/VOICE-PREVIEW.md。
 
 ## 运行环境限制
 

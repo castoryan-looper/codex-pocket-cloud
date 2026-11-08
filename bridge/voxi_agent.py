@@ -309,6 +309,6 @@ class AgentHub:
                 'tasks':[self.store.public_task(t) for t in tasks], 'credentials':self.store.credentials(),
                 'runtime':{'engine':'codex-pocket-cloud','ready':self.rpc is not None,'lastError':self.runtime_error,
                            'credentialMode':'existing-codex-login','providerKeysActive':False,
-                           'deployment':'personal-pilot','externalOpenClaw':'responses-https-or-relay','userPortalVersion':1,'voicePreviewVersion':3},
+                           'deployment':'personal-pilot','externalOpenClaw':'responses-https-or-relay','userPortalVersion':1,'voicePreviewVersion':4},
                 'usage':{'tasks':len(tasks),'live':sum(t['state'] in LIVE for t in tasks),
                          'note':'记录实际报告的 token；不将 Codex 订阅额度换算为 API 账单'}}

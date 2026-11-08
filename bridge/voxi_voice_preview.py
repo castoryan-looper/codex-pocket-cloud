@@ -16,7 +16,7 @@ from aiohttp import web
 from voxi_voices import PREVIEW_TEXT,PREVIEW_SEGMENTS,VOICES,validate_voice
 
 MAX_SECONDS=15
-LIBRARY_VERSION=hashlib.sha256(('codex-0.163-v3-split-asr-auto-language-exact-v3\n'+PREVIEW_TEXT+'\n'+','.join(VOICES)).encode()).hexdigest()[:16]
+LIBRARY_VERSION=hashlib.sha256(('codex-0.163-v3-rpc-speech-split-asr-exact-v4\n'+PREVIEW_TEXT+'\n'+','.join(VOICES)).encode()).hexdigest()[:16]
 ERRORS={
     'content-mismatch':'录音转写与试听文案不符，未作为有效样音发布',
     'language-mismatch':'录音识别到的语言不符或无法确认，未作为该语言样音发布',
@@ -31,7 +31,15 @@ ERRORS={
     'network':'语音传输失败，请稍后重试',
     'storage':'样音存储失败，请检查持久卷',
     'speech-failed':'语音生成失败，尚未取得可核对的完整录音',
+    'speech-submit-failed':'Codex 播报请求提交失败，已停止批量生成',
+    'control-rejected':'语音服务拒绝了控制事件，已停止批量生成',
+    'upstream-error':'上游语音会话异常关闭，已停止批量生成',
+    'unexpected-delegation':'试听被误分派为任务，已停止批量生成',
+    'media-receive':'语音媒体接收异常，已停止批量生成',
 }
+BLOCKING_CODES=frozenset(('verification-unavailable','verification-failed','authentication','rate-limit','storage',
+                         'speech-failed','speech-submit-failed','control-rejected','upstream-error',
+                         'unexpected-delegation','media-receive'))
 
 class PreviewError(RuntimeError):
     def __init__(self,code):self.code=code;super().__init__(code)
@@ -57,6 +65,7 @@ class VoicePreview:
         self.radio=radio;self.busy=False;self.worker=None;self.current=None;self.current_language=None;self.waiting=False
         self.session_factory=None;self.transcriber=None  # Controlled fixtures only.
         self.failures={};self.ready=set();self.available={};self.descriptions={}
+        self.mode='probe'
         runtime=getattr(radio.owner,'runtime',None)
         self.root=Path(runtime)/'voice-previews' if runtime else None
         self.directory=self.root/LIBRARY_VERSION if self.root else None
@@ -170,22 +179,29 @@ class VoicePreview:
             state='ready' if voice in self.ready else 'partial' if available else 'generating' if voice==self.current else 'failed' if any(s['state']=='failed' for s in samples) else 'pending'
             rows.append({'id':voice,'state':state,'languages':list(available),'samples':samples})
         blocked=self.blocked()
+        probe_languages=list(self.available.get('cove',()))
         return {'version':LIBRARY_VERSION,'previewText':PREVIEW_TEXT,'previewScripts':PREVIEW_SEGMENTS,'total':len(VOICES),
                 'ready':len(self.ready),'partial':sum(r['state']=='partial' for r in rows),
                 'samplesReady':sum(len(r['languages']) for r in rows),'samplesTotal':len(VOICES)*len(PREVIEW_SEGMENTS),
                 'failed':sum(any(s['state']=='failed' for s in r['samples']) for r in rows),
                 'running':bool(self.worker and not self.worker.done()),'current':self.current,'currentLanguage':self.current_language,
                 'waitingForCapacity':self.waiting,'persistent':self.directory is not None,'voices':rows,
-                'blockedReason':ERRORS[blocked] if blocked else ''}
+                'blockedReason':ERRORS[blocked] if blocked else '', 'mode':self.mode,
+                'probe':{'voice':'cove','ready':len(probe_languages),'total':len(PREVIEW_SEGMENTS),
+                         'languages':probe_languages,'passed':len(probe_languages)==len(PREVIEW_SEGMENTS)}}
 
     def blocked(self):
-        return next((f['code'] for f in self.failures.values() if f['code'] in ('verification-unavailable','authentication','rate-limit','storage')),None)
+        return next((f['code'] for f in self.failures.values() if f['code'] in BLOCKING_CODES),None)
 
-    def start(self,retry=False):
+    def start(self,retry=False,probe_only=False):
         if not self.directory or (self.worker and not self.worker.done()):return
         if not retry and self.blocked():return
-        if retry:self.failures.clear();self._save_failures()
-        self.worker=asyncio.create_task(self._prepare())
+        if retry:
+            if probe_only:self.failures={k:v for k,v in self.failures.items() if not k.startswith('cove:')}
+            else:self.failures.clear()
+            self._save_failures()
+        self.mode='probe' if probe_only else 'all'
+        self.worker=asyncio.create_task(self._prepare(probe_only))
 
     async def close(self):
         if self.worker and not self.worker.done():self.worker.cancel();await asyncio.gather(self.worker,return_exceptions=True)
@@ -200,11 +216,16 @@ class VoicePreview:
         reason=getattr(error,'reason','') or getattr(session,'preview_error_reason','')
         for label,code in [('authentication','authentication'),('rate-limit','rate-limit'),('access-denied','unsupported'),('unsupported','unsupported'),('invalid-parameters','unsupported'),('timeout','timeout'),('network','network')]:
             if label in reason:return code
+        code=getattr(session,'preview_failure_code',None)
+        if code in ERRORS:return code
         return 'speech-failed'
 
-    async def _prepare(self):
+    async def _prepare(self,probe_only=False):
         try:
-            for voice in dict.fromkeys((self.radio.settings.snapshot()['voice'],*VOICES)):
+            voices=('cove',) if probe_only else tuple(dict.fromkeys(('cove',self.radio.settings.snapshot()['voice'],*VOICES)))
+            for voice in voices:
+                # Never fan a broken common path out to all 50 samples.
+                if voice!='cove' and 'cove' not in self.ready:return
                 for language in PREVIEW_SEGMENTS:
                     key=self.key(voice,language)
                     if self._read(voice,language) or key in self.failures:continue
@@ -218,7 +239,7 @@ class VoicePreview:
                         except asyncio.CancelledError:raise
                         except Exception as error:
                             attempt+=1;code=self.failure_code(error)
-                            if code in ('verification-unavailable','authentication','rate-limit','storage'):
+                            if code in BLOCKING_CODES:
                                 self.failures[key]={'code':code,'attempts':attempt};self._save_failures();return
                             if attempt<2 and code in ('timeout','network','incomplete-audio','content-mismatch','language-mismatch','speech-failed'):
                                 await asyncio.sleep(1);continue
@@ -261,6 +282,7 @@ class VoicePreview:
             if capture.error:raise PreviewError(self.failure_code(RuntimeError(),session))
             if not capture.complete or len(capture.pcm)<48000:raise PreviewError('incomplete-audio')
             await session.stop();self.radio.active.discard(session)
+            session.phase='verifying-audio'
             recognition=await self._transcribe(bytes(capture.pcm),language)
             if not isinstance(recognition,dict):raise PreviewError('verification-failed')
             if recognition.get('language')!=('zh' if language=='zh-CN' else 'en') or not isinstance(recognition.get('probability'),(int,float)) or not .5<=recognition['probability']<=1:raise PreviewError('language-mismatch')
@@ -297,10 +319,12 @@ class VoicePreview:
             if owner!='admin' and (not isinstance(owner,str) or not re.fullmatch(r'[a-f0-9]{32}',owner) or not r.memory or not r.memory.user(owner)):raise ValueError('用户档案无效')
             action=body.get('action')
             if action:
-                if action in ('status','prepare') and not set(body)-{'action','actorUserId'}:
-                    if action=='prepare':
+                if action in ('status','prepare','probe') and not set(body)-{'action','actorUserId'}:
+                    if action in ('prepare','probe'):
                         if owner!='admin':raise ValueError('不能执行此项音频库操作')
-                        self.start(retry=True)
+                        if action=='prepare' and 'cove' not in self.ready:
+                            return response(409,{'error':'请先完成 Cove 中英文两段验证，再开始全库生成。'})
+                        self.start(retry=True,probe_only=action=='probe')
                     return response(200,self.status())
                 if action=='describe' and owner=='admin' and set(body)<={'action','actorUserId','voice','style','useCase'}:
                     self.describe(body.get('voice'),{'style':body.get('style'),'useCase':body.get('useCase')})
@@ -315,7 +339,10 @@ class VoicePreview:
             failure=next((self.failures.get(self.key(voice,l)) for l in ([language] if language else PREVIEW_SEGMENTS) if self.key(voice,l) in self.failures),None)
             if failure:return response(409,{'error':ERRORS[failure['code']]+'。可由管理员重试。','code':failure['code']})
             if self.blocked():return response(409,{'error':'样音准备已暂停：'+ERRORS[self.blocked()]+'。请管理员处理后重试。','code':self.blocked()})
-            self.start();return response(409,{'error':'样音正在后台准备和核对，稍后再试听；不会播放未核对或旧版本的录音。'})
+            if 'cove' not in self.ready:
+                self.start(probe_only=True)
+                return response(409,{'error':'正在先验证 Cove 两段样音；通过后由管理员启动全库生成，不会播放未经核对的录音。'})
+            return response(409,{'error':'这款音色的样音尚未准备，请管理员启动全库生成。'})
         except (ValueError,TypeError):return response(400,{'error':'音色、语言或试听请求无效'})
         except asyncio.CancelledError:raise
         except Exception:return response(502,{'error':'样音库暂不可用，请检查持久存储；未修改音色设置。'})
