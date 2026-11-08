@@ -18,8 +18,7 @@ class UserPortal:
         return {**r.memory.owned_snapshot(uid),'role':'user','serviceEnabled':cfg['enabled'],
                 'channels':cfg['channels'],'inheritsChannels':uid not in hub.store.channel_overrides(),
                 'preferences':hub.store.preferences(uid),'connections':hub.openclaw.public(uid),
-                'voiceSettings':{**catalog(r.settings.snapshot()['voice'],hub.store.preferences(uid)['voice']),
-                                 'library':r.voice_preview.status()},
+                'voiceSettings':r.voice_preview.enrich(catalog(r.settings.snapshot()['voice'],hub.store.preferences(uid)['voice'])),
                 'tasks':[hub.store.public_task(t) for t in hub.store.list_tasks(uid)],
                 'capabilities':{'openclaw':True,'userPortal':1}}
 

@@ -13,8 +13,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient,TestServer
 from voxi import VoxiRadio,VoiceSession,frameless_session_update
 from voxi_config import VoiceSettings,DEFAULTS
-from voxi_voice_preview import Capture,VoicePreview,MAX_SECONDS
-from voxi_voices import VOICES,PREVIEW_TEXT
+from voxi_voice_preview import Capture,VoicePreview,MAX_SECONDS,PreviewError
+from voxi_voices import VOICES,PREVIEW_TEXT,PREVIEW_SEGMENTS,catalog
 from voxi_portal import UserPortal
 
 
@@ -28,10 +28,12 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             async def start(self):pass
             async def say_agent(self,text):
                 self.text=text
-                await self.ws.send_bytes(b'\x10\x00'*2400)
+                await self.ws.send_bytes(b'\x10\x00'*24000)
                 await self.ws.send_json({'type':'audio_end'})
             async def stop(self):self.stopped=True
         self.radio.voice_preview.session_factory=Session
+        async def transcribe(pcm,language):return {'text':PREVIEW_SEGMENTS[language],'language':'zh' if language=='zh-CN' else 'en','probability':.99}
+        self.radio.voice_preview.transcriber=transcribe
         async def preview(request):return await self.radio.voice_preview.handle(request)
         app=web.Application();app.router.add_post('/voxi/voice-preview',preview);app.router.add_post('/voxi/portal',UserPortal(self.radio).handle)
         self.client=TestClient(TestServer(app));await self.client.start_server()
@@ -46,12 +48,12 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         await self.radio.voice_preview.render('ember',self.uid)
         r,data=await self.call({'voice':'ember','actorUserId':self.uid});self.assertEqual(r.status,200)
         session=self.created[0];self.assertEqual(session.voice_override,'ember');self.assertTrue(session.preview_mode);self.assertTrue(session.stopped)
-        self.assertEqual(session.text,PREVIEW_TEXT);self.assertEqual(data['voice'],'ember')
+        self.assertEqual(session.text,PREVIEW_SEGMENTS['zh-CN']);self.assertEqual(data['voice'],'ember')
         with wave.open(io.BytesIO(base64.b64decode(data['audioBase64'])),'rb') as wav:
-            self.assertEqual(wav.getframerate(),24000);self.assertEqual(wav.getnchannels(),1);self.assertEqual(wav.getnframes(),2400)
+            self.assertEqual(wav.getframerate(),24000);self.assertEqual(wav.getnchannels(),1);self.assertEqual(wav.getnframes(),56400)
         self.assertEqual(self.radio.settings.snapshot(),before);self.assertEqual(self.radio.agent.store.preferences(self.uid),prefs)
         self.assertEqual(len(self.radio.active),0);self.assertFalse(self.radio.voice_preview.busy)
-        r,again=await self.call({'voice':'ember','actorUserId':self.uid});self.assertEqual(r.status,200);self.assertTrue(again['cached']);self.assertEqual(len(self.created),1)
+        r,again=await self.call({'voice':'ember','actorUserId':self.uid});self.assertEqual(r.status,200);self.assertTrue(again['cached']);self.assertEqual(len(self.created),2)
 
     async def test_failed_preview_cleans_up_and_does_not_cache_or_replace_voice(self):
         class BadSession(self.radio.voice_preview.session_factory):
@@ -59,7 +61,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.radio.voice_preview.session_factory=BadSession
         with self.assertRaises(RuntimeError):await self.radio.voice_preview.render('ember',self.uid)
         self.assertTrue(self.created[0].stopped)
-        self.assertFalse(self.radio.voice_preview.cache);self.assertFalse(self.radio.voice_preview.busy);self.assertEqual(self.radio.settings.snapshot()['voice'],'cove')
+        self.assertFalse(self.radio.voice_preview.ready);self.assertFalse(self.radio.voice_preview.busy);self.assertEqual(self.radio.settings.snapshot()['voice'],'cove')
 
     async def test_admission_does_not_interrupt_existing_device_sessions(self):
         existing=SimpleNamespace();self.radio.active={1,2};self.radio.max_sessions=2
@@ -141,7 +143,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.radio.active={1,2}
         r,data=await self.call({'voice':'ember'});self.assertEqual(r.status,200)
         self.assertTrue(data['cached']);self.assertEqual(data['languages'],['zh-CN','en'])
-        self.assertIn('你好',data['text']);self.assertIn("Hello, I'm Voxi",data['text'])
+        self.assertIn('你好',data['text']);self.assertIn('Hello, nice',data['text'])
         self.assertEqual(preview.status()['ready'],1)
 
     async def test_batch_resumes_skips_ready_tracks_failures_and_admin_can_retry(self):
@@ -150,20 +152,20 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         session=preview.session_factory
         class FailsOne(session):
             async def say_agent(self,text):
-                if self.voice_override=='juniper':raise RuntimeError('private error')
+                if self.voice_override=='juniper':raise PreviewError('unsupported')
                 await super().say_agent(text)
         preview.session_factory=FailsOne;preview.start()
-        await asyncio.wait_for(preview.worker,15)
+        await asyncio.wait_for(preview.worker,25)
         self.assertEqual(preview.status()['ready'],24);self.assertEqual(preview.status()['failed'],1)
-        self.assertEqual(len([s for s in self.created if s.voice_override=='ember']),1)
-        self.assertTrue(all(s.text==PREVIEW_TEXT for s in self.created if hasattr(s,'text')))
+        self.assertEqual(len([s for s in self.created if s.voice_override=='ember']),2)
+        self.assertTrue(all(s.text in PREVIEW_SEGMENTS.values() for s in self.created if hasattr(s,'text')))
         count=len(self.created)
-        restarted=VoicePreview(self.radio);restarted.session_factory=session;self.radio.voice_preview=restarted
+        restarted=VoicePreview(self.radio);restarted.session_factory=session;restarted.transcriber=preview.transcriber;self.radio.voice_preview=restarted
         restarted.start();await restarted.worker;self.assertEqual(len(self.created),count)
         r,_=await self.call({'action':'prepare','actorUserId':self.uid});self.assertEqual(r.status,400)
         r,_=await self.call({'action':'prepare'});self.assertEqual(r.status,200)
         await restarted.worker;self.assertEqual(restarted.status()['ready'],25)
-        self.assertEqual(len(self.created),count+1);self.assertEqual(restarted.status()['failed'],0)
+        self.assertEqual(len(self.created),count+2);self.assertEqual(restarted.status()['failed'],0)
 
     async def test_pending_playback_is_immediate_and_worker_waits_for_capacity(self):
         preview=self.radio.voice_preview;self.radio.active={1,2}
@@ -176,7 +178,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
     async def test_corrupt_or_older_library_files_are_not_served(self):
         preview=self.radio.voice_preview
         await preview.render('ember',self.uid)
-        (preview.directory/'ember.wav').write_bytes(b'RIFFtruncated')
+        for lang in PREVIEW_SEGMENTS:(preview.directory/('ember-'+lang+'.wav')).write_bytes(b'RIFFtruncated')
         (preview.directory/'maple.wav.tmp').write_bytes(b'incomplete')
         old=preview.directory.parent/'old-version';old.mkdir();(old/'cove.wav').write_bytes(b'old sample')
         restarted=VoicePreview(self.radio);self.assertEqual(restarted.status()['ready'],0)
@@ -186,7 +188,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         preview=self.radio.voice_preview
         class Truncated(preview.session_factory):
             async def say_agent(self,text):
-                await self.ws.send_bytes(b'\x10\x00'*2400);await self.ws.close()
+                await self.ws.send_bytes(b'\x10\x00'*24000);await self.ws.close()
         preview.session_factory=Truncated
         with self.assertRaises(RuntimeError):await preview.render('cove',self.uid)
         self.assertFalse((preview.directory/'cove.wav').exists());self.assertFalse(preview.ready)
@@ -198,6 +200,90 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         preview.session_factory=Broken
         with self.assertRaises(RuntimeError):await preview.render('cove',self.uid)
         self.assertFalse(preview.busy);self.assertEqual(self.radio.active,set())
+
+    async def test_wrong_language_or_paraphrase_is_not_published_but_good_language_is_preserved(self):
+        preview=self.radio.voice_preview
+        await preview.render('cove',self.uid,'zh-CN')
+        async def wrong(pcm,language):return {'text':'This is a different answer','language':'en','probability':.99}
+        preview.transcriber=wrong
+        with self.assertRaisesRegex(PreviewError,'content-mismatch'):await preview.render('cove',self.uid,'en')
+        row=next(v for v in preview.status()['voices'] if v['id']=='cove')
+        self.assertEqual(row['state'],'partial');self.assertEqual(row['languages'],['zh-CN'])
+        r,value=await self.call({'voice':'cove'});self.assertEqual(r.status,200)
+        self.assertEqual(value['text'],PREVIEW_SEGMENTS['zh-CN']);self.assertEqual(value['languages'],['zh-CN'])
+        self.assertIsNone(preview._read('cove','en'))
+
+    async def test_expected_words_do_not_pass_if_recording_language_is_wrong_or_uncertain(self):
+        preview=self.radio.voice_preview
+        async def wrong(pcm,language):return {'text':PREVIEW_SEGMENTS[language],'language':'en','probability':.99}
+        preview.transcriber=wrong
+        with self.assertRaisesRegex(PreviewError,'language-mismatch'):await preview.render('cove',self.uid,'zh-CN')
+        self.assertIsNone(preview.stored('cove'))
+
+    async def test_global_login_or_verifier_failure_pauses_background_and_click_does_not_retry_quota(self):
+        preview=self.radio.voice_preview
+        preview.failures['cove:zh-CN']={'code':'rate-limit','attempts':1};preview._save_failures()
+        preview.start();self.assertIsNone(preview.worker)
+        r,value=await self.call({'voice':'ember'});self.assertEqual(r.status,409)
+        self.assertEqual(value['code'],'rate-limit');self.assertEqual(self.created,[])
+        self.assertIn('受限',preview.status()['blockedReason'])
+
+    async def test_wave_without_verification_metadata_or_with_changed_audio_is_rejected(self):
+        preview=self.radio.voice_preview
+        await preview.render('cove',self.uid,'zh-CN')
+        path,metadata=preview._paths('cove','zh-CN')
+        value=json.loads(metadata.read_text(encoding='utf-8'));value['transcript']='different speech';metadata.write_text(json.dumps(value),encoding='utf-8')
+        self.assertIsNone(preview._read('cove','zh-CN'))
+        value['transcript']=PREVIEW_SEGMENTS['zh-CN'];metadata.write_text(json.dumps(value),encoding='utf-8')
+        raw=bytearray(path.read_bytes());raw[-1]^=1;path.write_bytes(raw)
+        self.assertIsNone(preview._read('cove','zh-CN'))
+
+    async def test_description_is_admin_only_persistent_and_shared_with_user_without_changing_voice(self):
+        before=self.radio.settings.snapshot()
+        body={'action':'describe','voice':'cove','style':'阳光男声','useCase':'工作播报'}
+        r,_=await self.call({**body,'actorUserId':self.uid});self.assertEqual(r.status,400)
+        r,_=await self.call(body);self.assertEqual(r.status,200)
+        preview=VoicePreview(self.radio)
+        meta=preview.enrich(catalog())
+        self.assertEqual(meta['options'][0]['style'],'阳光男声')
+        self.assertEqual(meta['options'][0]['styleSource'],'admin-listening-note')
+        self.assertEqual(self.radio.settings.snapshot(),before)
+        preview.describe('juniper',{'style':'','useCase':'解释问题'})
+        voice=next(v for v in preview.enrich(catalog())['options'] if v['id']=='juniper')
+        self.assertTrue(voice['style']);self.assertEqual(voice['useCase'],'解释问题')
+
+    async def test_production_transcription_path_detects_language_without_expected_script_prompt(self):
+        preview=self.radio.voice_preview;preview.transcriber=None;calls=[]
+        model_path=Path(self.tmp.name)/'asr';model_path.mkdir();(model_path/'model.bin').touch()
+        def transcribe(audio,**kwargs):
+            calls.append(kwargs)
+            return [SimpleNamespace(text=PREVIEW_SEGMENTS['en'],no_speech_prob=0)],SimpleNamespace(language='en',language_probability=.99)
+        self.radio.memory_model=SimpleNamespace(transcribe=transcribe)
+        with patch.dict('os.environ',{'POCKET_MODEL_DIR':str(model_path)}):
+            await preview.render('cove',self.uid,'en')
+        self.assertEqual(len(calls),1);self.assertIsNone(calls[0]['language'])
+        self.assertFalse(calls[0]['condition_on_previous_text']);self.assertNotIn('initial_prompt',calls[0])
+        self.assertEqual(preview.stored('cove')['languages'],['en'])
+
+    async def test_content_failure_has_safe_per_language_reason_and_retry_does_not_regenerate_good_clip(self):
+        preview=self.radio.voice_preview
+        await preview.render('cove',self.uid,'zh-CN')
+        preview.failures[preview.key('cove','en')]={'code':'content-mismatch','attempts':2};preview._save_failures()
+        count=len(self.created)
+        r,value=await self.call({'voice':'cove','language':'en'});self.assertEqual(r.status,409)
+        self.assertEqual(value['code'],'content-mismatch')
+        await preview.render('cove',self.uid,'en')
+        self.assertEqual(len(self.created),count+1);self.assertIn('cove',preview.ready)
+
+    async def test_preview_uses_speakable_data_channel_and_script_prompt_without_backend_wrapper(self):
+        c=Capture();s=VoiceSession(c,'unused');s.preview_mode=True;s.preview_language='en';s.preview_text=PREVIEW_SEGMENTS['en']
+        s.rpc=SimpleNamespace();sent=[]
+        s.events=SimpleNamespace(readyState='open',send=lambda raw:sent.append(json.loads(raw)))
+        s.spawn=lambda coro:coro.close()
+        await s.say_agent(s.preview_text)
+        self.assertEqual(sent,[{'type':'session.context.append','channel':'speakable','content':[{'type':'input_text','text':s.preview_text}]}])
+        self.assertIn(s.preview_text,s.preview_instructions());self.assertIn('English',s.preview_instructions())
+        self.assertNotIn('[BACKEND]',str(sent))
 
 
 class VoiceConfigurationTests(unittest.TestCase):
@@ -215,5 +301,6 @@ class VoiceConfigurationTests(unittest.TestCase):
     def test_capture_enforces_bounded_audio(self):
         async def check():
             c=Capture()
-            with self.assertRaises(ValueError):await c.send_bytes(b'\0'*(MAX_SECONDS*48000+2))
+            with self.assertRaises(PreviewError):await c.send_bytes(b'\0'*(MAX_SECONDS*48000+2))
+            self.assertEqual(c.failure,'audio-too-long')
         asyncio.run(check())

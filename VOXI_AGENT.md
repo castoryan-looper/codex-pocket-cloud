@@ -74,13 +74,15 @@ bash deploy/docker.sh up
 
 `voxi-config.json` 新增服务默认 `voice`，旧文件迁移为 Cove；用户 preferences 新增 `voice`，空字符串表示继承默认，旧 fastPrompt-only 更新保留已选音色。`VoiceSession` 在新建/切台时按个人覆盖→服务默认选择，传到 realtime/start 和 Frameless session.update；当前会话不因保存而重建。
 
-`voxi_voices.py` 固定Codex0.163.0 v3目录和中英双语文本；previewLanguages只描述样音语言，不代表逐音色质量认证，languageAssessment=unrated。内网 `POST /voxi/voice-preview` 保留bearer/Origin和身份校验，默认只读已经完成的固定样音，输出24kHz单声道WAV的base64。缺失返回409准备提示；失败明确提示，不回退其他声音。
+`voxi_voices.py` 固定Codex0.163 v3目录、中文及英文脚本、常用音色官方风格概括和部分官方语言方向参考。目录未提供逐音色中文／英文质量认证；无资料的声线不凭空标注性别或音高。
 
-Pocket启动后自动串行准备全部25候选，优先默认音色，尊重总语音会话上限。复用既有Codex登录、WebRTC VoiceSession和appendSpeech，不需要额外API Key；每段上限20秒，生成截止80秒。完整audio_end后原子保存到 `<runtime>/voice-previews/<text-protocol-catalog-version>/<voice>.wav`，使用现有状态卷。启动验证WAV并复用成功项，接着补齐缺失；失败记录持久保存，避免每次重启反复请求。关闭时取消后台子会话。目录只包含固定产品文本，不带用户记忆或任务数据。
+`VoicePreview` v3改为25款×2语言分别生成与持久化。每次启动独立WebRTC VoiceSession，完整固定脚本作为指令，并通过speakable session.context.append发送，不经过BACKEND包装。录制的PCM通过已有本地Whisper自动检测语言并转写，检测语言／概率与去标点空白大小写后的脚本匹配才保存。每段WAV的JSON元数据包含脚本、实际转写、语言、置信度和音频SHA256，读取时再次校验。旧版未校验的样音不复用。ASR严格核对不是音色质量或人工听审认证，可能误拒绝正常发音。
 
-内网 `action: status` 返回进度与每音色状态；`action: prepare` 仅允许管理员身份，补齐并重试失败项，不覆盖成功文件。Voxi普通用户网关不接受action字段。点击读取成功文件不占语音名额、不调用模型、不修改默认或个人设置；用户portal的voiceSettings带音频库就绪状态。管理员runtime.voicePreviewVersion=2，Voxi部署检查同时显示voiceLibrary数量和状态。
+已有状态卷 `<runtime>/voice-previews/<version>/<voice>-<language>.wav` 保存成功单语录音，两个语言都通过时可合播；只有一个通过时只返回该语言和对应实际转写。最长15秒／语言、生成截止80秒，实时会话名额在ASR前释放。缺失／失败按语言补齐，最多两次瞬时重试；账号、额度、ASR模型缺失或存储问题暂停全库，普通点击不解除暂停。
 
-此前用户已确认生产真实试听可用。本版自动及Chrome测试使用受控PCM，覆盖持久文件重用、重启恢复、失败重试、容量等待、半成品与损坏文件拒绝、权限和配置隔离。实际双语全库在部署后自动生成，需在生产收听评估口音和自然度，不把生成成功作为语言质量认证。详见Voxi `docs/VOICE-PREVIEW.md`。
+内网POST /voxi/voice-preview支持status、管理员prepare和describe动作，试听只接受固定voice/language。describe把每款style/useCase原子保存到独立descriptions.json，跨样音版本保留；普通用户不可修改。门户voiceSettings包含说明来源、通过的样音语言和逐语言失败原因。音频正文返回真实录音转写，前端拒绝没有核验标记的旧音频。runtime.voicePreviewVersion=3；Voxi部署检查可显示50段核对进度。
+
+用户旧日志只证明Cove/Himari就绪后失败，无法据此确定音色不受支持；新版日志增加language和安全reason代码，以区别超长、超时、漏读、语言错误和额度等问题。模拟PCM／识别结果的自动及Chrome验收与生产真实声音听审分开，部署后仍需收听确认。详见Voxi docs/VOICE-PREVIEW.md。
 
 ## 运行环境限制
 

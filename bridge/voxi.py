@@ -209,6 +209,9 @@ class VoiceSession:
         self.voice_override=None
         self.voice='cove'
         self.preview_mode=False
+        self.preview_text=''
+        self.preview_language=''
+        self.preview_error_reason=''
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -228,7 +231,12 @@ class VoiceSession:
         self.release_at=time.monotonic();self.last_output_at=None
         await self.send({'type':'busy'})
         try:
-            await asyncio.wait_for(self.rpc.call('thread/realtime/appendSpeech',{'threadId':self.thread,'text':text[:1200]}),15)
+            if self.preview_mode:
+                # A fixed script, no [BACKEND] wrapper or mixed-language context.
+                if not self.events or self.events.readyState!='open':raise RuntimeError('Preview data channel unavailable')
+                self.event({'type':'session.context.append','channel':'speakable','content':[{'type':'input_text','text':text}]})
+            else:
+                await asyncio.wait_for(self.rpc.call('thread/realtime/appendSpeech',{'threadId':self.thread,'text':text[:1200]}),15)
         except Exception:
             self.allow_output=False;self.ready=False
             await self.send({'type':'error','message':'Task state is saved; native speech failed. Reconnect and check task status.'})
@@ -264,6 +272,7 @@ class VoiceSession:
                 self.spawn(self.rpc.call('thread/realtime/appendSpeech', {
                     'threadId': self.thread, 'text': '这次查询没有完成，请稍后重试。'}))
         elif method in ('thread/realtime/error', 'thread/realtime/closed'):
+            if self.preview_mode:self.preview_error_reason=diagnostic_reason(params.get('error',params.get('message',params.get('reason',''))))
             LOG.warning('Native voice upstream %s reason=%s',method,diagnostic_reason(params.get('error',params.get('message',params.get('reason','')))))
             if self.answer and not self.answer.done():
                 self.answer.set_exception(VoiceFailure('notification', params.get('code'), params.get('error', params.get('message', params.get('reason', '')))))
@@ -297,7 +306,9 @@ class VoiceSession:
         def opened():
             # Only configure fields defined by the Frameless Bidi protocol.
             # Audio is buffered until PTT release; do not disable server VAD.
-            self.event(frameless_session_update(self.voice))
+            update=frameless_session_update(self.voice)
+            if self.preview_mode:update['session']['instructions']=self.preview_instructions()
+            self.event(update)
         @self.events.on('message')
         def message(raw):
             try: packet = json.loads(raw)
@@ -328,7 +339,7 @@ class VoiceSession:
         if self.memory_store and self.memory_user:
             try:prompt += self.memory_store.context(self.memory_user)
             except Exception:LOG.warning('Voxi memory context unavailable')
-        if self.preview_mode:prompt='你只负责用所选音色逐字自然朗读提供的双语句子，先中文后英文，完整读出两种语言，不翻译、不省略，不加开场、解释或其他内容，不调用工具。'
+        if self.preview_mode:prompt=self.preview_instructions()
         await self.rpc.call('thread/realtime/start', {'threadId': self.thread,
             'transport': {'type': 'webrtc', 'sdp': self.peer.localDescription.sdp},
             # Codex v3 maps to the AVAS-required quicksilver=v2 alpha header.
@@ -387,8 +398,16 @@ class VoiceSession:
             self.generation_done = True
         elif kind == 'error':
             if event.get('error', {}).get('code') in ('response_cancel_not_active', 'input_audio_buffer_commit_empty'): return
+            if self.preview_mode:self.preview_error_reason=diagnostic_reason(event.get('error',{}))
             await self.send({'type': 'error', 'message': 'Codex voice rejected an audio/control event'})
             await self.ws.close()
+
+    def preview_instructions(self):
+        language='普通话中文' if self.preview_language=='zh-CN' else 'English' if self.preview_language=='en' else 'the script language'
+        return ('You are a script reader, not a conversational assistant. Read ONLY the exact script below once, '
+                'verbatim, in '+language+'. Do not reply to it, translate, paraphrase, introduce yourself, '
+                'add words, or call tools. Keep a natural neutral pace. Stop after the last word.\n'
+                '<script>'+self.preview_text+'</script>')
 
     async def begin_research(self):
         if self.preview_mode:
@@ -776,18 +795,20 @@ class VoxiRadio:
                 LOG.warning('Voxi memory transcription failed (%s)',type(error).__name__)
         task=asyncio.create_task(capture());self.memory_tasks.add(task);task.add_done_callback(self.memory_tasks.discard)
 
-    def transcribe_memory(self, pcm):
+    def transcribe_memory(self, pcm, language='zh', details=False):
         import numpy as np
-        from faster_whisper import WhisperModel
         from pathlib import Path
         model_path=Path(os.environ.get('POCKET_MODEL_DIR','/models/whisper-small'))
         if not (model_path/'model.bin').exists():raise RuntimeError('Whisper model unavailable')
         if self.memory_model is None:
+            from faster_whisper import WhisperModel
             self.memory_model=WhisperModel(str(model_path),device='cpu',compute_type='int8',cpu_threads=1,num_workers=1,local_files_only=True)
         source=np.frombuffer(pcm,dtype='<i2').astype(np.float32)/32768
         audio=np.interp(np.arange(0,len(source),1.5),np.arange(len(source)),source).astype(np.float32)
-        segments,_=self.memory_model.transcribe(audio,language='zh',beam_size=1,vad_filter=True,condition_on_previous_text=False)
-        return ''.join(segment.text for segment in segments if segment.no_speech_prob<.6).strip()[:4000]
+        segments,info=self.memory_model.transcribe(audio,language=language,beam_size=1,vad_filter=True,condition_on_previous_text=False)
+        text=''.join(segment.text for segment in segments if segment.no_speech_prob<.6).strip()[:4000]
+        if details:return {'text':text,'language':info.language,'probability':info.language_probability}
+        return text
 
     async def memory_configuration(self, request):
         if request.headers.get('Origin') or not hmac.compare_digest(request.headers.get('Authorization',''),'Bearer '+self.owner.config['device_token']):raise web.HTTPForbidden()
@@ -824,7 +845,7 @@ class VoxiRadio:
             except OSError:
                 raise web.HTTPInternalServerError(text='Could not persist voice configuration')
         value=self.settings.public()
-        value['voices']['library']=self.voice_preview.status()
+        value['voices']=self.voice_preview.enrich(value['voices'])
         return web.json_response(value, headers={'Cache-Control':'no-store'})
 
     async def websocket(self, request):
