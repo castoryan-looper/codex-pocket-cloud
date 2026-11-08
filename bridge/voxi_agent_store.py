@@ -86,6 +86,15 @@ class AgentStore:
     def channel_overrides(self):
         return [r['key'][9:] for r in self.db.execute("SELECT key FROM config WHERE key LIKE 'channels:%'")]
 
+    def preferences(self, user):
+        row=self.db.execute('SELECT value FROM config WHERE key=?',('preferences:'+user,)).fetchone()
+        return json.loads(row['value']) if row else {'fastPrompt':''}
+
+    def save_preferences(self, user, value):
+        if not isinstance(value,dict) or set(value)!={'fastPrompt'} or not isinstance(value['fastPrompt'],str) or len(value['fastPrompt'])>4000:
+            raise ValueError('回答偏好最多4000字符')
+        with self.db:self.db.execute('INSERT OR REPLACE INTO config VALUES(?,?)',('preferences:'+user,json.dumps(value,ensure_ascii=False)))
+
     def save_settings(self, value, user=None):
         if user:
             value = self.validate_channels(value)

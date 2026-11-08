@@ -62,7 +62,15 @@ bash deploy/docker.sh up
 
 本地测试：`python -m unittest discover -s bridge -p 'test_*.py'`；需安装 `bridge/requirements.txt` 和 `bridge/requirements-voxi.txt`。测试中的 Codex 为可控模拟，不能代替真实账号、麦克风和设备听感验收。
 
-## 本版边界及后续方向
+## 普通用户空间
+
+新增 Docker 内网 `POST /voxi/portal`，网关通过 `/api/user/*` 验证普通账户后固定其 `actorUserId`。此入口不加入公网 Pocket ingress，仍验证内部 bearer 并拒绝浏览器 Origin；普通客户端不能覆盖身份。`snapshot` 仅返回该档案的资料、频道、偏好、连接、设备、记忆、转写与任务；不复用全局管理员快照。任务、OpenClaw、设备操作再次核对所有者，拒绝设置全局参数、凭据、改绑和创建档案。
+
+内网管理员 `/voxi/agent` 新增 `create_profile`，不改变现有设备归属。个人 FAST 偏好保存在 AgentStore 用户配置键中，在 FAST 新会话加载；管理员快照额外返回 `preferencesByUser` 供查看，普通快照只返回本人。`runtime.userPortalVersion=1` 用于部署核对。
+
+登录账户与密码摘要在 Voxi 网关的已有状态卷，Pocket 只存档案和配置。网页开通/停用不等于取消硬件任务，也不升级共享 Codex 试用环境为安全的公众多租户执行器。开通步骤及备份说明见 Voxi `docs/USER-ACCOUNTS.md`。
+
+## 执行环境边界
 
 本版面向当前个人／小范围试用环境。每用户目录和应用层所有者校验不构成互不信任租户之间的执行隔离；Docker externalSandbox 沿用现有个人执行环境，CLI 登录也仍是现有账户。**不能把这一版直接作为面向公众收费、共享个人订阅的多租户服务。**
 

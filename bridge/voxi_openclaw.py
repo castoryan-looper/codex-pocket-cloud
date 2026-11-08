@@ -52,9 +52,9 @@ class OpenClaw:
         r=self.store.db.execute('SELECT * FROM openclaw_connections WHERE id=?',(ident,)).fetchone()
         return dict(r) if r and (user is None or r['user_id']==user) else None
 
-    def public(self):
+    def public(self, user=None):
         result=[]
-        for r in self.store.db.execute('SELECT * FROM openclaw_connections ORDER BY name'):
+        for r in self.store.db.execute('SELECT * FROM openclaw_connections'+(' WHERE user_id=?' if user else '')+' ORDER BY name',(user,) if user else ()):
             v={k:r[k] for k in ('id','user_id','name','transport','url','agent','seen','status')}
             if r['transport']=='relay' and (not r['seen'] or time.time()-r['seen']>30):v['status']='offline'
             v['configured']=True;result.append(v)

@@ -57,6 +57,18 @@ class MemoryStore:
         row=self.db.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
         return dict(row) if row else None
     @database
+    def create_user(self, name):
+        if not isinstance(name,str) or not 1<=len(name.strip())<=80:raise ValueError('称呼需要1–80字符')
+        uid=uuid.uuid4().hex
+        with self.db:self.db.execute('INSERT INTO users(id,name) VALUES(?,?)',(uid,name.strip()))
+        return self.user(uid)
+    @database
+    def owned_snapshot(self, uid):
+        return {'profile':self.user(uid),
+                'devices':[dict(r) for r in self.db.execute('SELECT * FROM devices WHERE user_id=? ORDER BY last_seen DESC',(uid,))],
+                'memories':[dict(r) for r in self.db.execute('SELECT * FROM memories WHERE user_id=? ORDER BY created DESC',(uid,))],
+                'turns':[dict(r) for r in self.db.execute('SELECT * FROM turns WHERE user_id=? ORDER BY created DESC LIMIT 200',(uid,))]}
+    @database
     def record(self, uid, identifier, key, text):
         user=self.user(uid)
         if not user or not user['enabled'] or self.owner(identifier)!=uid:return

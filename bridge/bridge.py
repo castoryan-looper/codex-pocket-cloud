@@ -1393,6 +1393,8 @@ class Pocket:
         app.router.add_post('/voxi/memory', self.voxi_radio.memory_configuration)
         app.router.add_get('/voxi/agent', self.voxi_radio.agent_configuration)
         app.router.add_post('/voxi/agent', self.voxi_radio.agent_configuration)
+        from voxi_portal import UserPortal
+        app.router.add_post('/voxi/portal', UserPortal(self.voxi_radio).handle)
         async def agent_startup(_):
             if self.voxi_radio.agent:self.voxi_radio.agent.start()
         async def agent_cleanup(_):

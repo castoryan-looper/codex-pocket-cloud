@@ -1,0 +1,72 @@
+"""Owner-scoped web API. actorUserId is supplied by the authenticated gateway.
+
+This endpoint remains Docker-internal, never directly exposed by ingress.
+Its response deliberately does not reuse the administrator's global snapshot.
+"""
+import hmac
+import json
+import re
+from aiohttp import web
+
+
+class UserPortal:
+    def __init__(self, radio):self.radio=radio
+
+    def snapshot(self, uid):
+        r=self.radio;hub=r.agent;cfg=hub.store.settings(uid)
+        return {**r.memory.owned_snapshot(uid),'role':'user','serviceEnabled':cfg['enabled'],
+                'channels':cfg['channels'],'inheritsChannels':uid not in hub.store.channel_overrides(),
+                'preferences':hub.store.preferences(uid),'connections':hub.openclaw.public(uid),
+                'tasks':[hub.store.public_task(t) for t in hub.store.list_tasks(uid)],
+                'capabilities':{'openclaw':True,'userPortal':1}}
+
+    async def changed_context(self, uid):
+        r=self.radio;r.memory_revision[uid]=r.memory_revision.get(uid,0)+1
+        for session in tuple(r.active):
+            if session.memory_user==uid:await session.ws.close(code=1012,message=b'Personal context updated')
+
+    async def handle(self, request):
+        r=self.radio
+        if request.headers.get('Origin') or not hmac.compare_digest(request.headers.get('Authorization',''),'Bearer '+r.owner.config['device_token']):raise web.HTTPForbidden()
+        if not r.agent or not r.memory:raise web.HTTPServiceUnavailable()
+        try:
+            raw=await request.read()
+            if len(raw)>131072:raise ValueError('请求过大')
+            body=json.loads(raw)
+            if not isinstance(body,dict):raise ValueError('请求无效')
+            uid=body.get('actorUserId')
+            if not isinstance(uid,str) or not re.fullmatch(r'[a-f0-9]{32}',uid) or not r.memory.user(uid):raise ValueError('账户未绑定有效用户档案')
+            if 'userId' in body and body['userId']!=uid:raise ValueError('不能操作其他用户')
+            action=body.get('action');hub=r.agent
+            if action=='snapshot':pass
+            elif action=='profile':
+                r.memory.change({'action':'profile','userId':uid,'name':body.get('name'),'profile':body.get('profile'),'enabled':body.get('enabled')})
+                await self.changed_context(uid)
+            elif action=='preferences':
+                hub.store.save_preferences(uid,body.get('preferences'));await self.changed_context(uid)
+            elif action=='channels':
+                hub.openclaw.check_routes(body.get('channels'),uid);hub.store.save_settings(body.get('channels'),uid)
+            elif action=='reset_channels':hub.store.reset_channels(uid)
+            elif action=='rename_device':r.memory.change({'action':action,'userId':uid,'deviceId':body.get('deviceId'),'name':body.get('name')})
+            elif action=='connect_openclaw':
+                result=hub.openclaw.create(uid,body.get('name'),body.get('transport'),body.get('url',''),body.get('agent','main'),body.get('token',''))
+                return web.json_response(result,headers={'Cache-Control':'no-store'})
+            elif action=='test_openclaw':
+                return web.json_response(await hub.openclaw.probe(uid,body.get('connectionId')),headers={'Cache-Control':'no-store'})
+            elif action=='delete_openclaw':hub.openclaw.delete(uid,body.get('connectionId'))
+            elif action=='submit':
+                task,_=hub.submit(uid,None,body.get('channel'),body.get('requestId'),body.get('text'))
+                return web.json_response({'task':task},headers={'Cache-Control':'no-store'})
+            elif action=='detail':
+                task=hub.store.task(body.get('taskId'),uid)
+                if not task:raise ValueError('任务不存在或不可访问')
+                return web.json_response({'task':hub.store.public_task(task,True)},headers={'Cache-Control':'no-store'})
+            elif action in ('cancel','approve','decline','answer','continue'):
+                task=await hub.action(uid,body.get('taskId'),action,text=body.get('text'),request_id=body.get('requestId'),answers=body.get('answers'))
+                return web.json_response({'task':task},headers={'Cache-Control':'no-store'})
+            else:raise ValueError('普通用户不能修改此项配置')
+            return web.json_response(self.snapshot(uid),headers={'Cache-Control':'no-store'})
+        except (ValueError,TypeError,KeyError) as e:
+            return web.json_response({'error':str(e)},status=400,headers={'Cache-Control':'no-store'})
+        except OSError:
+            return web.json_response({'error':'保存失败，请联系管理员检查存储'},status=500)

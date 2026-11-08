@@ -314,6 +314,9 @@ class VoiceSession:
         if route:
             if route['channelMode']=='fast':
                 prompt=self.settings['systemPrompt']+'\n当前频道：'+route['name']+'。这是快问频道：直接回答，必要时只读查询。需要持久执行或修改数据时，请用户切换 Agent 频道。'
+                if self.memory_user and self.agent_radio.agent:
+                    preference=self.agent_radio.agent.store.preferences(self.memory_user)['fastPrompt']
+                    if preference:prompt+='\n当前用户的回答偏好：'+preference
             else:
                 prompt='你是 Voxi 的任务语音播报入口。按提供的播报文本简洁朗读，不添加任务执行过程，不自行调用工具或声称完成其他工作。'
         if self.memory_store and self.memory_user:
@@ -701,6 +704,8 @@ class VoxiRadio:
                 try:result=await self.agent.openclaw.relay(body)
                 except ValueError:return web.json_response({'error':'连接器请求被拒绝'},status=400)
                 return web.json_response(result,headers={'Cache-Control':'no-store'})
+            if action=='create_profile':
+                return web.json_response({'profile':self.memory.create_user(body.get('name'))},headers={'Cache-Control':'no-store'})
             if action=='settings':
                 self.agent.openclaw.check_routes((body.get('settings') or {}).get('channels'))
                 self.agent.store.save_settings(body.get('settings'))
