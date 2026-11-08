@@ -41,7 +41,9 @@ POST 的 `action`：`settings`、`channels`、`credential`、`submit`、`detail`
 
 ## 部署与验证
 
-在此仓库的服务器工作目录执行（保留已有 `.env.docker`）：
+推荐在 Voxi 仓库执行 `sudo python3 deploy/upgrade-pocket-agent.py`，它会区分自动快照发布与普通 Git 部署。Docker Compose 标签里的 working_dir 可能指向不含 `.git` 的发布快照，不能直接把它当成源码仓库。
+
+仅在确认使用普通 Git 部署、且当前位于真正源码仓库时，才执行下面命令（保留已有 `.env.docker`）：
 
 ```bash
 git pull --ff-only
