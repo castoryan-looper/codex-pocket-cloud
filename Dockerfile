@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --prefer-binary --timeout 60 --retries 5 -r /app/bridge/requirements-voxi.txt
 COPY bridge/bridge.py bridge/harness.py bridge/goal_flow.py bridge/round_display.py bridge/task_stream.py bridge/conversation_memory.py bridge/recommendations.py bridge/console.html bridge/icons.json bridge/test_*.py /app/bridge/
 COPY bridge/voxi.py bridge/voxi_config.py bridge/voxi_memory.py bridge/voice_recovery.py /app/bridge/
-COPY bridge/voxi_agent.py bridge/voxi_agent_store.py /app/bridge/
+COPY bridge/voxi_agent.py bridge/voxi_agent_store.py bridge/voxi_openclaw.py /app/bridge/
 COPY deployment-revision.txt /app/deployment-revision.txt
 COPY deploy/export_connection.py /app/deploy/export_connection.py
 COPY assistant-workspace/AGENTS.md /app/default-AGENTS.md

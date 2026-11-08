@@ -529,7 +529,7 @@ class VoiceSession:
                 self.pending_audio.clear()
                 await self.send({'type': 'idle', 'reason': 'too_short'})
                 return
-            if self.agent_radio and self.agent_radio.channel_info(self).get('channelMode') in ('agent','disabled'):
+            if self.agent_radio and self.agent_radio.channel_info(self).get('channelMode') in ('agent','openclaw','disabled'):
                 self.ready=False
                 await self.send({'type':'thinking'})
                 pcm=bytes(self.pending_audio);self.pending_audio.clear()
@@ -632,7 +632,8 @@ class VoxiRadio:
         route=cfg['channels'][session.channel]
         latest=self.agent.store.list_tasks(session.memory_user,session.channel,1) if session.memory_user else []
         task=latest[0] if latest else None
-        return {'name':route['name'],'channelMode':route['mode'],'agentTasks':True,
+        return {'name':route['name'],'channelMode':'agent' if route['mode']=='openclaw' else route['mode'],
+                'agentProvider':'openclaw' if route['mode']=='openclaw' else 'codex','agentTasks':True,
                 'taskId':task['id'] if task else '', 'taskState':task['state'] if task else ''}
 
     async def agent_event(self, task):
@@ -690,18 +691,33 @@ class VoxiRadio:
         if request.method=='GET':
             return web.json_response(self.agent.snapshot(self.memory),headers={'Cache-Control':'no-store'})
         try:
-            if request.content_length and request.content_length>131072:raise ValueError('请求过大')
+            if request.content_length and request.content_length>262144:raise ValueError('请求过大')
             raw=await request.read()
-            if len(raw)>131072:raise ValueError('请求过大')
+            if len(raw)>262144:raise ValueError('请求过大')
             body=json.loads(raw)
             if not isinstance(body,dict):raise ValueError('无效请求')
             action=body.get('action')
-            if action=='settings':self.agent.store.save_settings(body.get('settings'))
+            if action=='relay':
+                try:result=await self.agent.openclaw.relay(body)
+                except ValueError:return web.json_response({'error':'连接器请求被拒绝'},status=400)
+                return web.json_response(result,headers={'Cache-Control':'no-store'})
+            if action=='settings':
+                self.agent.openclaw.check_routes((body.get('settings') or {}).get('channels'))
+                self.agent.store.save_settings(body.get('settings'))
             elif action=='credential':self.agent.store.save_secret(body.get('provider'),body.get('key'))
             else:
                 uid=body.get('userId')
                 if not isinstance(uid,str) or not self.memory or not self.memory.user(uid):raise ValueError('用户不存在')
-                if action=='channels':self.agent.store.save_settings(body.get('channels'),uid)
+                if action=='channels':
+                    self.agent.openclaw.check_routes(body.get('channels'),uid)
+                    self.agent.store.save_settings(body.get('channels'),uid)
+                elif action=='reset_channels':self.agent.store.reset_channels(uid)
+                elif action=='connect_openclaw':
+                    result=self.agent.openclaw.create(uid,body.get('name'),body.get('transport'),body.get('url',''),body.get('agent','main'),body.get('token',''))
+                    return web.json_response(result,headers={'Cache-Control':'no-store'})
+                elif action=='test_openclaw':
+                    return web.json_response(await self.agent.openclaw.probe(uid,body.get('connectionId')),headers={'Cache-Control':'no-store'})
+                elif action=='delete_openclaw':self.agent.openclaw.delete(uid,body.get('connectionId'))
                 elif action=='detail':
                     task=self.agent.store.task(body.get('taskId'),uid)
                     if not task:raise ValueError('任务不存在')

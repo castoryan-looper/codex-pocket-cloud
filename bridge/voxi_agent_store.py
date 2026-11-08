@@ -47,6 +47,9 @@ class AgentStore:
         CREATE TABLE IF NOT EXISTS secrets(provider TEXT PRIMARY KEY,ciphertext TEXT NOT NULL,updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS usage(task_id TEXT PRIMARY KEY,input_tokens INTEGER,output_tokens INTEGER,total_tokens INTEGER);
         ''')
+        columns={r['name'] for r in self.db.execute('PRAGMA table_info(tasks)')}
+        for name,definition in [('engine',"TEXT NOT NULL DEFAULT 'codex'"),('connection_id','TEXT')]:
+            if name not in columns:self.db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {definition}')
         for task in self.db.execute("SELECT id FROM tasks WHERE state NOT IN ('queued','completed','failed','cancelled','interrupted','delivery_unknown')").fetchall():
             self.update(task['id'], state='interrupted', summary='服务已重启；未自动重放任务，请核对结果后继续')
         with self.db:
@@ -69,11 +72,19 @@ class AgentStore:
         if not isinstance(channels, list) or len(channels) != 4:
             raise ValueError('当前固件需要恰好 4 个频道（CH0–CH3）')
         for c in channels:
-            if not isinstance(c, dict) or set(c) != {'name', 'mode'}:
+            if not isinstance(c, dict) or set(c) not in ({'name', 'mode'},{'name','mode','connectionId'}):
                 raise ValueError('频道需要名称和模式')
-            if not isinstance(c['name'], str) or not 1 <= len(c['name'].strip()) <= 32 or c['mode'] not in ('fast', 'agent', 'disabled'):
+            if not isinstance(c['name'], str) or not 1 <= len(c['name'].strip()) <= 32 or c['mode'] not in ('fast', 'agent', 'openclaw', 'disabled'):
                 raise ValueError('频道名称或模式无效')
-        return [{'name': c['name'].strip(), 'mode': c['mode']} for c in channels]
+            if c['mode']=='openclaw' and (not isinstance(c.get('connectionId'),str) or not 1<=len(c['connectionId'])<=64):
+                raise ValueError('请为 OpenClaw 频道选择连接')
+        return [{**{'name':c['name'].strip(),'mode':c['mode']},**({'connectionId':c['connectionId']} if c['mode']=='openclaw' else {})} for c in channels]
+
+    def reset_channels(self, user):
+        with self.db:self.db.execute('DELETE FROM config WHERE key=?',('channels:'+user,))
+
+    def channel_overrides(self):
+        return [r['key'][9:] for r in self.db.execute("SELECT key FROM config WHERE key LIKE 'channels:%'")]
 
     def save_settings(self, value, user=None):
         if user:
@@ -108,7 +119,7 @@ class AgentStore:
         query = 'SELECT * FROM tasks' + (' WHERE ' + ' AND '.join(clauses) if clauses else '')
         return [dict(r) for r in self.db.execute(query + ' ORDER BY created DESC LIMIT ?', (*args, min(200, limit)))]
 
-    def submit(self, user, device, channel, request_id, prompt, thread=None):
+    def submit(self, user, device, channel, request_id, prompt, thread=None, *, engine='codex', connection=None):
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
             raise ValueError('需要 1–128 字符的请求编号')
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 8000 or type(channel) is not int or not 0 <= channel < 4:
@@ -122,8 +133,9 @@ class AgentStore:
             raise ValueError('任务队列已满，请等待已有任务完成')
         ident, now = uuid.uuid4().hex, time.time()
         with self.db:
-            self.db.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                            (ident,user,device,channel,request_id,prompt.strip(),'queued','任务已保存，等待执行','',thread,None,now,now))
+            if engine=='openclaw' and not thread:thread='voxi-'+user+'-'+ident
+            self.db.execute('INSERT INTO tasks(id,user_id,device_id,channel,request_id,prompt,state,summary,result,thread_id,turn_id,created,updated,engine,connection_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                            (ident,user,device,channel,request_id,prompt.strip(),'queued','任务已保存，等待执行','',thread,None,now,now,engine,connection))
             self.db.execute('INSERT INTO events(task_id,state,summary,created) VALUES(?,?,?,?)', (ident,'queued','任务已保存，等待执行',now))
         return self.task(ident), True
 
@@ -165,7 +177,7 @@ class AgentStore:
             else:self.db.execute('DELETE FROM approvals WHERE task_id=?',(ident,))
 
     def public_task(self, task, detail=False):
-        fields = ('id','user_id','device_id','channel','state','summary','created','updated')
+        fields = ('id','user_id','device_id','channel','state','summary','created','updated','engine','connection_id')
         value = {k:task[k] for k in fields}
         if detail:
             value.update(prompt=task['prompt'],result=task['result'],threadId=task['thread_id'],turnId=task['turn_id'])
@@ -190,7 +202,9 @@ class AgentStore:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         path = self.directory / 'voxi-credentials.key'
         if not path.exists():
-            if self.db.execute('SELECT count(*) FROM secrets').fetchone()[0]:
+            connections=self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='openclaw_connections'").fetchone()
+            encrypted_connections=connections and self.db.execute("SELECT count(*) FROM openclaw_connections WHERE transport='https'").fetchone()[0]
+            if self.db.execute('SELECT count(*) FROM secrets').fetchone()[0] or encrypted_connections:
                 raise ValueError('凭据加密密钥缺失，请恢复备份，不能重新生成')
             try:
                 with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:

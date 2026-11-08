@@ -1,11 +1,11 @@
 # Voxi Agent：Pocket Cloud 首个可用版本
 
-本版继续使用现有 Codex CLI 0.163.0、官方登录、本机 Whisper 和原生语音播报。不需要新的模型 API Key，不安装 OpenClaw，也不复用旧 Pocket 设备正在执行的任务线程。
+本版 Voxi Agent 继续使用现有 Codex CLI 0.163.0、官方登录、本机 Whisper 和原生语音播报。不需要新的模型 API Key，也不复用旧 Pocket 设备正在执行的任务线程。另支持接入用户已有的 OpenClaw（HTTPS 或家中主动连接器），不替换 Voxi Agent 的 Codex 执行器。
 
 ## 已实现
 
 - 语音连接和后台任务分离。FAST 保留现有问答及只读实时查询；AGENT 先转写、持久保存任务，再播报“任务已保存”。
-- CH0–CH3 可配置名称和 `fast / agent / disabled`，支持默认配置及用户覆盖。用户通过现有设备—用户绑定确定，多个设备可共享频道。
+- CH0–CH3 可配置名称和 `fast / agent / openclaw / disabled`，支持公共模板及明确的用户覆盖/恢复继承。`openclaw` 需指定同一用户拥有的 `connectionId`；公共模板不允许跨用户共享此连接。用户通过现有设备—用户绑定确定，多个设备可共享频道。
 - 独立 Codex app-server 任务执行器、每用户工作目录 `/workspace/voxi-users/<userId>`、每任务线程，以及明确的继续操作。不会把其他 Pocket 任务线程当作当前任务。
 - SQLite 保存任务、请求编号、线程/轮次引用、简短状态、结果、批准请求和实际报告的 token。相同用户的相同请求编号不会重复派发；同一用户同一频道串行，整体并发有上限。
 - 成功只认 Codex `turn/completed` 事件。取消先标记“正在停止”，收到执行器终态后才确认；取消不会撤销此前的文件或外部修改。
@@ -29,6 +29,12 @@
 
 POST 的 `action`：`settings`、`channels`、`credential`、`submit`、`detail`、`cancel`、`approve`、`decline`、`answer`、`continue`。任务操作均指定 `userId`；详情、批准、中断和继续核对任务所有者。提交/继续必须有稳定的 `requestId`。
 
+新增 `reset_channels` 恢复公共模板；`connect_openclaw`、`test_openclaw`、`delete_openclaw` 管理用户连接。`relay` 仅供 Voxi 网关固定的 `/api/openclaw/relay` 代理：使用每连接随机密钥的 SHA-256 校验，不能访问管理员配置、其他用户/连接任务或 Pocket 内部凭据。API 返回的家中连接密钥只显示一次；直连 Gateway Token 加密保存、不回显。新 `openclaw_connections` 表沿用同一数据库与主密钥；只有 OpenClaw 密文时也会拒绝在主密钥丢失后重建。
+
+任务新增 `engine` / `connection_id` 列，老任务迁移为 `codex`；提交时在同一事务固定执行器。新 OpenClaw 任务使用独立 `voxi-<user>-<task>` 会话键，“继续”保留原连接与会话。直连验证证书、禁止重定向、拒绝实际解析出的非公网 IP。主动连接器在 OpenClaw 电脑轮询 Voxi HTTPS，不将本机 Gateway Token 上传；领取状态先持久保存再发任务，不重新派发不确定任务。端到端同一结果重传可确认，不重执行。具体使用步骤与下载入口见 Voxi 仓库 `docs/VOXI-AGENT.md` 和后台“频道与助手”。
+
+探测只调用认证的 `GET /v1/models`，不消耗模型推理；依赖 OpenClaw 启用 `gateway.http.endpoints.responses.enabled`。执行接官方 `POST /v1/responses` SSE，只有 `response.completed` 且资源状态 completed 才成功。响应失败/截断不当成成功，缺终态则 delivery_unknown，不自动重试。外部工具批准在 OpenClaw 内处理；停止等待不声明远端停止。家中连接器退出时未回传的结果暂存在内存，可能丢失。后续可增加本机服务安装和可靠结果发件箱。
+
 状态包括 queued、submitting、running、needs_input、awaiting_approval、cancelling、completed、failed、cancelled、interrupted、delivery_unknown。任务最长执行时间包含等待用户操作的时间。停机或状态不明不会被标成成功。
 
 私有运行卷新增：
@@ -38,6 +44,8 @@ POST 的 `action`：`settings`、`channels`、`credential`、`submit`、`detail`
 - 用户工作区位于已有 workspace 卷。
 
 备份时先停止服务或使用 SQLite 一致性备份；加密密钥和数据库必须一起保留，密钥缺失时拒绝覆盖已有加密记录。不要提交运行卷、数据库、加密密钥或账号文件。
+
+本次任务表会自动增加执行器字段，保留旧任务。不要在新建 OpenClaw 任务后只回滚旧 Agent 镜像并继续派发：旧版不认识外部执行器，且旧 INSERT 不兼容新增列。回退时先停任务服务，再恢复成对的升级前数据库/密钥备份；不得将排队的 OpenClaw 任务交给旧 Codex 执行器。
 
 ## 部署与验证
 
@@ -58,4 +66,4 @@ bash deploy/docker.sh up
 
 本版面向当前个人／小范围试用环境。每用户目录和应用层所有者校验不构成互不信任租户之间的执行隔离；Docker externalSandbox 沿用现有个人执行环境，CLI 登录也仍是现有账户。**不能把这一版直接作为面向公众收费、共享个人订阅的多租户服务。**
 
-自有 OpenClaw 本地/云端插件接入、OpenClaw 托管工作器、商业 API 执行和收费账本仍是后续阶段；当前没有把占位连接显示为可用，也不生成虚构的 API 费用。后台凭据入口先完成，后续启用 API 执行时可复用。
+自有 OpenClaw 的本地/云端 HTTP 接入已实现，原生频道插件、服务安装/自动启动、OpenClaw 托管工作器、商业 API 执行和收费账本仍是后续阶段。连接检测、模拟运行和真实用户 OpenClaw 验收分别核对；不生成虚构的 API 费用。

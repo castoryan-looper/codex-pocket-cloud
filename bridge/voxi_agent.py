@@ -14,11 +14,13 @@ from collections import defaultdict
 
 from harness import DEVELOPER_INSTRUCTIONS
 from voxi_agent_store import AgentStore, LIVE, TERMINAL
+from voxi_openclaw import OpenClaw
 
 
 class AgentHub:
     def __init__(self, directory, workspace, rpc_factory):
         self.store=AgentStore(directory)
+        self.openclaw=OpenClaw(self)
         self.workspace=Path(workspace)/'voxi-users'
         self.workspace.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.rpc_factory=rpc_factory
@@ -92,12 +94,16 @@ class AgentHub:
         await self.emit(task)
         return task
 
-    def submit(self, user, device, channel, request_id, prompt, thread=None):
+    def submit(self, user, device, channel, request_id, prompt, thread=None, *, original=None):
         if not re.fullmatch(r'[a-f0-9]{32}',user or ''):raise ValueError('设备尚未绑定有效用户')
         settings=self.store.settings(user)
         if not settings['enabled']:raise ValueError('管理员尚未启用 Voxi Agent')
-        if type(channel) is not int or not 0<=channel<4 or settings['channels'][channel]['mode']!='agent':raise ValueError('当前频道未配置 Agent')
-        task,created=self.store.submit(user,device,channel,request_id,prompt,thread)
+        if type(channel) is not int or not 0<=channel<4 or settings['channels'][channel]['mode'] not in ('agent','openclaw'):raise ValueError('当前频道未配置 Agent')
+        route=settings['channels'][channel]
+        engine=original['engine'] if original else ('openclaw' if route['mode']=='openclaw' else 'codex')
+        connection=original['connection_id'] if original else route.get('connectionId')
+        if engine=='openclaw' and not self.openclaw.connection(connection,user):raise ValueError('请先接入 OpenClaw 并绑定到此频道')
+        task,created=self.store.submit(user,device,channel,request_id,prompt,thread,engine=engine,connection=connection)
         self.start()
         return self.store.public_task(task,True),created
 
@@ -109,6 +115,7 @@ class AgentHub:
                 for task in reversed(self.store.list_tasks(limit=200)):
                     key=(task['user_id'],task['channel'])
                     if task['state']!='queued' or task['id'] in self.active or key in busy:continue
+                    if not self.openclaw.available(task):continue
                     if len(self.active)>=settings['maxConcurrent']:break
                     busy.add(key)
                     job=asyncio.create_task(self.run(task['id']))
@@ -121,6 +128,9 @@ class AgentHub:
         try:
             task=self.store.task(ident)
             if task['state']!='queued':return
+            if task['engine']=='openclaw':
+                await self.openclaw.run(task)
+                return
             # Keep queued until the runtime is ready; no side effect was admitted yet.
             rpc=await self.ensure_rpc()
             task=self.store.task(ident)
@@ -171,7 +181,7 @@ class AgentHub:
         if not thread:return None
         for ident in self.active:
             task=self.store.task(ident)
-            if task['thread_id']==thread and task['state'] in LIVE-{'queued'}:return task
+            if task['engine']=='codex' and task['thread_id']==thread and task['state'] in LIVE-{'queued'}:return task
         return None
 
     async def notification(self, msg):
@@ -181,7 +191,7 @@ class AgentHub:
             self.rpc=None
             self.runtime_error='Codex 连接已断开，运行中任务未自动重放'
             for ident in tuple(self.active):
-                if self.store.task(ident)['state'] in LIVE:
+                if self.store.task(ident)['engine']=='codex' and self.store.task(ident)['state'] in LIVE:
                     await self.change(ident,state='interrupted',summary=self.runtime_error)
             return
         task=self.for_thread(params.get('threadId'))
@@ -244,11 +254,16 @@ class AgentHub:
         if not task:raise ValueError('任务不存在或不属于当前用户')
         if action=='continue':
             if task['state'] not in TERMINAL or not task['thread_id']:raise ValueError('任务尚未结束或没有可继续的会话')
-            return self.submit(user,task['device_id'],task['channel'],request_id,text,task['thread_id'])[0]
+            return self.submit(user,task['device_id'],task['channel'],request_id,text,task['thread_id'],original=task)[0]
         if action=='cancel':
             if task['state'] in TERMINAL:return self.store.public_task(task,True)
-            if task['state']=='queued':
+            connection=self.openclaw.connection(task['connection_id'],user) if task['engine']=='openclaw' else None
+            if task['state']=='queued' or (task['state']=='submitting' and connection and connection['transport']=='relay'):
                 task=await self.change(ident,state='cancelled',summary='任务在开始前已取消')
+            elif task['engine']=='openclaw':
+                await self.change(ident,state='delivery_unknown',summary='已停止等待；直连已断开请求，家中连接器可能仍在执行，请在 OpenClaw 核对或停止')
+                job=self.active.get(ident)
+                if job:job.cancel()
             elif task['turn_id'] and self.rpc:
                 await self.change(ident,state='cancelling',summary='已请求停止，等待执行器确认')
                 try:await self.rpc.call('turn/interrupt',{'threadId':task['thread_id'],'turnId':task['turn_id']})
@@ -289,9 +304,10 @@ class AgentHub:
         tasks=self.store.list_tasks()
         return {'settings':self.store.settings(),'users':users.get('users',[]),'devices':users.get('devices',[]),
                 'channelsByUser':{u['id']:self.store.settings(u['id'])['channels'] for u in users.get('users',[])},
+                'channelOverrides':self.store.channel_overrides(),'connections':self.openclaw.public(),
                 'tasks':[self.store.public_task(t) for t in tasks], 'credentials':self.store.credentials(),
                 'runtime':{'engine':'codex-pocket-cloud','ready':self.rpc is not None,'lastError':self.runtime_error,
                            'credentialMode':'existing-codex-login','providerKeysActive':False,
-                           'deployment':'personal-pilot','externalOpenClaw':'planned'},
+                           'deployment':'personal-pilot','externalOpenClaw':'responses-https-or-relay'},
                 'usage':{'tasks':len(tasks),'live':sum(t['state'] in LIVE for t in tasks),
                          'note':'记录实际报告的 token；不将 Codex 订阅额度换算为 API 账单'}}
