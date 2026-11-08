@@ -3,6 +3,7 @@ import copy
 import json
 import os
 from pathlib import Path
+from voxi_voices import validate_voice, catalog
 
 VOICE_TASK_INSTRUCTIONS = (
     'You are a voice assistant with read-only web research. Use web search for current facts, '
@@ -24,6 +25,7 @@ RESEARCH_PROMPT = (
 )
 
 DEFAULTS = {
+    'voice':'cove',
     'systemPrompt': '你是虚构对讲机里的AI伙伴。默认用简短自然中文直接回应，通常一到三句。用户明确要求讲故事、详细讲解或长回复时，按要求完整讲完，不受十秒或句数限制；不要为了简短而截断内容。偶尔说收到或完毕，不要每句重复。不要模拟电流声。听不清就请求重说。身份被问及时如实说明是AI。',
     'channels': [
         {'name': '营地一号', 'persona': '沉稳、熟悉山野的营地值守员。关心对方，但不说教。'},
@@ -39,8 +41,10 @@ DEFAULTS = {
 }
 
 def validate(value):
+    if isinstance(value,dict) and set(value)==set(DEFAULTS)-{'voice'}:value={**value,'voice':DEFAULTS['voice']}
     if not isinstance(value, dict) or set(value) != set(DEFAULTS):
         raise ValueError('配置字段不完整或包含不支持的字段')
+    validate_voice(value['voice'])
     def text(value, length):
         if not isinstance(value, str) or not value.strip() or len(value) > length or '\x00' in value:
             raise ValueError(f'文本不能为空，最多 {length} 字符')
@@ -77,6 +81,7 @@ class VoiceSettings:
         return copy.deepcopy(self.value)
 
     def save(self, value):
+        if isinstance(value,dict) and 'voice' not in value:value={**value,'voice':self.value['voice']}
         value = validate(value)
         if self.path:
             temporary = self.path.with_suffix('.tmp')
@@ -90,7 +95,8 @@ class VoiceSettings:
     def public(self):
         return {'settings': self.snapshot(), 'defaults': copy.deepcopy(DEFAULTS),
                 'effectivePrompts': [effective_prompt(self.value, i) for i in range(4)],
-                'runtime': {'voice': 'cove', 'protocol': 'v3', 'model': '由 Codex 原生语音后端选择',
+                'voices':catalog(self.value['voice']),
+                'runtime': {'voice': self.value['voice'], 'protocol': 'v3', 'model': '由 Codex 原生语音后端选择',
                             'developerInstructions': VOICE_TASK_INSTRUCTIONS},
                 'persistent': self.path is not None,
                 'applies': '保存后在新连接或切换频道时生效；当前故事不会被打断。'}

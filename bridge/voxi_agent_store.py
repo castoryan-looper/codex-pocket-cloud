@@ -12,6 +12,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+from voxi_voices import validate_voice
 
 TERMINAL = {'completed', 'failed', 'cancelled', 'interrupted', 'delivery_unknown'}
 LIVE = {'queued', 'submitting', 'running', 'needs_input', 'awaiting_approval', 'cancelling'}
@@ -88,11 +89,12 @@ class AgentStore:
 
     def preferences(self, user):
         row=self.db.execute('SELECT value FROM config WHERE key=?',('preferences:'+user,)).fetchone()
-        return json.loads(row['value']) if row else {'fastPrompt':''}
+        return {'fastPrompt':'','voice':'',**(json.loads(row['value']) if row else {})}
 
     def save_preferences(self, user, value):
-        if not isinstance(value,dict) or set(value)!={'fastPrompt'} or not isinstance(value['fastPrompt'],str) or len(value['fastPrompt'])>4000:
+        if not isinstance(value,dict) or set(value) not in ({'fastPrompt'},{'fastPrompt','voice'}) or not isinstance(value['fastPrompt'],str) or len(value['fastPrompt'])>4000:
             raise ValueError('回答偏好最多4000字符')
+        value={**self.preferences(user),**value};validate_voice(value['voice'],inherit=True)
         with self.db:self.db.execute('INSERT OR REPLACE INTO config VALUES(?,?)',('preferences:'+user,json.dumps(value,ensure_ascii=False)))
 
     def save_settings(self, value, user=None):

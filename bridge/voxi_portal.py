@@ -7,6 +7,7 @@ import hmac
 import json
 import re
 from aiohttp import web
+from voxi_voices import catalog,validate_voice
 
 
 class UserPortal:
@@ -17,6 +18,7 @@ class UserPortal:
         return {**r.memory.owned_snapshot(uid),'role':'user','serviceEnabled':cfg['enabled'],
                 'channels':cfg['channels'],'inheritsChannels':uid not in hub.store.channel_overrides(),
                 'preferences':hub.store.preferences(uid),'connections':hub.openclaw.public(uid),
+                'voiceSettings':catalog(r.settings.snapshot()['voice'],hub.store.preferences(uid)['voice']),
                 'tasks':[hub.store.public_task(t) for t in hub.store.list_tasks(uid)],
                 'capabilities':{'openclaw':True,'userPortal':1}}
 
@@ -44,6 +46,9 @@ class UserPortal:
                 await self.changed_context(uid)
             elif action=='preferences':
                 hub.store.save_preferences(uid,body.get('preferences'));await self.changed_context(uid)
+            elif action=='voice_preference':
+                voice=validate_voice(body.get('voice'),inherit=True)
+                hub.store.save_preferences(uid,{**hub.store.preferences(uid),'voice':voice})
             elif action=='channels':
                 hub.openclaw.check_routes(body.get('channels'),uid);hub.store.save_settings(body.get('channels'),uid)
             elif action=='reset_channels':hub.store.reset_channels(uid)

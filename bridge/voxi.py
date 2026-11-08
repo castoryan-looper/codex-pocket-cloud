@@ -21,6 +21,7 @@ from aiohttp import web, WSMsgType
 from voxi_config import VoiceSettings, effective_prompt, VOICE_TASK_INSTRUCTIONS
 from voxi_memory import MemoryStore, device_id
 from voice_recovery import offer_audio_nack, configure_audio_recovery
+from voxi_voices import validate_voice
 LOG = logging.getLogger('pocket.voxi')
 
 
@@ -54,11 +55,11 @@ class VoiceFailure(RuntimeError):
         super().__init__(f'{self.source} code={self.code} reason={self.reason}')
 
 
-def frameless_session_update():
+def frameless_session_update(voice='cove'):
     # Exact Frameless Bidi session shape used by Codex 0.163.0.
     # PTT is enforced locally by withholding all input until release.
     return {'type': 'session.update', 'session': {
-        'audio': {'output': {'voice': 'cove'}}, 'delegation': {'type': 'client'}}}
+        'audio': {'output': {'voice': validate_voice(voice)}}, 'delegation': {'type': 'client'}}}
 
 
 class VoiceRpc:
@@ -205,6 +206,9 @@ class VoiceSession:
         self.audio_segment = 0
         self.agent_radio = None
         self.agent_request_id = None
+        self.voice_override=None
+        self.voice='cove'
+        self.preview_mode=False
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -272,6 +276,8 @@ class VoiceSession:
         await self.stop()
         self.channel = channel
         if self.settings_source: self.settings = self.settings_source.snapshot()
+        personal=self.agent_radio.agent.store.preferences(self.memory_user).get('voice') if self.agent_radio and self.agent_radio.agent and self.memory_user else None
+        self.voice=validate_voice(self.voice_override or personal or self.settings['voice'])
         await self.send({'type': 'connecting', 'channel': channel})
         self.workspace = tempfile.TemporaryDirectory(prefix='voxi-chat-')
         self.rpc = VoiceRpc(self.binary, self.notification)
@@ -280,8 +286,8 @@ class VoiceSession:
         self.phase = 'thread'
         self.thread = (await self.rpc.call('thread/start', {
             'cwd': self.workspace.name, 'approvalPolicy': 'never', 'sandbox': 'read-only',
-            'ephemeral': True, 'developerInstructions': VOICE_TASK_INSTRUCTIONS,
-            'config': {'web_search': 'live', 'features.shell_tool': False}
+            'ephemeral': True, 'developerInstructions': '只朗读提供的试听句子，不调用工具，不执行任务。' if self.preview_mode else VOICE_TASK_INSTRUCTIONS,
+            'config': {'web_search': 'disabled' if self.preview_mode else 'live', 'features.shell_tool': False}
         }))['thread']['id']
         self.peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         self.input_track=create_input_track()
@@ -291,7 +297,7 @@ class VoiceSession:
         def opened():
             # Only configure fields defined by the Frameless Bidi protocol.
             # Audio is buffered until PTT release; do not disable server VAD.
-            self.event(frameless_session_update())
+            self.event(frameless_session_update(self.voice))
         @self.events.on('message')
         def message(raw):
             try: packet = json.loads(raw)
@@ -322,11 +328,11 @@ class VoiceSession:
         if self.memory_store and self.memory_user:
             try:prompt += self.memory_store.context(self.memory_user)
             except Exception:LOG.warning('Voxi memory context unavailable')
+        if self.preview_mode:prompt='你只负责用所选音色自然朗读提供的中文句子，不加开场、解释或其他内容，不调用工具。'
         await self.rpc.call('thread/realtime/start', {'threadId': self.thread,
             'transport': {'type': 'webrtc', 'sdp': self.peer.localDescription.sdp},
             # Codex v3 maps to the AVAS-required quicksilver=v2 alpha header.
-            # cove is supported by v3; marin belongs to the separate v2 API.
-            'outputModality': 'audio', 'version': 'v3', 'voice': 'cove', 'prompt': prompt,
+            'outputModality': 'audio', 'version': 'v3', 'voice': self.voice, 'prompt': prompt,
             'includeStartupContext': False, 'clientManagedHandoffs': False})
         answer = await asyncio.wait_for(self.answer, 40)
         await self.peer.setRemoteDescription(RTCSessionDescription(sdp=answer, type='answer'))
@@ -385,6 +391,10 @@ class VoiceSession:
             await self.ws.close()
 
     async def begin_research(self):
+        if self.preview_mode:
+            await self.send({'type':'error','message':'Voice preview cannot execute research or tasks'})
+            await self.ws.close()
+            return
         if self.recording or self.ws.closed:
             return
         self.research_pending = True
@@ -621,6 +631,8 @@ class VoxiRadio:
         self.memory_error = '' if self.memory else '记忆存储无法打开'
         self.memory_model = None
         self.agent = None
+        from voxi_voice_preview import VoicePreview
+        self.voice_preview=VoicePreview(self)
         if getattr(owner,'runtime',None) and getattr(owner,'config',{}).get('cwd'):
             from voxi_agent import AgentHub
             from bridge import Rpc

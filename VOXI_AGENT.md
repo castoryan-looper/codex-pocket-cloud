@@ -70,7 +70,17 @@ bash deploy/docker.sh up
 
 登录账户与密码摘要在 Voxi 网关的已有状态卷，Pocket 只存档案和配置。网页开通/停用不等于取消硬件任务，也不升级共享 Codex 试用环境为安全的公众多租户执行器。开通步骤及备份说明见 Voxi `docs/USER-ACCOUNTS.md`。
 
-## 执行环境边界
+## 音色与试听
+
+`voxi-config.json` 新增服务默认 `voice`，旧文件迁移为 Cove；用户 preferences 新增 `voice`，空字符串表示继承默认，旧 fastPrompt-only 更新保留已选音色。`VoiceSession` 在新建/切台时按个人覆盖→服务默认选择，传到 realtime/start 和 Frameless session.update；当前会话不因保存而重建。
+
+`voxi_voices.py` 固定 Codex 0.163.0 v3 候选目录和一句话文本。内网 `POST /voxi/voice-preview` 验证 bearer/Origin、固定文本和身份，调用独立临时 WebRTC VoiceSession 与原生 appendSpeech，输出实际 PCM WAV 的 base64；不开麦，不带记忆，不派发任务，不写语音文件。最多一个生成中试听，遵守总语音名额、12秒音频上限和80秒生成截止；取消时停止子进程与临时会话。固定音频最多缓存4音色/10分钟。兼容目录不等于账户实测可用，失败不回退其他声音。
+
+用户 portal 快照包含 `voiceSettings`（目录、默认/个人/生效音色与试听句子），`voice_preference` 只修改本人音色。管理员快照 runtime 添加 `voicePreviewVersion=1`。Voxi 网关新增独立鉴权试听代理，90秒请求截止、客户端断开传递取消，不沿用普通配置接口的8秒截止。
+
+真实浏览器已验证模拟 PCM 试听解码、无自动保存、个人/默认持久化和停止回收。Windows本机0.161登录可用但WebRTC等ACK超时；云端0.163和真实音色需升级后点击试听验收。未采用需要API key认证的WebSocket路径，不要求新增模型密钥。详见 Voxi `docs/VOICE-PREVIEW.md`。
+
+## 运行环境限制
 
 本版面向当前个人／小范围试用环境。每用户目录和应用层所有者校验不构成互不信任租户之间的执行隔离；Docker externalSandbox 沿用现有个人执行环境，CLI 登录也仍是现有账户。**不能把这一版直接作为面向公众收费、共享个人订阅的多租户服务。**
 
