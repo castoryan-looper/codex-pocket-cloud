@@ -328,7 +328,7 @@ class VoiceSession:
         if self.memory_store and self.memory_user:
             try:prompt += self.memory_store.context(self.memory_user)
             except Exception:LOG.warning('Voxi memory context unavailable')
-        if self.preview_mode:prompt='你只负责用所选音色自然朗读提供的中文句子，不加开场、解释或其他内容，不调用工具。'
+        if self.preview_mode:prompt='你只负责用所选音色逐字自然朗读提供的双语句子，先中文后英文，完整读出两种语言，不翻译、不省略，不加开场、解释或其他内容，不调用工具。'
         await self.rpc.call('thread/realtime/start', {'threadId': self.thread,
             'transport': {'type': 'webrtc', 'sdp': self.peer.localDescription.sdp},
             # Codex v3 maps to the AVAS-required quicksilver=v2 alpha header.
@@ -823,7 +823,9 @@ class VoxiRadio:
                 raise web.HTTPBadRequest(text='Invalid voice configuration')
             except OSError:
                 raise web.HTTPInternalServerError(text='Could not persist voice configuration')
-        return web.json_response(self.settings.public(), headers={'Cache-Control':'no-store'})
+        value=self.settings.public()
+        value['voices']['library']=self.voice_preview.status()
+        return web.json_response(value, headers={'Cache-Control':'no-store'})
 
     async def websocket(self, request):
         if request.headers.get('Origin') or not hmac.compare_digest(

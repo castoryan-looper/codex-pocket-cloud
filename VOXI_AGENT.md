@@ -74,11 +74,13 @@ bash deploy/docker.sh up
 
 `voxi-config.json` 新增服务默认 `voice`，旧文件迁移为 Cove；用户 preferences 新增 `voice`，空字符串表示继承默认，旧 fastPrompt-only 更新保留已选音色。`VoiceSession` 在新建/切台时按个人覆盖→服务默认选择，传到 realtime/start 和 Frameless session.update；当前会话不因保存而重建。
 
-`voxi_voices.py` 固定 Codex 0.163.0 v3 候选目录和一句话文本。内网 `POST /voxi/voice-preview` 验证 bearer/Origin、固定文本和身份，调用独立临时 WebRTC VoiceSession 与原生 appendSpeech，输出实际 PCM WAV 的 base64；不开麦，不带记忆，不派发任务，不写语音文件。最多一个生成中试听，遵守总语音名额、12秒音频上限和80秒生成截止；取消时停止子进程与临时会话。固定音频最多缓存4音色/10分钟。兼容目录不等于账户实测可用，失败不回退其他声音。
+`voxi_voices.py` 固定Codex0.163.0 v3目录和中英双语文本；previewLanguages只描述样音语言，不代表逐音色质量认证，languageAssessment=unrated。内网 `POST /voxi/voice-preview` 保留bearer/Origin和身份校验，默认只读已经完成的固定样音，输出24kHz单声道WAV的base64。缺失返回409准备提示；失败明确提示，不回退其他声音。
 
-用户 portal 快照包含 `voiceSettings`（目录、默认/个人/生效音色与试听句子），`voice_preference` 只修改本人音色。管理员快照 runtime 添加 `voicePreviewVersion=1`。Voxi 网关新增独立鉴权试听代理，90秒请求截止、客户端断开传递取消，不沿用普通配置接口的8秒截止。
+Pocket启动后自动串行准备全部25候选，优先默认音色，尊重总语音会话上限。复用既有Codex登录、WebRTC VoiceSession和appendSpeech，不需要额外API Key；每段上限20秒，生成截止80秒。完整audio_end后原子保存到 `<runtime>/voice-previews/<text-protocol-catalog-version>/<voice>.wav`，使用现有状态卷。启动验证WAV并复用成功项，接着补齐缺失；失败记录持久保存，避免每次重启反复请求。关闭时取消后台子会话。目录只包含固定产品文本，不带用户记忆或任务数据。
 
-真实浏览器已验证模拟 PCM 试听解码、无自动保存、个人/默认持久化和停止回收。Windows本机0.161登录可用但WebRTC等ACK超时；云端0.163和真实音色需升级后点击试听验收。未采用需要API key认证的WebSocket路径，不要求新增模型密钥。详见 Voxi `docs/VOICE-PREVIEW.md`。
+内网 `action: status` 返回进度与每音色状态；`action: prepare` 仅允许管理员身份，补齐并重试失败项，不覆盖成功文件。Voxi普通用户网关不接受action字段。点击读取成功文件不占语音名额、不调用模型、不修改默认或个人设置；用户portal的voiceSettings带音频库就绪状态。管理员runtime.voicePreviewVersion=2，Voxi部署检查同时显示voiceLibrary数量和状态。
+
+此前用户已确认生产真实试听可用。本版自动及Chrome测试使用受控PCM，覆盖持久文件重用、重启恢复、失败重试、容量等待、半成品与损坏文件拒绝、权限和配置隔离。实际双语全库在部署后自动生成，需在生产收听评估口音和自然度，不把生成成功作为语言质量认证。详见Voxi `docs/VOICE-PREVIEW.md`。
 
 ## 运行环境限制
 

@@ -1398,7 +1398,9 @@ class Pocket:
         app.router.add_post('/voxi/voice-preview', self.voxi_radio.voice_preview.handle)
         async def agent_startup(_):
             if self.voxi_radio.agent:self.voxi_radio.agent.start()
+            self.voxi_radio.voice_preview.start()
         async def agent_cleanup(_):
+            await self.voxi_radio.voice_preview.close()
             if self.voxi_radio.agent:await self.voxi_radio.agent.close()
         app.on_startup.append(agent_startup)
         app.on_cleanup.append(agent_cleanup)
