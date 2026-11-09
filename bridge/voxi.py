@@ -208,6 +208,7 @@ class VoiceSession:
         self.agent_request_id = None
         self.voice_override=None
         self.voice='cove'
+        self.agent_speech_only=False
         self.preview_mode=False
         self.preview_text=''
         self.preview_language=''
@@ -294,13 +295,36 @@ class VoiceSession:
                 await self.send({'type': 'error', 'message': 'Codex native voice session closed; check account support'})
                 await self.ws.close()
 
+    def selected_voice(self, settings):
+        personal = (self.agent_radio.agent.store.preferences(self.memory_user).get('voice')
+                    if self.agent_radio and self.agent_radio.agent and self.memory_user else None)
+        return validate_voice(self.voice_override or personal or settings['voice'])
+
+    async def switch_channel(self, channel):
+        began = time.monotonic()
+        # Agent routes send explicit speech via RPC. Task routing and history
+        # live in the store, so these channels can share an idle speech peer.
+        reused = False
+        if (self.agent_speech_only and self.ready and not (self.recording or self.allow_output or self.outputting)
+                and self.peer and self.peer.connectionState == 'connected'):
+            route = self.agent_radio.channel_info(self, channel)
+            settings = self.settings_source.snapshot() if self.settings_source else self.settings
+            if (route.get('channelMode') in ('agent', 'disabled')
+                    and settings == self.settings and self.selected_voice(settings) == self.voice):
+                self.channel = channel
+                await self.send({'type': 'ready', 'channel': channel})
+                reused = True
+        if not reused:
+            await self.start(channel)
+        LOG.info('Voxi channel ready sessionId=%s channel=%s reusedSpeech=%s elapsedMs=%s',
+                 self.session_id, channel, reused, round((time.monotonic() - began) * 1000))
+
     async def start(self, channel=0):
         from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration
         await self.stop()
         self.channel = channel
         if self.settings_source: self.settings = self.settings_source.snapshot()
-        personal=self.agent_radio.agent.store.preferences(self.memory_user).get('voice') if self.agent_radio and self.agent_radio.agent and self.memory_user else None
-        self.voice=validate_voice(self.voice_override or personal or self.settings['voice'])
+        self.voice=self.selected_voice(self.settings)
         await self.send({'type': 'connecting', 'channel': channel})
         self.workspace = tempfile.TemporaryDirectory(prefix='voxi-chat-')
         self.rpc = VoiceRpc(self.binary, self.notification)
@@ -340,6 +364,7 @@ class VoiceSession:
         self.phase = 'webrtc-sdp'
         prompt = effective_prompt(self.settings, channel)
         route=self.agent_radio.channel_info(self) if self.agent_radio else {}
+        self.agent_speech_only = not self.preview_mode and route.get('channelMode') in ('agent', 'disabled')
         if route:
             if route['channelMode']=='fast':
                 prompt=self.settings['systemPrompt']+'\n当前频道：'+route['name']+'。这是快问频道：直接回答，必要时只读查询。需要持久执行或修改数据时，请用户切换 Agent 频道。'
@@ -549,7 +574,7 @@ class VoiceSession:
         if kind == 'played': self.played = max(0,min(60000,int(event.get('ms',0))))
         elif kind == 'channel':
             channel = event.get('channel')
-            if type(channel) is int and 0 <= channel < 4: await self.start(channel)
+            if type(channel) is int and 0 <= channel < 4: await self.switch_channel(channel)
         elif kind == 'ptt_down' and self.ready and not self.recording and not self.allow_output:
             self.continuation_until = 0
             self.research_result_waiting = False
@@ -585,6 +610,9 @@ class VoiceSession:
                 pcm=bytes(self.pending_audio);self.pending_audio.clear()
                 self.spawn(self.agent_radio.agent_voice(self,pcm))
                 return
+            # A live route edit can change a speech-only channel into FAST.
+            # Once this peer has accepted microphone input, keep it isolated.
+            self.agent_speech_only = False
             self.allow_output = True
             self.generation_done = False
             self.lookback.clear()
@@ -629,6 +657,7 @@ class VoiceSession:
 
     async def stop(self):
         self.ready = self.recording = self.allow_output = self.outputting = False
+        self.agent_speech_only = False
         # Ignore closure notifications from the old peer while changing channel.
         self.thread = self.item = self.response_id = None
         self.lookback.clear()
@@ -678,12 +707,13 @@ class VoxiRadio:
             self.agent.context_provider=lambda uid:self.memory.context(uid) if self.memory else ''
             self.agent.listeners.add(self.agent_event)
 
-    def channel_info(self, session):
+    def channel_info(self, session, channel=None):
         if not self.agent:return {}
         cfg=self.agent.store.settings(session.memory_user)
         if not cfg['enabled']:return {}
-        route=cfg['channels'][session.channel]
-        latest=self.agent.store.list_tasks(session.memory_user,session.channel,1) if session.memory_user else []
+        channel = session.channel if channel is None else channel
+        route=cfg['channels'][channel]
+        latest=self.agent.store.list_tasks(session.memory_user,channel,1) if session.memory_user else []
         task=latest[0] if latest else None
         return {'name':route['name'],'channelMode':'agent' if route['mode']=='openclaw' else route['mode'],
                 'agentProvider':'openclaw' if route['mode']=='openclaw' else 'codex','agentTasks':True,

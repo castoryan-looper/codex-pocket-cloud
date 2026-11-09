@@ -25,6 +25,43 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_agent_switch_reuses_speech_and_selects_destination_metadata(self):
+        ws = Socket()
+        voice = VoiceSession(ws, 'unused')
+        voice.peer = SimpleNamespace(connectionState='connected')
+        voice.agent_speech_only = voice.ready = True
+        voice.channel = 1
+        modes = ['fast', 'agent', 'agent', 'disabled']
+
+        def channel_info(session, channel=None):
+            selected = session.channel if channel is None else channel
+            return {'channelMode': modes[selected], 'taskId': f'task-{selected}'}
+
+        voice.agent_radio = SimpleNamespace(agent=None, channel_info=channel_info)
+        voice.start = AsyncMock()
+        await voice.control({'type': 'channel', 'channel': 2})
+        voice.start.assert_not_awaited()
+        self.assertEqual(voice.channel, 2)
+        self.assertEqual(ws.packets[-1], {'type': 'ready', 'channel': 2, 'channelMode': 'agent', 'taskId': 'task-2'})
+        await voice.control({'type': 'channel', 'channel': 0})
+        voice.start.assert_awaited_once_with(0)
+
+    async def test_agent_switch_rebuilds_when_speech_cannot_be_reused(self):
+        for busy, peer_state, changed_voice in [(True, 'connected', False),
+                                                (False, 'failed', False),
+                                                (False, 'connected', True)]:
+            with self.subTest(busy=busy, peer_state=peer_state, changed_voice=changed_voice):
+                voice = VoiceSession(Socket(), 'unused')
+                voice.peer = SimpleNamespace(connectionState=peer_state)
+                voice.agent_speech_only = voice.ready = True
+                voice.allow_output = busy
+                voice.agent_radio = SimpleNamespace(agent=None, channel_info=lambda *_: {'channelMode': 'agent'})
+                if changed_voice:
+                    voice.settings_source = SimpleNamespace(snapshot=lambda: {**voice.settings, 'voice': 'maple'})
+                voice.start = AsyncMock()
+                await voice.switch_channel(2)
+                voice.start.assert_awaited_once_with(2)
+
     @unittest.skipUnless(importlib.util.find_spec('av'), 'Optional native voice dependencies not installed')
     async def test_trailing_rtp_silence_finishes_speech_after_backend_completion(self):
         from av import AudioFrame
