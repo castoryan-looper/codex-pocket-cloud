@@ -466,35 +466,70 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 await radio.websocket(SimpleNamespace(headers=headers))
         self.assertFalse(radio.active)
 
-    async def test_two_devices_are_isolated_and_third_is_rejected(self):
+    async def test_overflow_devices_stay_online_and_reclaim_only_idle_voice_slots(self):
         radio=VoxiRadio(SimpleNamespace(config={'device_token':'test'}),'unused')
         radio.max_sessions=2
-        async def ready(session,channel=0):
-            await session.send({'type':'ready'})
-        async def control(session,event):
-            session.channel=event['channel']
-            await session.send({'type':'channel','channel':session.channel})
-        app=web.Application();app.router.add_get('/voxi',radio.websocket)
-        with patch.object(VoiceSession,'start',new=ready),patch.object(VoiceSession,'control',new=control),patch.object(VoiceSession,'stop',new=AsyncMock()):
+        radio.capture_memory=lambda *_:None
+        inputs={}
+        async def start(session,channel=0):
+            await session.stop()
+            session.channel=channel
+            session.input_track=SimpleNamespace(submit=lambda pcm: inputs.setdefault(session, []).append(pcm),
+                                                stop=lambda:None, emitted_bytes=0)
+            session.ready=True
+            await session.send({'type':'ready','channel':channel})
+        app=web.Application()
+        app.router.add_get('/voxi',radio.websocket)
+        app.router.add_get('/voxi/overview',radio.overview)
+        async def speak(socket):
+            await socket.send_json({'type':'ptt_down'})
+            self.assertEqual((await socket.receive_json(timeout=2))['type'],'flush')
+            self.assertEqual((await socket.receive_json(timeout=2))['type'],'recording')
+            for _ in range(2):await socket.send_bytes(bytes(4800))
+            await socket.send_json({'type':'ptt_up'})
+        with patch.object(VoiceSession,'start',new=start):
             async with TestClient(TestServer(app)) as client:
                 headers={'Authorization':'Bearer test'}
-                a=await client.ws_connect('/voxi',headers=headers);await a.receive_json()
-                b=await client.ws_connect('/voxi',headers=headers);await b.receive_json()
-                self.assertEqual(len(radio.active),2)
-                response=await client.get('/voxi',headers=headers)
-                self.assertEqual(response.status,503)
-                self.assertEqual(response.headers['X-Voxi-Rejection'],'session-limit')
-                await a.send_json({'channel':3});self.assertEqual((await a.receive_json())['channel'],3)
-                await b.send_json({'channel':1});self.assertEqual((await b.receive_json())['channel'],1)
-                self.assertEqual(sorted(s.channel for s in radio.active),[1,3])
-                await a.close()
-                for _ in range(30):
-                    if len(radio.active)==1:break
-                    await asyncio.sleep(.01)
-                self.assertEqual(len(radio.active),1)
-                c=await client.ws_connect('/voxi',headers=headers);await c.receive_json()
-                await b.send_json({'channel':2});self.assertEqual((await b.receive_json())['channel'],2)
-                await b.close();await c.close()
+                self.assertEqual((await client.get('/voxi/overview')).status,403)
+                clients=[]
+                for i in range(6):
+                    socket=await client.ws_connect('/voxi',headers={**headers,'X-Voxi-Device-Id':f'esp32-{i:012x}'})
+                    first=await socket.receive_json(timeout=2)
+                    if first['type']=='channel_catalog':first=await socket.receive_json(timeout=2)
+                    self.assertEqual(first['type'],'ready')
+                    clients.append(socket)
+                a,b,c,*_=clients
+                self.assertEqual(len(radio.active),6)
+                self.assertEqual(len(radio.voice_slots),2)
+                self.assertIsNone(radio.memory.product_metrics()['voiceTurns'])
+                for socket in (a,b):
+                    await speak(socket)
+                    self.assertEqual((await socket.receive_json(timeout=2))['type'],'busy')
+                    self.assertEqual((await socket.receive_json(timeout=2))['type'],'thinking')
+                await c.send_json({'type':'channel','channel':3})
+                self.assertEqual((await c.receive_json(timeout=2))['channel'],3)
+                await speak(c)
+                self.assertEqual((await c.receive_json(timeout=2))['type'],'thinking')
+                self.assertEqual(await c.receive_json(timeout=2),{'type':'idle','reason':'voice_capacity'})
+                full=await (await client.get('/voxi/overview',headers=headers)).json()
+                self.assertEqual(full['voice'],{'capacity':2,'occupied':2,'warmed':0,'available':0})
+                self.assertEqual(full['audience']['users'],6)
+                self.assertEqual(full['audience']['voiceTurns'],2)
+                self.assertEqual(full['audience']['voiceInputMs'],400)
+                first=next(s for s in radio.active if s.memory_device=='esp32-000000000000')
+                await first.end_audio()
+                self.assertEqual((await a.receive_json(timeout=2))['type'],'audio_end')
+                self.assertEqual((await a.receive_json(timeout=2))['type'],'ready')
+                await speak(c)
+                for expected in ('thinking','busy','thinking'):
+                    self.assertEqual((await c.receive_json(timeout=2))['type'],expected)
+                self.assertNotIn(first,radio.voice_slots)
+                self.assertFalse(a.closed)
+                self.assertEqual(len(radio.voice_slots),2)
+                self.assertEqual(sorted(len(pcm) for frames in inputs.values() for pcm in frames),[48000]*3)
+                self.assertEqual(radio.memory.product_metrics()['voiceTurns'],3)
+                for socket in clients:await socket.close()
+                self.assertEqual(len(radio.voice_slots),0)
 
     async def test_failed_voice_setup_enters_cooldown_without_restarting_cli(self):
         radio=VoxiRadio(SimpleNamespace(config={'device_token':'test'}),'unused')
@@ -504,8 +539,10 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 socket=await client.ws_connect('/voxi',headers={'Authorization':'Bearer test'})
                 self.assertEqual((await socket.receive_json())['type'],'error')
                 await socket.close()
-                response=await client.get('/voxi',headers={'Authorization':'Bearer test'})
-                self.assertEqual(response.status,503)
+                second=await client.ws_connect('/voxi',headers={'Authorization':'Bearer test'})
+                self.assertEqual((await second.receive_json(timeout=2))['type'],'channel_catalog')
+                self.assertEqual((await second.receive_json(timeout=2))['type'],'ready')
+                await second.close()
                 self.assertEqual(start.call_count,1)
 
     @unittest.skipUnless(importlib.util.find_spec('aiortc'), 'Optional native voice dependencies not installed')

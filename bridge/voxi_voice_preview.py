@@ -251,7 +251,7 @@ class VoicePreview:
                     if self._read(voice,language) or key in self.failures:continue
                     self.current=voice;self.current_language=language;attempt=0
                     while attempt<2:
-                        self.waiting=self.busy or len(self.radio.active)>=self.radio.max_sessions
+                        self.waiting=self.busy or len(self.radio.voice_slots)>=self.radio.max_sessions
                         if self.waiting:await asyncio.sleep(2);continue
                         try:
                             await self.render(voice,'library',language);break
@@ -313,7 +313,7 @@ class VoicePreview:
             return self.stored(voice)
         if language not in PREVIEW_SEGMENTS:raise ValueError('试听语言无效')
         if self._read(voice,language):return self.stored(voice,language)
-        if self.busy or len(self.radio.active)>=self.radio.max_sessions:raise web.HTTPTooManyRequests(text='当前语音资源正在使用')
+        if self.busy or len(self.radio.voice_slots)>=self.radio.max_sessions:raise web.HTTPTooManyRequests(text='当前语音资源正在使用')
         self.busy=True
         from voxi import VoiceSession
         capture=Capture();session=None
@@ -326,14 +326,14 @@ class VoicePreview:
             session=(self.session_factory or VoiceSession)(capture,self.radio.binary)
             session.preview_mode=True;session.preview_text=PREVIEW_SEGMENTS[language];session.preview_language=language
             session.voice_override=voice;session.settings_source=self.radio.settings
-            self.radio.active.add(session)
+            self.radio.voice_slots.add(session)
             async def generate():
                 await session.start();await session.say_agent(PREVIEW_SEGMENTS[language]);await capture.done.wait()
             await asyncio.wait_for(generate(),80)
             if capture.failure:raise PreviewError(capture.failure)
             if capture.error:raise PreviewError(self.failure_code(RuntimeError(),session))
             if not capture.complete or len(capture.pcm)<48000:raise PreviewError('incomplete-audio')
-            await session.stop();self.radio.active.discard(session)
+            await session.stop();self.radio.voice_slots.discard(session)
             session.phase='verifying-audio'
             self.stage='language'
             recognition=await self._transcribe(bytes(capture.pcm),language)
@@ -354,7 +354,7 @@ class VoicePreview:
         finally:
             if session:
                 with contextlib.suppress(Exception):await session.stop()
-            self.radio.active.discard(session);self.busy=False;self.stage=None
+            self.radio.voice_slots.discard(session);self.busy=False;self.stage=None
 
     async def handle(self,request):
         r=self.radio

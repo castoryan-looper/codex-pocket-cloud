@@ -55,7 +55,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         with wave.open(io.BytesIO(base64.b64decode(data['audioBase64'])),'rb') as wav:
             self.assertEqual(wav.getframerate(),24000);self.assertEqual(wav.getnchannels(),1);self.assertEqual(wav.getnframes(),56400)
         self.assertEqual(self.radio.settings.snapshot(),before);self.assertEqual(self.radio.agent.store.preferences(self.uid),prefs)
-        self.assertEqual(len(self.radio.active),0);self.assertFalse(self.radio.voice_preview.busy)
+        self.assertEqual(len(self.radio.voice_slots),0);self.assertFalse(self.radio.voice_preview.busy)
         r,again=await self.call({'voice':'ember','actorUserId':self.uid});self.assertEqual(r.status,200);self.assertTrue(again['cached']);self.assertEqual(len(self.created),2)
 
     async def test_failed_preview_cleans_up_and_does_not_cache_or_replace_voice(self):
@@ -67,10 +67,10 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.radio.voice_preview.ready);self.assertFalse(self.radio.voice_preview.busy);self.assertEqual(self.radio.settings.snapshot()['voice'],'cove')
 
     async def test_admission_does_not_interrupt_existing_device_sessions(self):
-        existing=SimpleNamespace();self.radio.active={1,2};self.radio.max_sessions=2
+        existing=SimpleNamespace();self.radio.voice_slots={1,2};self.radio.max_sessions=2
         with self.assertRaises(web.HTTPTooManyRequests):await self.radio.voice_preview.render('cove',self.uid)
-        self.assertEqual(self.created,[]);self.assertEqual(self.radio.active,{1,2})
-        self.radio.active=set()
+        self.assertEqual(self.created,[]);self.assertEqual(self.radio.voice_slots,{1,2})
+        self.radio.voice_slots=set()
         r,_=await self.call({'voice':'not-a-voice'});self.assertEqual(r.status,400)
 
     async def test_preview_auth_and_custom_text_rejection(self):
@@ -101,7 +101,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.radio.voice_preview.session_factory=Waiting
         job=asyncio.create_task(self.radio.voice_preview.render('cove',self.uid));await started.wait();job.cancel()
         with self.assertRaises(asyncio.CancelledError):await job
-        self.assertTrue(self.created[0].stopped);self.assertFalse(self.radio.voice_preview.busy);self.assertEqual(self.radio.active,set())
+        self.assertTrue(self.created[0].stopped);self.assertFalse(self.radio.voice_preview.busy);self.assertEqual(self.radio.voice_slots,set())
 
     async def test_selected_voice_reaches_native_start_and_preview_disables_research(self):
         from aiortc import RTCPeerConnection
@@ -147,7 +147,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self,*args):raise AssertionError('cache hit invoked synthesis')
         preview.session_factory=Forbidden;self.radio.voice_preview=preview
         # Playback remains available even when all realtime capacity is occupied.
-        self.radio.active={1,2}
+        self.radio.voice_slots={1,2}
         r,data=await self.call({'voice':'ember'});self.assertEqual(r.status,200)
         self.assertTrue(data['cached']);self.assertEqual(data['languages'],['zh-CN','en'])
         self.assertIn('你好',data['text']);self.assertIn('Hello, nice',data['text'])
@@ -175,7 +175,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.created),count+2);self.assertEqual(restarted.status()['failed'],0)
 
     async def test_pending_playback_is_immediate_and_worker_waits_for_capacity(self):
-        preview=self.radio.voice_preview;self.radio.active={1,2}
+        preview=self.radio.voice_preview;self.radio.voice_slots={1,2}
         r,data=await self.call({'voice':'cove'});self.assertEqual(r.status,409)
         self.assertIn('验证 Cove',data['error']);await asyncio.sleep(.02)
         self.assertEqual(self.created,[]);self.assertTrue(preview.status()['waitingForCapacity'])
@@ -206,7 +206,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self,*args):raise RuntimeError('fixture construction failure')
         preview.session_factory=Broken
         with self.assertRaises(RuntimeError):await preview.render('cove',self.uid)
-        self.assertFalse(preview.busy);self.assertEqual(self.radio.active,set())
+        self.assertFalse(preview.busy);self.assertEqual(self.radio.voice_slots,set())
 
     async def test_wrong_language_or_paraphrase_is_not_published_but_good_language_is_preserved(self):
         preview=self.radio.voice_preview

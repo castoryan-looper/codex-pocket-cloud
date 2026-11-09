@@ -229,6 +229,9 @@ class VoiceSession:
         self.audio_segment = 0
         self.output_event_epoch = 0
         self.agent_radio = None
+        self.radio = None
+        self.voice_lock = asyncio.Lock()
+        self.warming_turn = False
         self.agent_request_id = None
         self.voice_override=None
         self.voice='cove'
@@ -247,6 +250,8 @@ class VoiceSession:
         return task
 
     async def send(self, packet):
+        if self.warming_turn and packet.get('type') in ('connecting', 'ready'):
+            return
         if packet.get('type') == 'ready' and self.agent_radio:
             packet = {**packet, **self.agent_radio.channel_info(self)}
         if not self.ws.closed: await self.ws.send_json(packet)
@@ -355,9 +360,20 @@ class VoiceSession:
                 await self.send({'type': 'ready', 'channel': channel})
                 reused = True
         if not reused:
-            await self.start(channel)
+            if self.radio and self not in self.radio.voice_slots:
+                self.recording = False
+                self.pending_audio.clear()
+                await self.cold_ready(channel)
+            else:
+                await self.start(channel)
         LOG.info('Voxi channel ready sessionId=%s channel=%s reusedSpeech=%s elapsedMs=%s',
                  self.session_id, channel, reused, round((time.monotonic() - began) * 1000))
+
+    async def cold_ready(self, channel=0):
+        self.channel = channel
+        self.ready = True
+        await self.send_channel_catalog()
+        await self.send({'type': 'ready', 'channel': channel})
 
     async def start(self, channel=0):
         from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration
@@ -657,10 +673,26 @@ class VoiceSession:
                 self.pending_audio.clear()
                 await self.send({'type': 'idle', 'reason': 'too_short'})
                 return
+            if self.radio and self not in self.radio.voice_slots:
+                pcm = bytes(self.pending_audio)
+                self.pending_audio.clear()
+                self.ready = False
+                await self.send({'type': 'thinking'})
+                self.warming_turn = True
+                try:
+                    acquired = await self.radio.warm_voice(self, reuse_idle=True)
+                finally:
+                    self.warming_turn = False
+                if not acquired:
+                    self.ready = True
+                    await self.send({'type': 'idle', 'reason': 'voice_capacity'})
+                    return
+                self.pending_audio.extend(pcm)
             if self.agent_radio and self.agent_radio.channel_info(self).get('channelMode') in ('agent','openclaw','disabled'):
                 self.ready=False
                 await self.send({'type':'thinking'})
                 pcm=bytes(self.pending_audio);self.pending_audio.clear()
+                if self.radio: self.radio.record_voice(self.bytes)
                 self.spawn(self.agent_radio.agent_voice(self,pcm))
                 return
             # A live route edit can change a speech-only channel into FAST.
@@ -677,6 +709,7 @@ class VoiceSession:
             self.emitted_baseline=getattr(self.input_track,'emitted_bytes',0)
             if self.memory_capture: self.memory_capture(self, bytes(self.pending_audio))
             self.input_track.submit(bytes(self.pending_audio)+bytes(38400))
+            if self.radio: self.radio.record_voice(self.bytes)
             self.pending_audio.clear()
             await self.send({'type': 'thinking'})
             turn = self.turn
@@ -740,6 +773,8 @@ class VoiceSession:
 class VoxiRadio:
     def __init__(self, owner, binary):
         self.owner, self.binary, self.active = owner, binary, set()
+        self.voice_slots = set()
+        self.voice_pool_lock = asyncio.Lock()
         self.max_sessions = max(1,min(4,int(os.environ.get("VOXI_MAX_SESSIONS","2"))))
         self.retry_after = 0
         self.settings = VoiceSettings(getattr(owner, 'runtime', None))
@@ -759,6 +794,54 @@ class VoxiRadio:
             self.agent=AgentHub(owner.runtime,owner.config['cwd'],Rpc)
             self.agent.context_provider=lambda uid:self.memory.context(uid) if self.memory else ''
             self.agent.listeners.add(self.agent_event)
+
+    def can_park(self, session):
+        return (session in self.active and not session.ws.closed and session.ready
+                and not (session.recording or session.allow_output or session.outputting
+                         or session.research_pending or session.voice_lock.locked())
+                and session.continuation_until <= time.monotonic())
+
+    async def warm_voice(self, session, *, reuse_idle=False):
+        if time.monotonic() < self.retry_after:
+            return False
+        async with self.voice_pool_lock:
+            if len(self.voice_slots) >= self.max_sessions:
+                if not reuse_idle:
+                    return False
+                parked = min((s for s in self.voice_slots if self.can_park(s)),
+                             key=lambda s: s.release_at or 0, default=None)
+                if parked is None:
+                    return False
+                async with parked.voice_lock:
+                    # Keep the device ready for local recording while its idle peer is recycled.
+                    await parked.stop()
+                    self.voice_slots.discard(parked)
+                    parked.ready = True
+            self.voice_slots.add(session)
+        await session.start(session.channel)
+        return True
+
+    def record_voice(self, byte_count):
+        if self.memory:
+            try: self.memory.record_voice(byte_count // 48)
+            except Exception: LOG.warning('Voxi voice aggregate could not be saved')
+
+    async def overview(self, request):
+        if request.headers.get('Origin') or not hmac.compare_digest(
+                request.headers.get('Authorization', ''), 'Bearer '+self.owner.config['device_token']):
+            raise web.HTTPForbidden()
+        occupied = sum(not self.can_park(s) for s in self.voice_slots)
+        agent = None
+        if self.agent:
+            agent = {**self.agent.store.product_metrics(), 'running': len(self.agent.active)}
+        value = {
+            'audience': self.memory.product_metrics() if self.memory else None,
+            'voice': {'capacity': self.max_sessions, 'occupied': occupied,
+                      'warmed': len(self.voice_slots)-occupied,
+                      'available': 0 if time.monotonic() < self.retry_after else max(0, self.max_sessions-occupied)},
+            'agent': agent,
+        }
+        return web.json_response(value, headers={'Cache-Control': 'no-store'})
 
     def channel_info(self, session, channel=None):
         if not self.agent:return {}
@@ -985,10 +1068,6 @@ class VoxiRadio:
         if request.headers.get('Origin') or not hmac.compare_digest(
                 request.headers.get('Authorization', ''), 'Bearer '+self.owner.config['device_token']):
             raise web.HTTPForbidden()
-        if len(self.active)>=self.max_sessions:
-            raise web.HTTPServiceUnavailable(text='Native voice session capacity reached', headers={'Retry-After':'5','X-Voxi-Rejection':'session-limit'})
-        if time.monotonic() < self.retry_after:
-            raise web.HTTPServiceUnavailable(text='Native voice retry cooldown', headers={'Retry-After':'30'})
         ws = web.WebSocketResponse(heartbeat=20,max_msg_size=8192,writer_limit=32768)
         session = VoiceSession(ws, self.binary)
         session.settings_source = self.settings
@@ -999,10 +1078,13 @@ class VoxiRadio:
         session.memory_store=self.memory
         session.memory_capture=self.capture_memory
         session.agent_radio=self
-        self.active.add(session) # reserve before the first await; concurrent admission is bounded
+        session.radio=self
+        self.active.add(session)
         try:
             await ws.prepare(request)
-            await session.start()
+            async with session.voice_lock:
+                if not await self.warm_voice(session):
+                    await session.cold_ready()
             if self.agent and self.agent.store.settings()['enabled']:
                 self.agent.start()
             async for packet in ws:
@@ -1010,7 +1092,8 @@ class VoxiRadio:
                 elif packet.type == WSMsgType.TEXT:
                     event = json.loads(packet.data)
                     if not isinstance(event,dict): raise ValueError('Expected object')
-                    await session.control(event)
+                    async with session.voice_lock:
+                        await session.control(event)
         except Exception as error:
             self.retry_after = time.monotonic()+30
             detail = str(error) if isinstance(error, VoiceFailure) else diagnostic_reason(error)
@@ -1019,8 +1102,10 @@ class VoxiRadio:
                 await session.send({'type': 'error', 'message': f'Native voice failed at {session.phase}: {detail}'})
         finally:
             try:
-                await session.stop()
+                async with session.voice_lock:
+                    await session.stop()
             finally:
+                self.voice_slots.discard(session)
                 self.active.discard(session)
                 await ws.close()
         return ws

@@ -1387,6 +1387,7 @@ class Pocket:
         self.voxi_radio = VoxiRadio(self, codex_binary())
         app.router.add_get('/voxi', self.voxi_radio.websocket)
         app.router.add_get('/voxi/config', self.voxi_radio.configuration)
+        app.router.add_get('/voxi/overview', self.voxi_radio.overview)
         app.router.add_post('/voxi/config', self.voxi_radio.configuration)
         app.router.add_get('/voxi/devices', self.voxi_radio.memory_configuration)
         app.router.add_get('/voxi/memory', self.voxi_radio.memory_configuration)

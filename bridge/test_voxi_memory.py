@@ -14,6 +14,19 @@ A='esp32-111111111111'
 B='esp32-222222222222'
 
 class MemoryTests(unittest.TestCase):
+    def test_voice_counts_survive_restart_and_today_uses_beijing_midnight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store=MemoryStore(directory)
+            beijing_midnight=86400*20000-8*3600
+            with patch('voxi_memory.time.time',return_value=beijing_midnight-1):
+                store.record_voice(1200)
+            with patch('voxi_memory.time.time',return_value=beijing_midnight+1):
+                reopened=MemoryStore(directory)
+                self.assertEqual(reopened.product_metrics()['todayTurns'],0)
+                reopened.record_voice(3000)
+                stats=reopened.product_metrics()
+            self.assertEqual((stats['voiceTurns'],stats['voiceInputMs'],stats['todayTurns'],stats['todayInputMs']),(2,4200,1,3000))
+
     def test_device_name_migration_preserves_identity_and_memory(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'voxi-memory.sqlite3'

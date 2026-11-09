@@ -47,6 +47,7 @@ class AgentStore:
         CREATE TABLE IF NOT EXISTS approvals(task_id TEXT PRIMARY KEY,request TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS secrets(provider TEXT PRIMARY KEY,ciphertext TEXT NOT NULL,updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS usage(task_id TEXT PRIMARY KEY,input_tokens INTEGER,output_tokens INTEGER,total_tokens INTEGER);
+        CREATE TABLE IF NOT EXISTS thread_usage(thread_id TEXT PRIMARY KEY,total_tokens INTEGER NOT NULL);
         ''')
         columns={r['name'] for r in self.db.execute('PRAGMA table_info(tasks)')}
         for name,definition in [('engine',"TEXT NOT NULL DEFAULT 'codex'"),('connection_id','TEXT')]:
@@ -208,6 +209,28 @@ class AgentStore:
             n=usage.get(key); return n if type(n) is int and n >= 0 else None
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO usage VALUES(?,?,?,?)', (ident,count('inputTokens'),count('outputTokens'),count('totalTokens')))
+
+    def product_metrics(self):
+        row = self.db.execute("""SELECT count(*) AS tasks,
+          count(CASE WHEN state='queued' THEN 1 END) AS queued,
+          count(CASE WHEN state='completed' THEN 1 END) AS completed,
+          count(CASE WHEN state IN ('failed','interrupted','delivery_unknown') THEN 1 END) AS unresolved,
+          count(DISTINCT CASE WHEN engine='codex' THEN thread_id END) AS codexThreads
+          FROM tasks""").fetchone()
+        covered, tokens = self.db.execute('SELECT count(*),sum(total_tokens) FROM thread_usage').fetchone()
+        return {**dict(row),'threadsWithUsage':covered,'totalTokens':tokens}
+
+    def record_thread_usage(self, thread, total):
+        if not isinstance(total, dict):
+            return
+        tokens = total.get('totalTokens')
+        if type(tokens) is not int or not 0 <= tokens <= 2**63-1:
+            return
+        with self.db:
+            self.db.execute("""INSERT INTO thread_usage(thread_id,total_tokens)
+                SELECT ?,? WHERE EXISTS(SELECT 1 FROM tasks WHERE thread_id=? AND engine='codex')
+                ON CONFLICT(thread_id) DO UPDATE SET total_tokens=excluded.total_tokens
+                WHERE excluded.total_tokens>thread_usage.total_tokens""", (thread, tokens, thread))
 
     def _cipher(self):
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM

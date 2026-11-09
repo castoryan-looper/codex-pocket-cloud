@@ -105,6 +105,22 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hub.store.task(task['id'])['state'],'cancelling')
         await self.hub.notification({'method':'turn/completed','params':{'threadId':task['thread_id'],'turn':{'id':task['turn_id'],'status':'interrupted'}}})
         self.assertEqual(self.hub.store.task(task['id'])['state'],'cancelled')
+
+    async def test_late_usage_is_aggregated_once_for_the_finished_turn(self):
+        task,_=self.hub.submit(USER,None,1,'usage-test','inspect')
+        task=await self.running(task['id'])
+        await self.complete(task)
+        self.assertIsNone(self.hub.store.product_metrics()['totalTokens'])
+        event={'method':'thread/tokenUsage/updated','params':{
+            'threadId':task['thread_id'],'turnId':task['turn_id'],
+            'tokenUsage':{'last':{'inputTokens':100,'outputTokens':20,'totalTokens':120},'total':{'totalTokens':480}}}}
+        await self.hub.notification(event)
+        await self.hub.notification(event)
+        stats=self.hub.store.product_metrics()
+        self.assertEqual((stats['completed'],stats['threadsWithUsage'],stats['totalTokens']),(1,1,480))
+        self.hub.store.record_thread_usage(task['thread_id'],{'totalTokens':200})
+        self.hub.store.record_thread_usage('unrelated-thread',{'totalTokens':999})
+        self.assertEqual(self.hub.store.product_metrics()['totalTokens'],480)
     async def test_submit_timeout_is_not_replayed(self):
         rpc=await self.hub.ensure_rpc();original=rpc.call
         async def call(method,params=None):

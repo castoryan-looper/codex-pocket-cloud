@@ -194,6 +194,15 @@ class AgentHub:
                 if self.store.task(ident)['engine']=='codex' and self.store.task(ident)['state'] in LIVE:
                     await self.change(ident,state='interrupted',summary=self.runtime_error)
             return
+        if method=='thread/tokenUsage/updated':
+            usage=params.get('tokenUsage') or {}
+            self.store.record_thread_usage(params.get('threadId'),usage.get('total'))
+            if params.get('threadId') and params.get('turnId'):
+                row=self.store.db.execute("SELECT id FROM tasks WHERE engine='codex' AND thread_id=? AND turn_id=?",
+                                          (params['threadId'],params['turnId'])).fetchone()
+                if row:
+                    self.store.set_usage(row['id'],usage.get('last'))
+                    return
         task=self.for_thread(params.get('threadId'))
         if not task:
             if 'id' in msg and self.rpc:

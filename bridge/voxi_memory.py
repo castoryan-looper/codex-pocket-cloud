@@ -29,6 +29,7 @@ class MemoryStore:
         CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,last_seen REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS turns(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,device_id TEXT NOT NULL,text TEXT NOT NULL,created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS memories(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,text TEXT NOT NULL,source TEXT NOT NULL,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS voice_daily(day INTEGER PRIMARY KEY,turns INTEGER NOT NULL,input_ms INTEGER NOT NULL);
         ''')
         if 'name' not in {r['name'] for r in self.db.execute('PRAGMA table_info(devices)')}:
             self.db.execute("ALTER TABLE devices ADD COLUMN name TEXT NOT NULL DEFAULT ''");self.db.commit()
@@ -96,6 +97,31 @@ class MemoryStore:
     @database
     def registry(self):
         return {'devices':[dict(r) for r in self.db.execute('SELECT devices.*,users.name AS user_name FROM devices JOIN users ON users.id=devices.user_id ORDER BY last_seen DESC')]}
+
+    @database
+    def record_voice(self, input_ms):
+        day = int((time.time() + 8 * 3600) // 86400)
+        with self.db:
+            self.db.execute('''INSERT INTO voice_daily VALUES(?,1,?)
+                ON CONFLICT(day) DO UPDATE SET turns=turns+1,input_ms=input_ms+excluded.input_ms''',
+                (day, input_ms))
+
+    @database
+    def product_metrics(self):
+        now = time.time()
+        day = int((now + 8 * 3600) // 86400)
+        users, enabled = self.db.execute('SELECT count(*),coalesce(sum(enabled),0) FROM users').fetchone()
+        devices, users_week = self.db.execute('''SELECT count(*),count(DISTINCT CASE WHEN last_seen>=? THEN user_id END)
+            FROM devices''', (now-7*86400,)).fetchone()
+        voice = self.db.execute('''SELECT min(day),sum(turns),sum(input_ms),
+            coalesce(sum(CASE WHEN day=? THEN turns END),0),
+            coalesce(sum(CASE WHEN day=? THEN input_ms END),0) FROM voice_daily''', (day, day)).fetchone()
+        first, turns, input_ms, today_turns, today_ms = voice
+        return {'users':users,'enabledUsers':enabled,'devices':devices,'usersSeen7d':users_week,
+                'voiceTurns':turns,'voiceInputMs':input_ms,
+                'todayTurns':today_turns if first is not None else None,
+                'todayInputMs':today_ms if first is not None else None,
+                'firstVoiceDay':(first * 86400 - 8 * 3600) if first is not None else None}
     @database
     def snapshot(self):
         return {'users':[dict(r) for r in self.db.execute('SELECT * FROM users ORDER BY name')],
