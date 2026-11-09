@@ -22,6 +22,7 @@ from collections import deque
 
 from aiohttp import web, WSMsgType
 from voxi_config import VoiceSettings, effective_prompt, VOICE_TASK_INSTRUCTIONS
+from voxi_agent_store import CHANNEL_LIMIT, MISSING_CHANNEL, channel_routes, route_engine
 from voxi_memory import MemoryStore, device_id
 from voice_recovery import offer_audio_nack, configure_audio_recovery
 from voxi_voices import validate_voice
@@ -237,6 +238,9 @@ class VoiceSession:
         self.voice='cove'
         self.agent_speech_only=False
         self.sent_channel_catalog=None
+        self.channel_catalog_lock=asyncio.Lock()
+        self.channel_limit=4
+        self.recording_route=None
         self.preview_mode=False
         self.preview_text=''
         self.preview_language=''
@@ -259,17 +263,20 @@ class VoiceSession:
     async def send_channel_catalog(self):
         if not self.agent_radio or self.preview_mode or self.ws.closed:
             return
-        routes = self.agent_radio.channel_catalog(self)
-        if routes == self.sent_channel_catalog:
-            return
-        rows = [[name, mode, channel_label_bitmap(name) if mode != 'disabled' else '']
-                for name, mode in routes]
-        # The firmware accepts at most 2048 bytes per frame. UTF-8 and four
-        # fixed-size labels keep the whole catalog atomic within that limit.
-        payload = json.dumps({'type': 'channel_catalog', 'channels': rows},
-                             ensure_ascii=False, separators=(',', ':'))
-        self.sent_channel_catalog = routes
-        await self.ws.send_str(payload)
+        async with self.channel_catalog_lock:
+            routes = self.agent_radio.channel_catalog(self)
+            if routes == self.sent_channel_catalog:
+                return
+            rows = [[name, mode, channel_label_bitmap(name) if mode != 'disabled' else '']
+                    for name, mode in routes]
+            # Four bitmap rows fit in a 2048-byte device frame. Extended firmware
+            # stages all blocks before applying the new catalog.
+            for offset in range(0, len(rows), 4):
+                packet = {'type': 'channel_catalog', 'channels': rows[offset:offset+4]}
+                if len(rows) > 4:
+                    packet.update(offset=offset, total=len(rows))
+                await self.ws.send_str(json.dumps(packet, ensure_ascii=False, separators=(',', ':')))
+            self.sent_channel_catalog = routes
 
     async def say_agent(self, text):
         """Use the existing native speech transport; never feed task text to its tool loop."""
@@ -419,7 +426,7 @@ class VoiceSession:
         await self.peer.setLocalDescription(offer_audio_nack(offer) if self.settings['audioRetransmission'] else offer)
         self.answer = asyncio.get_running_loop().create_future()
         self.phase = 'webrtc-sdp'
-        prompt = effective_prompt(self.settings, channel)
+        prompt = effective_prompt(self.settings, channel if channel < 4 else 0)
         route=self.agent_radio.channel_info(self) if self.agent_radio else {}
         self.agent_speech_only = not self.preview_mode and route.get('channelMode') in ('agent', 'disabled')
         if route:
@@ -643,8 +650,9 @@ class VoiceSession:
         if kind == 'played': self.played = max(0,min(60000,int(event.get('ms',0))))
         elif kind == 'channel':
             channel = event.get('channel')
-            if type(channel) is int and 0 <= channel < 4: await self.switch_channel(channel)
+            if type(channel) is int and 0 <= channel < self.channel_limit: await self.switch_channel(channel)
         elif kind == 'ptt_down' and self.ready and not self.recording and not self.allow_output:
+            self.recording_route=self.agent_radio.route(self) if self.agent_radio and self.agent_radio.agent else None
             self.continuation_until = 0
             self.research_result_waiting = False
             if self.research_watchdog:
@@ -669,6 +677,10 @@ class VoiceSession:
             await self.send({'type': 'recording'})
         elif kind == 'ptt_up' and self.recording:
             self.recording = False
+            if self.agent_radio and self.agent_radio.agent and self.recording_route != self.agent_radio.route(self):
+                self.pending_audio.clear()
+                await self.send({'type':'idle','reason':'channel_changed'})
+                return
             if self.bytes < 4800:
                 self.pending_audio.clear()
                 await self.send({'type': 'idle', 'reason': 'too_short'})
@@ -843,24 +855,34 @@ class VoxiRadio:
         }
         return web.json_response(value, headers={'Cache-Control': 'no-store'})
 
-    def channel_info(self, session, channel=None):
-        if not self.agent:return {}
+    def route(self, session, channel=None):
+        if not self.agent:return None
         cfg=self.agent.store.settings(session.memory_user)
-        if not cfg['enabled']:return {}
+        if not cfg['enabled']:return None
         channel = session.channel if channel is None else channel
-        route=cfg['channels'][channel]
-        latest=self.agent.store.list_tasks(session.memory_user,channel,1) if session.memory_user else []
+        return channel_routes(cfg['channels']).get(channel,MISSING_CHANNEL)
+
+    def channel_info(self, session, channel=None):
+        route=self.route(session,channel)
+        if route is None:return {}
+        channel = session.channel if channel is None else channel
+        engine=route_engine(route)
+        latest=self.agent.store.list_tasks(session.memory_user,channel,1,route=route) if session.memory_user and engine else []
         task=latest[0] if latest else None
-        return {'name':route['name'],'channelMode':'agent' if route['mode']=='openclaw' else route['mode'],
-                'agentProvider':'openclaw' if route['mode']=='openclaw' else 'codex','agentTasks':True,
+        return {'name':route['name'],'channelMode':'agent' if engine else route['mode'],
+                'agentProvider':engine or 'codex','agentTasks':True,
                 'taskId':task['id'] if task else '', 'taskState':task['state'] if task else ''}
 
     def channel_catalog(self, session):
         config = self.agent.store.settings(session.memory_user) if self.agent else None
         managed = config and config['enabled']
         channels = config['channels'] if managed else self.settings.snapshot()['channels']
+        if managed:
+            routes = channel_routes(channels)
+            limit = min(session.channel_limit, max(4, max(routes, default=0)+1))
+            channels = [routes.get(slot, MISSING_CHANNEL) for slot in range(limit)]
         return tuple((''.join(c if unicodedata.category(c)[0] != 'C' else ' ' for c in entry['name'][:32]),
-                      ('agent' if entry['mode'] == 'openclaw' else entry['mode']) if managed else 'legacy')
+                      ('agent' if route_engine(entry) else entry['mode']) if managed else 'legacy')
                      for entry in channels)
 
     async def publish_channel_catalog(self, uid=None):
@@ -872,7 +894,10 @@ class VoxiRadio:
     async def agent_event(self, task):
         for session in tuple(self.active):
             if session.memory_user==task['user_id'] and session.channel==task['channel'] and not session.ws.closed:
-                await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
+                cfg = self.agent.store.settings(session.memory_user)
+                route = channel_routes(cfg['channels']).get(session.channel, MISSING_CHANNEL)
+                if route_engine(route) == task['engine'] and route.get('connectionId') == task['connection_id']:
+                    await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
 
     async def agent_voice(self, session, pcm):
         try:
@@ -881,21 +906,27 @@ class VoxiRadio:
             uid=session.memory_user
             if not uid or not self.memory or self.memory.owner(session.memory_device)!=uid:
                 await session.say_agent('设备还没有绑定用户，请先在管理后台完成绑定。');return
+            channel=session.channel
+            route=channel_routes(self.agent.store.settings(uid)['channels']).get(channel,MISSING_CHANNEL)
             async with self.memory_lock:
                 text=await asyncio.to_thread(self.transcribe_memory,pcm)
             if not text:
                 await session.say_agent('没有听清任务，请再说一次。');return
             if self.memory.owner(session.memory_device)!=uid:return
             # ASR work can finish after a channel change. Never submit its old input.
-            if not self.agent.store.settings(uid)['enabled']:raise ValueError('Agent 未启用')
+            settings=self.agent.store.settings(uid)
+            current=channel_routes(settings['channels']).get(channel,MISSING_CHANNEL)
+            if not settings['enabled'] or session.channel != channel or route != current:
+                await session.say_agent('频道设置已变化，请确认后重新说一遍。');return
             self.memory.record(uid,session.memory_device,session.agent_request_id,text)
             normalized=text.strip().rstrip('。！？!?')
-            tasks=self.agent.store.list_tasks(uid,session.channel,1)
+            tasks=self.agent.store.list_tasks(uid,channel,1,route=route)
             task=tasks[0] if tasks else None
             if normalized in ('查看进度','查询进度','任务进度','读结果','查看结果','任务结果'):
                 if task:
                     await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
-                    await session.say_agent(task['summary'][:900])
+                    spoken=task['result'] if normalized in ('读结果','查看结果','任务结果') and task['result'] else task['summary']
+                    await session.say_agent(spoken[:900])
                 else:await session.say_agent('这个频道还没有任务。')
                 return
             if normalized in ('取消任务','停止任务'):
@@ -911,8 +942,17 @@ class VoxiRadio:
                                                text=normalized[4:].strip('，,：: ') or '继续完成此前尚未完成的任务；先核对已有结果，不重复执行已完成的操作。')
                 await session.send({'type':'task_state','taskId':result['id'],'state':result['state'],'summary':result['summary'][:120]})
             else:
-                result,_=self.agent.submit(uid,session.memory_device,session.channel,session.agent_request_id,text)
+                result,_=self.agent.submit(uid,session.memory_device,channel,session.agent_request_id,text)
                 await session.send({'type':'task_state','taskId':result['id'],'state':result['state'],'summary':result['summary'][:120]})
+                if result['engine']=='model':
+                    deadline=time.monotonic()+6
+                    while time.monotonic()<deadline:
+                        task=self.agent.store.task(result['id'],uid)
+                        if task['state']=='completed':
+                            await session.say_agent(task['result'][:900]);return
+                        if task['state'] in ('failed','cancelled','interrupted','delivery_unknown'):
+                            await session.say_agent(task['summary']);return
+                        await asyncio.sleep(.15)
             await session.say_agent('任务已保存，我会在后台处理。可以说查看进度、读结果，或者取消任务。')
         except asyncio.CancelledError:raise
         except Exception:
@@ -943,7 +983,7 @@ class VoxiRadio:
                     if not isinstance(settings, dict) or not settings or settings.keys() - current.keys():
                         raise ValueError('助手配置字段无效')
                     settings = {**current, **settings}
-                self.agent.openclaw.check_routes(settings.get('channels') if isinstance(settings, dict) else None)
+                self.agent.check_routes(settings.get('channels') if isinstance(settings, dict) else None)
                 self.agent.store.save_settings(settings)
                 await self.publish_channel_catalog()
             elif action=='credential':self.agent.store.save_secret(body.get('provider'),body.get('key'))
@@ -951,7 +991,7 @@ class VoxiRadio:
                 uid=body.get('userId')
                 if not isinstance(uid,str) or not self.memory or not self.memory.user(uid):raise ValueError('用户不存在')
                 if action=='channels':
-                    self.agent.openclaw.check_routes(body.get('channels'),uid)
+                    self.agent.check_routes(body.get('channels'),uid)
                     self.agent.store.save_settings(body.get('channels'),uid)
                     await self.publish_channel_catalog(uid)
                 elif action=='reset_channels':
@@ -1088,6 +1128,8 @@ class VoxiRadio:
             raise web.HTTPForbidden()
         ws = web.WebSocketResponse(heartbeat=20,max_msg_size=8192,writer_limit=32768)
         session = VoiceSession(ws, self.binary)
+        if request.headers.get('X-Voxi-Channels') == 'blocks-v1':
+            session.channel_limit = CHANNEL_LIMIT
         session.settings_source = self.settings
         identifier=device_id(request.headers.get('X-Voxi-Device-Id'))
         session.memory_device=identifier

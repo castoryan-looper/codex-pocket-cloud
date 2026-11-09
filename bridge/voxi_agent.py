@@ -13,7 +13,8 @@ import time
 from collections import defaultdict
 
 from harness import DEVELOPER_INSTRUCTIONS
-from voxi_agent_store import AgentStore, LIVE, TERMINAL
+from voxi_agent_store import AgentStore, LIVE, TERMINAL, CHANNEL_LIMIT, channel_routes, MISSING_CHANNEL, route_engine
+from voxi_models import ModelConnections, PROVIDERS
 from voxi_openclaw import OpenClaw
 
 
@@ -21,6 +22,7 @@ class AgentHub:
     def __init__(self, directory, workspace, rpc_factory):
         self.store=AgentStore(directory)
         self.openclaw=OpenClaw(self)
+        self.models=ModelConnections(self)
         self.workspace=Path(workspace)/'voxi-users'
         self.workspace.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.rpc_factory=rpc_factory
@@ -94,15 +96,23 @@ class AgentHub:
         await self.emit(task)
         return task
 
+    def check_routes(self, channels, user=None):
+        self.openclaw.check_routes(channels, user)
+        for route in self.store.validate_channels(channels):
+            if route['mode'] == 'model' and (not user or not self.models.connection(user, route['connectionId'])):
+                raise ValueError('请选择此用户已验证的模型接入')
+
     def submit(self, user, device, channel, request_id, prompt, thread=None, *, original=None):
         if not re.fullmatch(r'[a-f0-9]{32}',user or ''):raise ValueError('设备尚未绑定有效用户')
         settings=self.store.settings(user)
         if not settings['enabled']:raise ValueError('管理员尚未启用 Voxi Agent')
-        if type(channel) is not int or not 0<=channel<4 or settings['channels'][channel]['mode'] not in ('agent','openclaw'):raise ValueError('当前频道未配置 Agent')
-        route=settings['channels'][channel]
-        engine=original['engine'] if original else ('openclaw' if route['mode']=='openclaw' else 'codex')
+        if type(channel) is not int:raise ValueError('频道编号无效')
+        route=channel_routes(settings['channels']).get(channel, MISSING_CHANNEL)
+        engine=original['engine'] if original else route_engine(route)
+        if not engine:raise ValueError('当前频道未配置助手或模型')
         connection=original['connection_id'] if original else route.get('connectionId')
         if engine=='openclaw' and not self.openclaw.connection(connection,user):raise ValueError('请先接入 OpenClaw 并绑定到此频道')
+        if engine=='model' and not self.models.connection(user,connection):raise ValueError('请先验证并绑定模型接入')
         task,created=self.store.submit(user,device,channel,request_id,prompt,thread,engine=engine,connection=connection)
         self.start()
         return self.store.public_task(task,True),created
@@ -130,6 +140,9 @@ class AgentHub:
             if task['state']!='queued':return
             if task['engine']=='openclaw':
                 await self.openclaw.run(task)
+                return
+            if task['engine']=='model':
+                await self.models.run(task)
                 return
             # Keep queued until the runtime is ready; no side effect was admitted yet.
             rpc=await self.ensure_rpc()
@@ -273,6 +286,10 @@ class AgentHub:
                 await self.change(ident,state='delivery_unknown',summary='已停止等待；直连已断开请求，家中连接器可能仍在执行，请在 OpenClaw 核对或停止')
                 job=self.active.get(ident)
                 if job:job.cancel()
+            elif task['engine']=='model':
+                await self.change(ident,state='delivery_unknown',summary='已停止接收模型回复，供应商可能已处理请求并计费')
+                job=self.active.get(ident)
+                if job:job.cancel()
             elif task['turn_id'] and self.rpc:
                 await self.change(ident,state='cancelling',summary='已请求停止，等待执行器确认')
                 try:await self.rpc.call('turn/interrupt',{'threadId':task['thread_id'],'turnId':task['turn_id']})
@@ -314,6 +331,7 @@ class AgentHub:
         return {'settings':self.store.settings(),'users':users.get('users',[]),'devices':users.get('devices',[]),
                 'channelsByUser':{u['id']:self.store.settings(u['id'])['channels'] for u in users.get('users',[])},
                 'channelOverrides':self.store.channel_overrides(),'connections':self.openclaw.public(),
+                'modelConnections':self.models.public(),'modelProviders':PROVIDERS,'channelLimit':CHANNEL_LIMIT,
                 'preferencesByUser':{u['id']:self.store.preferences(u['id']) for u in users.get('users',[])},
                 'tasks':[self.store.public_task(t) for t in tasks], 'credentials':self.store.credentials(),
                 'runtime':{'engine':'codex-pocket-cloud','ready':self.rpc is not None,'lastError':self.runtime_error,

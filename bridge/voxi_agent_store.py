@@ -16,6 +16,16 @@ from voxi_voices import validate_voice
 
 TERMINAL = {'completed', 'failed', 'cancelled', 'interrupted', 'delivery_unknown'}
 LIVE = {'queued', 'submitting', 'running', 'needs_input', 'awaiting_approval', 'cancelling'}
+CHANNEL_LIMIT = 16
+MISSING_CHANNEL = {'name': '', 'mode': 'disabled'}
+
+
+def channel_routes(channels):
+    return {route.get('slot', index): route for index, route in enumerate(channels)}
+
+
+def route_engine(route):
+    return {'agent': 'codex', 'openclaw': 'openclaw', 'model': 'model'}.get(route['mode'])
 DEFAULTS = {
     'enabled': False, 'model': '', 'maxConcurrent': 2, 'maxTaskSeconds': 1800,
     'instructions': '你是 Voxi Agent。持续完成用户明确委托的工作。只播报必要状态，最终先给简短结论，再给详细结果。',
@@ -46,6 +56,9 @@ class AgentStore:
           summary TEXT NOT NULL,created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS approvals(task_id TEXT PRIMARY KEY,request TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS secrets(provider TEXT PRIMARY KEY,ciphertext TEXT NOT NULL,updated REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS model_connections(
+          id TEXT PRIMARY KEY,user_id TEXT NOT NULL,name TEXT NOT NULL,provider TEXT NOT NULL,
+          model TEXT NOT NULL,workspace TEXT NOT NULL,secret BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS usage(task_id TEXT PRIMARY KEY,input_tokens INTEGER,output_tokens INTEGER,total_tokens INTEGER);
         CREATE TABLE IF NOT EXISTS thread_usage(thread_id TEXT PRIMARY KEY,total_tokens INTEGER NOT NULL);
         ''')
@@ -71,16 +84,26 @@ class AgentStore:
 
     @staticmethod
     def validate_channels(channels):
-        if not isinstance(channels, list) or len(channels) != 4:
-            raise ValueError('当前固件需要恰好 4 个频道（CH0–CH3）')
-        for c in channels:
-            if not isinstance(c, dict) or set(c) not in ({'name', 'mode'},{'name','mode','connectionId'}):
+        if not isinstance(channels, list) or len(channels) > CHANNEL_LIMIT:
+            raise ValueError(f'最多可配置 {CHANNEL_LIMIT} 个频道')
+        result, slots = [], set()
+        for index, c in enumerate(channels):
+            if not isinstance(c, dict) or not {'name','mode'} <= c.keys() or c.keys() - {'name','mode','connectionId','slot'}:
                 raise ValueError('频道需要名称和模式')
-            if not isinstance(c['name'], str) or not 1 <= len(c['name'].strip()) <= 32 or c['mode'] not in ('fast', 'agent', 'openclaw', 'disabled'):
+            slot = c.get('slot', index)
+            if type(slot) is not int or not 0 <= slot < CHANNEL_LIMIT or slot in slots:
+                raise ValueError('频道编号无效或重复')
+            slots.add(slot)
+            if not isinstance(c['name'], str) or not 1 <= len(c['name'].strip()) <= 32 or c['mode'] not in ('fast', 'agent', 'openclaw', 'model', 'disabled'):
                 raise ValueError('频道名称或模式无效')
-            if c['mode']=='openclaw' and (not isinstance(c.get('connectionId'),str) or not 1<=len(c['connectionId'])<=64):
-                raise ValueError('请为 OpenClaw 频道选择连接')
-        return [{**{'name':c['name'].strip(),'mode':c['mode']},**({'connectionId':c['connectionId']} if c['mode']=='openclaw' else {})} for c in channels]
+            route = {'name': c['name'].strip(), 'mode': c['mode']}
+            if 'slot' in c: route['slot'] = slot
+            if c['mode'] in ('openclaw', 'model'):
+                if not isinstance(c.get('connectionId'),str) or not 1<=len(c['connectionId'])<=64:
+                    raise ValueError('请为频道选择已配置的接入')
+                route['connectionId'] = c['connectionId']
+            result.append(route)
+        return result
 
     def reset_channels(self, user):
         with self.db:self.db.execute('DELETE FROM config WHERE key=?',('channels:'+user,))
@@ -122,19 +145,22 @@ class AgentStore:
                               (ident, user) if user else (ident,)).fetchone()
         return dict(row) if row else None
 
-    def list_tasks(self, user=None, channel=None, limit=100):
+    def list_tasks(self, user=None, channel=None, limit=100, *, route=None):
         clauses, args = [], []
         if user:
             clauses.append('user_id=?'); args.append(user)
         if channel is not None:
             clauses.append('channel=?'); args.append(channel)
+        if route is not None:
+            clauses.extend(('engine=?', 'connection_id IS ?'))
+            args.extend((route_engine(route), route.get('connectionId')))
         query = 'SELECT * FROM tasks' + (' WHERE ' + ' AND '.join(clauses) if clauses else '')
         return [dict(r) for r in self.db.execute(query + ' ORDER BY created DESC LIMIT ?', (*args, min(200, limit)))]
 
     def submit(self, user, device, channel, request_id, prompt, thread=None, *, engine='codex', connection=None):
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
             raise ValueError('需要 1–128 字符的请求编号')
-        if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 8000 or type(channel) is not int or not 0 <= channel < 4:
+        if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 8000 or type(channel) is not int or not 0 <= channel < CHANNEL_LIMIT:
             raise ValueError('任务内容或频道无效')
         old = self.db.execute('SELECT * FROM tasks WHERE user_id=? AND request_id=?', (user, request_id)).fetchone()
         if old:
@@ -238,7 +264,7 @@ class AgentStore:
         if not path.exists():
             connections=self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='openclaw_connections'").fetchone()
             encrypted_connections=connections and self.db.execute("SELECT count(*) FROM openclaw_connections WHERE transport='https'").fetchone()[0]
-            if self.db.execute('SELECT count(*) FROM secrets').fetchone()[0] or encrypted_connections:
+            if self.db.execute('SELECT count(*) FROM secrets').fetchone()[0] or encrypted_connections or self.db.execute('SELECT 1 FROM model_connections LIMIT 1').fetchone():
                 raise ValueError('凭据加密密钥缺失，请恢复备份，不能重新生成')
             try:
                 with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:

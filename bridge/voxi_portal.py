@@ -7,6 +7,8 @@ import hmac
 import json
 import re
 from aiohttp import web
+from voxi_agent_store import CHANNEL_LIMIT
+from voxi_models import PROVIDERS
 from voxi_voices import catalog,validate_voice
 
 
@@ -18,6 +20,7 @@ class UserPortal:
         return {**r.memory.owned_snapshot(uid),'role':'user','serviceEnabled':cfg['enabled'],
                 'channels':cfg['channels'],'inheritsChannels':uid not in hub.store.channel_overrides(),
                 'preferences':hub.store.preferences(uid),'connections':hub.openclaw.public(uid),
+                'modelConnections':hub.models.public(uid),'modelProviders':PROVIDERS,'channelLimit':CHANNEL_LIMIT,
                 'voiceSettings':r.voice_preview.enrich(catalog(r.settings.snapshot()['voice'],hub.store.preferences(uid)['voice'])),
                 'tasks':[hub.store.public_task(t) for t in hub.store.list_tasks(uid)],
                 'capabilities':{'openclaw':True,'userPortal':1}}
@@ -50,7 +53,7 @@ class UserPortal:
                 voice=validate_voice(body.get('voice'),inherit=True)
                 hub.store.save_preferences(uid,{**hub.store.preferences(uid),'voice':voice})
             elif action=='channels':
-                hub.openclaw.check_routes(body.get('channels'),uid);hub.store.save_settings(body.get('channels'),uid)
+                hub.check_routes(body.get('channels'),uid);hub.store.save_settings(body.get('channels'),uid)
                 await r.publish_channel_catalog(uid)
             elif action=='reset_channels':
                 hub.store.reset_channels(uid)
@@ -62,6 +65,11 @@ class UserPortal:
             elif action=='test_openclaw':
                 return web.json_response(await hub.openclaw.probe(uid,body.get('connectionId')),headers={'Cache-Control':'no-store'})
             elif action=='delete_openclaw':hub.openclaw.delete(uid,body.get('connectionId'))
+            elif action=='connect_model':
+                return web.json_response(await hub.models.create(uid,body),headers={'Cache-Control':'no-store'})
+            elif action=='test_model':
+                return web.json_response(await hub.models.probe(uid,body.get('connectionId')),headers={'Cache-Control':'no-store'})
+            elif action=='delete_model':hub.models.delete(uid,body.get('connectionId'))
             elif action=='submit':
                 task,_=hub.submit(uid,None,body.get('channel'),body.get('requestId'),body.get('text'))
                 return web.json_response({'task':task},headers={'Cache-Control':'no-store'})
