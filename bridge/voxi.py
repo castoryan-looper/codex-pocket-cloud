@@ -853,9 +853,15 @@ class VoxiRadio:
                 return web.json_response(result,headers={'Cache-Control':'no-store'})
             if action=='create_profile':
                 return web.json_response({'profile':self.memory.create_user(body.get('name'))},headers={'Cache-Control':'no-store'})
-            if action=='settings':
-                self.agent.openclaw.check_routes((body.get('settings') or {}).get('channels'))
-                self.agent.store.save_settings(body.get('settings'))
+            if action in ('settings', 'settings_patch'):
+                settings = body.get('settings')
+                if action == 'settings_patch':
+                    current = self.agent.store.settings()
+                    if not isinstance(settings, dict) or not settings or settings.keys() - current.keys():
+                        raise ValueError('助手配置字段无效')
+                    settings = {**current, **settings}
+                self.agent.openclaw.check_routes(settings.get('channels') if isinstance(settings, dict) else None)
+                self.agent.store.save_settings(settings)
                 await self.publish_channel_catalog()
             elif action=='credential':self.agent.store.save_secret(body.get('provider'),body.get('key'))
             else:
@@ -959,6 +965,12 @@ class VoxiRadio:
         if request.method == 'POST':
             try:
                 value = await request.json()
+                if isinstance(value, dict) and set(value) == {'patch'}:
+                    changes = value['patch']
+                    current = self.settings.snapshot()
+                    if not isinstance(changes, dict) or not changes or changes.keys() - current.keys() or 'channels' in changes:
+                        raise ValueError('语音配置字段无效')
+                    value = {**current, **changes}
                 self.settings.save(value)
                 await self.publish_channel_catalog()
             except (ValueError, TypeError):

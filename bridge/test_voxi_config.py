@@ -63,5 +63,9 @@ class ConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status,200)
                 self.assertIn('长故事', (await response.json())['effectivePrompts'][0])
                 self.assertEqual(VoiceSettings(directory).snapshot(), value)
+                response=await client.post('/voxi/config',headers=headers,json={'patch':{'voice':'maple'}})
+                self.assertEqual(response.status,200)
+                self.assertEqual(VoiceSettings(directory).snapshot(),{**value,'voice':'maple'})
+                self.assertEqual((await client.post('/voxi/config',headers=headers,json={'patch':{'channels':[]}})).status,400)
                 value['voice']='unsupported'
                 self.assertEqual((await client.post('/voxi/config',headers=headers,json=value)).status,400)

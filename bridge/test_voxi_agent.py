@@ -199,6 +199,18 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status,200);task=(await response.json())['task'];self.assertEqual(task['state'],'queued')
         response=await self.client.post('/voxi/agent',headers=self.headers,json={'action':'detail','userId':OTHER,'taskId':task['id']})
         self.assertEqual(response.status,400)
+
+    async def test_settings_patch_saves_only_requested_fields(self):
+        original = self.radio.agent.store.settings()
+        for patch in ({'enabled': True}, {'instructions': '先给简洁结论。'}):
+            response = await self.client.post('/voxi/agent', headers=self.headers,
+                                              json={'action': 'settings_patch', 'settings': patch})
+            self.assertEqual(response.status, 200)
+        self.assertEqual(self.radio.agent.store.settings(),
+                         {**original, 'enabled': True, 'instructions': '先给简洁结论。'})
+        response = await self.client.post('/voxi/agent', headers=self.headers,
+                                          json={'action': 'settings_patch', 'settings': {'unknown': True}})
+        self.assertEqual(response.status, 400)
     async def test_voice_dispatch_saves_before_ack_without_sending_pcm_to_realtime(self):
         cfg=copy.deepcopy(DEFAULTS);cfg['enabled']=True;self.radio.agent.store.save_settings(cfg)
         socket=SimpleNamespace(closed=False,send_json=AsyncMock())
