@@ -196,6 +196,7 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.radio.agent.rpc_factory=Rpc
         self.uid=self.radio.memory.bind('esp32-111111111111')
         app=web.Application();app.router.add_get('/voxi/agent',self.radio.agent_configuration);app.router.add_post('/voxi/agent',self.radio.agent_configuration)
+        app.router.add_post('/voxi/memory',self.radio.memory_configuration)
         self.client=TestClient(TestServer(app));await self.client.start_server()
         self.headers={'Authorization':'Bearer internal-only'}
     async def asyncTearDown(self):await self.client.close();await self.radio.agent.close();self.temp.cleanup()
@@ -215,6 +216,28 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status,200);task=(await response.json())['task'];self.assertEqual(task['state'],'queued')
         response=await self.client.post('/voxi/agent',headers=self.headers,json={'action':'detail','userId':OTHER,'taskId':task['id']})
         self.assertEqual(response.status,400)
+
+    async def test_admin_user_detail_is_scoped_to_owner_and_selected_section(self):
+        device='esp32-111111111111';other_device='esp32-222222222222'
+        other=self.radio.memory.bind(other_device)
+        for uid,identifier,mark in [(self.uid,device,'first'),(other,other_device,'second')]:
+            self.radio.memory.record(uid,identifier,mark,mark+' private transcript')
+            self.radio.agent.store.submit(uid,identifier,1,mark,mark+' task')
+        payload={'action':'user_detail','userId':self.uid,'section':'memory'}
+        self.assertEqual((await self.client.post('/voxi/memory',json=payload)).status,403)
+        response=await self.client.post('/voxi/memory',headers=self.headers,json=payload)
+        memory=await response.json()
+        self.assertEqual([d['id'] for d in memory['devices']],[device])
+        self.assertEqual([t['text'] for t in memory['turns']],['first private transcript'])
+        self.assertNotIn('agent',memory)
+        response=await self.client.post('/voxi/memory',headers=self.headers,json={**payload,'section':'tasks'})
+        tasks=await response.json()
+        self.assertEqual([t['user_id'] for t in tasks['agent']['tasks']],[self.uid])
+        self.assertNotIn('turns',tasks)
+        response=await self.client.post('/voxi/memory',headers=self.headers,json={'action':'directory'})
+        directory=(await response.json())['profiles']
+        self.assertEqual({p['id']:p['deviceCount'] for p in directory},{self.uid:1,other:1})
+        self.assertTrue(all('profile' not in p for p in directory))
 
     async def test_settings_patch_saves_only_requested_fields(self):
         original = self.radio.agent.store.settings()

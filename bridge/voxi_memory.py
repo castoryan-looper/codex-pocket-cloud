@@ -66,7 +66,7 @@ class MemoryStore:
     @database
     def owned_snapshot(self, uid):
         return {'profile':self.user(uid),
-                'devices':[dict(r) for r in self.db.execute('SELECT * FROM devices WHERE user_id=? ORDER BY last_seen DESC',(uid,))],
+                'devices':self.user_devices(uid),
                 'memories':[dict(r) for r in self.db.execute('SELECT * FROM memories WHERE user_id=? ORDER BY created DESC',(uid,))],
                 'turns':[dict(r) for r in self.db.execute('SELECT * FROM turns WHERE user_id=? ORDER BY created DESC LIMIT 200',(uid,))]}
     @database
@@ -97,6 +97,15 @@ class MemoryStore:
     @database
     def registry(self):
         return {'devices':[dict(r) for r in self.db.execute('SELECT devices.*,users.name AS user_name FROM devices JOIN users ON users.id=devices.user_id ORDER BY last_seen DESC')]}
+
+    @database
+    def user_directory(self):
+        return [dict(row) for row in self.db.execute('''SELECT users.id,users.name,users.enabled,count(devices.id) AS deviceCount
+            FROM users LEFT JOIN devices ON devices.user_id=users.id GROUP BY users.id ORDER BY users.name,users.id''')]
+
+    @database
+    def user_devices(self, uid):
+        return [dict(row) for row in self.db.execute('SELECT * FROM devices WHERE user_id=? ORDER BY last_seen DESC',(uid,))]
 
     @database
     def record_voice(self, input_ms):
@@ -130,7 +139,7 @@ class MemoryStore:
                 'turns':[dict(r) for r in self.db.execute('SELECT * FROM turns ORDER BY created DESC LIMIT 500')],
                 'policy':'每用户保留最近200条用户转写、最多100条记忆；不保存录音。自动提取仅覆盖明确偏好，可能有转写误差，可编辑删除。新连接或切换频道加载最新记忆。'}
     @database
-    def change(self, body):
+    def change(self, body, *, snapshot=True):
         action=body.get('action');uid=body.get('userId')
         if not isinstance(uid,str) or not self.user(uid):raise ValueError('用户不存在')
         with self.db:
@@ -161,4 +170,4 @@ class MemoryStore:
                 if not identifier or not self.owner(identifier):raise ValueError('设备不存在')
                 self.db.execute('UPDATE devices SET user_id=? WHERE id=?',(uid,identifier))
             else:raise ValueError('操作不支持')
-        return self.snapshot()
+        return self.snapshot() if snapshot else {}

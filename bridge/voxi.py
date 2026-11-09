@@ -1027,17 +1027,35 @@ class VoxiRadio:
             try:
                 body=await request.json()
                 if not isinstance(body,dict):raise ValueError('无效请求')
-                result=self.memory.change(body)
                 uid=body.get('userId')
-                if body.get('action')!='rename_device':self.memory_revision[uid]=self.memory_revision.get(uid,0)+1
-                if body.get('action') in ('profile','memory','delete_memory','delete_turn','clear'):
+                action=body.get('action')
+                if action=='directory':
+                    return web.json_response({'profiles':self.memory.user_directory()},headers={'Cache-Control':'no-store'})
+                if action=='user_detail':
+                    section=body.get('section')
+                    if section not in ('profile','devices','memory','tasks'):raise ValueError('用户页面无效')
+                    profile=self.memory.user(uid) if isinstance(uid,str) else None
+                    if not profile:raise ValueError('用户档案不存在')
+                    detail={'profile':profile,'devices':self.memory.user_devices(uid)}
+                    if section=='memory':detail=self.memory.owned_snapshot(uid)
+                    if section=='tasks':
+                        detail['agent']=None
+                        if self.agent:
+                            cfg=self.agent.store.settings(uid)
+                            detail['agent']={'enabled':cfg['enabled'],'channels':cfg['channels'],
+                                'tasks':[self.agent.store.public_task(t) for t in self.agent.store.list_tasks(uid)]}
+                    return web.json_response(detail,headers={'Cache-Control':'no-store'})
+                result=self.memory.change(body,snapshot=body.get('returnSnapshot') is not False)
+                if action!='rename_device':self.memory_revision[uid]=self.memory_revision.get(uid,0)+1
+                if action in ('profile','memory','delete_memory','delete_turn','clear'):
                     for session in list(self.active):
                         if session.memory_user==uid:await session.ws.close(code=1012,message=b'Memory context updated')
-                if body.get('action')=='rebind':
+                if action=='rebind':
                     # Existing sessions retain no access after ownership changes.
                     for session in list(self.active):
                         if session.memory_device==body.get('deviceId'):await session.ws.close(code=1012,message=b'Device owner changed')
-            except (ValueError,TypeError) as error:raise web.HTTPBadRequest(text=str(error))
+            except (ValueError,TypeError) as error:
+                return web.json_response({'error':str(error)},status=400,headers={'Cache-Control':'no-store'})
         else:result=self.memory.snapshot()
         result.update({'pendingTranscriptions':len(self.memory_tasks),'lastError':self.memory_error})
         return web.json_response(result,headers={'Cache-Control':'no-store'})
