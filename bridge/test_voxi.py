@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import time
 import importlib.util
@@ -15,6 +16,7 @@ class Socket:
     closed = False
     def __init__(self): self.packets = []
     async def send_json(self, packet): self.packets.append(packet)
+    async def send_str(self, packet): self.packets.append(packet)
 
 
 class Channel:
@@ -25,6 +27,33 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_channel_catalog_is_owner_scoped_bounded_and_deduplicated(self):
+        owner = 'device-owner'
+        routes = [{'name': '𠮷' * 32, 'mode': 'fast'} for _ in range(4)]
+        def settings(uid):
+            self.assertEqual(uid, owner)
+            return {'enabled': True, 'channels': routes}
+        radio = VoxiRadio(SimpleNamespace(), 'unused')
+        radio.agent = SimpleNamespace(store=SimpleNamespace(settings=settings))
+        ws = Socket()
+        voice = VoiceSession(ws, 'unused')
+        voice.agent_radio = radio
+        voice.memory_user = owner
+        await voice.send_channel_catalog()
+        await voice.send_channel_catalog()
+        self.assertEqual(len(ws.packets), 1)
+        self.assertLessEqual(len(ws.packets[0].encode()), 2048)
+        packet = json.loads(ws.packets[0])
+        self.assertEqual(packet['channels'][0][:2], ['𠮷' * 32, 'fast'])
+        bitmap = packet['channels'][0][2]
+        if bitmap:
+            pixels = base64.b64decode(bitmap)
+            self.assertEqual(len(pixels), 240)
+            self.assertTrue(any(pixels))
+        routes[2] = {'name': '备用', 'mode': 'disabled'}
+        await voice.send_channel_catalog()
+        self.assertEqual(json.loads(ws.packets[-1])['channels'][2], ['备用', 'disabled', ''])
+
     async def test_idle_agent_switch_reuses_speech_and_selects_destination_metadata(self):
         ws = Socket()
         voice = VoiceSession(ws, 'unused')

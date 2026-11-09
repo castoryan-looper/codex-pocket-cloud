@@ -51,7 +51,10 @@ class UserPortal:
                 hub.store.save_preferences(uid,{**hub.store.preferences(uid),'voice':voice})
             elif action=='channels':
                 hub.openclaw.check_routes(body.get('channels'),uid);hub.store.save_settings(body.get('channels'),uid)
-            elif action=='reset_channels':hub.store.reset_channels(uid)
+                await r.publish_channel_catalog(uid)
+            elif action=='reset_channels':
+                hub.store.reset_channels(uid)
+                await r.publish_channel_catalog(uid)
             elif action=='rename_device':r.memory.change({'action':action,'userId':uid,'deviceId':body.get('deviceId'),'name':body.get('name')})
             elif action=='connect_openclaw':
                 result=hub.openclaw.create(uid,body.get('name'),body.get('transport'),body.get('url',''),body.get('agent','main'),body.get('token',''))

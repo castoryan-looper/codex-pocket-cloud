@@ -105,7 +105,8 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selected_voice_reaches_native_start_and_preview_disables_research(self):
         from aiortc import RTCPeerConnection
-        capture=Capture();voice=VoiceSession(capture,'unused');voice.settings_source=self.radio.settings
+        capture=Capture();capture.send_str=AsyncMock()
+        voice=VoiceSession(capture,'unused');voice.settings_source=self.radio.settings
         cfg=self.radio.settings.snapshot();cfg['voice']='ember';self.radio.settings.save(cfg)
         self.radio.agent.store.save_preferences(self.uid,{'fastPrompt':'','voice':'juniper'})
         voice.agent_radio=self.radio;voice.memory_user=self.uid
@@ -128,6 +129,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
                 calls.clear();voice.agent_radio=None;voice.memory_user=None;voice.preview_mode=True;voice.voice_override='maple'
                 await voice.start()
                 self.assertEqual(next(p for m,p in calls if m=='thread/realtime/start')['voice'],'maple')
+                capture.send_str.assert_awaited_once()
                 self.assertEqual(next(p for m,p in calls if m=='thread/start')['config']['web_search'],'disabled')
                 events=[];voice.event=events.append;voice.events.emit('open')
                 self.assertEqual(events,[frameless_session_update('maple')])

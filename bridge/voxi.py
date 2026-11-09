@@ -6,7 +6,9 @@ delegations run on the dedicated, ephemeral voice thread and return automaticall
 The /voxi endpoint is Docker-internal only, not added to the public Caddy routes.
 """
 import asyncio
+import base64
 import contextlib
+from functools import lru_cache
 import hmac
 import json
 import logging
@@ -15,6 +17,7 @@ import re
 import secrets
 import tempfile
 import time
+import unicodedata
 from collections import deque
 
 from aiohttp import web, WSMsgType
@@ -23,6 +26,26 @@ from voxi_memory import MemoryStore, device_id
 from voice_recovery import offer_audio_nack, configure_audio_recovery
 from voxi_voices import validate_voice
 LOG = logging.getLogger('pocket.voxi')
+CHANNEL_LABEL_WIDTH, CHANNEL_LABEL_HEIGHT = 120, 16
+
+
+@lru_cache(maxsize=128)
+def channel_label_bitmap(name):
+    from PIL import Image, ImageDraw
+    from bridge import ui_font
+    try:
+        font = ui_font(14)
+    except (OSError, RuntimeError):
+        return ''
+    image = Image.new('1', (CHANNEL_LABEL_WIDTH, CHANNEL_LABEL_HEIGHT))
+    draw = ImageDraw.Draw(image)
+    text = name
+    while draw.textlength(text, font=font) > CHANNEL_LABEL_WIDTH:
+        name = name[:-1].rstrip()
+        text = name + '…'
+    left, top, _, bottom = draw.textbbox((0, 0), text, font=font)
+    draw.text((-left, (CHANNEL_LABEL_HEIGHT - (bottom - top)) // 2 - top), text, font=font, fill=1)
+    return base64.b64encode(image.tobytes()).decode('ascii')
 
 
 def diagnostic_reason(value):
@@ -210,6 +233,7 @@ class VoiceSession:
         self.voice_override=None
         self.voice='cove'
         self.agent_speech_only=False
+        self.sent_channel_catalog=None
         self.preview_mode=False
         self.preview_text=''
         self.preview_language=''
@@ -226,6 +250,21 @@ class VoiceSession:
         if packet.get('type') == 'ready' and self.agent_radio:
             packet = {**packet, **self.agent_radio.channel_info(self)}
         if not self.ws.closed: await self.ws.send_json(packet)
+
+    async def send_channel_catalog(self):
+        if not self.agent_radio or self.preview_mode or self.ws.closed:
+            return
+        routes = self.agent_radio.channel_catalog(self)
+        if routes == self.sent_channel_catalog:
+            return
+        rows = [[name, mode, channel_label_bitmap(name) if mode != 'disabled' else '']
+                for name, mode in routes]
+        # The firmware accepts at most 2048 bytes per frame. UTF-8 and four
+        # fixed-size labels keep the whole catalog atomic within that limit.
+        payload = json.dumps({'type': 'channel_catalog', 'channels': rows},
+                             ensure_ascii=False, separators=(',', ':'))
+        self.sent_channel_catalog = routes
+        await self.ws.send_str(payload)
 
     async def say_agent(self, text):
         """Use the existing native speech transport; never feed task text to its tool loop."""
@@ -326,6 +365,7 @@ class VoiceSession:
         self.channel = channel
         if self.settings_source: self.settings = self.settings_source.snapshot()
         self.voice=self.selected_voice(self.settings)
+        await self.send_channel_catalog()
         await self.send({'type': 'connecting', 'channel': channel})
         self.workspace = tempfile.TemporaryDirectory(prefix='voxi-chat-')
         self.rpc = VoiceRpc(self.binary, self.notification)
@@ -732,6 +772,20 @@ class VoxiRadio:
                 'agentProvider':'openclaw' if route['mode']=='openclaw' else 'codex','agentTasks':True,
                 'taskId':task['id'] if task else '', 'taskState':task['state'] if task else ''}
 
+    def channel_catalog(self, session):
+        config = self.agent.store.settings(session.memory_user) if self.agent else None
+        managed = config and config['enabled']
+        channels = config['channels'] if managed else self.settings.snapshot()['channels']
+        return tuple((''.join(c if unicodedata.category(c)[0] != 'C' else ' ' for c in entry['name'][:32]),
+                      ('agent' if entry['mode'] == 'openclaw' else entry['mode']) if managed else 'legacy')
+                     for entry in channels)
+
+    async def publish_channel_catalog(self, uid=None):
+        for session in tuple(self.active):
+            if uid is None or session.memory_user == uid:
+                with contextlib.suppress(ConnectionError):
+                    await session.send_channel_catalog()
+
     async def agent_event(self, task):
         for session in tuple(self.active):
             if session.memory_user==task['user_id'] and session.channel==task['channel'] and not session.ws.closed:
@@ -802,6 +856,7 @@ class VoxiRadio:
             if action=='settings':
                 self.agent.openclaw.check_routes((body.get('settings') or {}).get('channels'))
                 self.agent.store.save_settings(body.get('settings'))
+                await self.publish_channel_catalog()
             elif action=='credential':self.agent.store.save_secret(body.get('provider'),body.get('key'))
             else:
                 uid=body.get('userId')
@@ -809,7 +864,10 @@ class VoxiRadio:
                 if action=='channels':
                     self.agent.openclaw.check_routes(body.get('channels'),uid)
                     self.agent.store.save_settings(body.get('channels'),uid)
-                elif action=='reset_channels':self.agent.store.reset_channels(uid)
+                    await self.publish_channel_catalog(uid)
+                elif action=='reset_channels':
+                    self.agent.store.reset_channels(uid)
+                    await self.publish_channel_catalog(uid)
                 elif action=='connect_openclaw':
                     result=self.agent.openclaw.create(uid,body.get('name'),body.get('transport'),body.get('url',''),body.get('agent','main'),body.get('token',''))
                     return web.json_response(result,headers={'Cache-Control':'no-store'})
@@ -902,6 +960,7 @@ class VoxiRadio:
             try:
                 value = await request.json()
                 self.settings.save(value)
+                await self.publish_channel_catalog()
             except (ValueError, TypeError):
                 raise web.HTTPBadRequest(text='Invalid voice configuration')
             except OSError:
