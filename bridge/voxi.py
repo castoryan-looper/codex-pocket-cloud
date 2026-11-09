@@ -204,6 +204,7 @@ class VoiceSession:
         self.research_watchdog = None
         self.research_result_waiting = False
         self.audio_segment = 0
+        self.output_event_epoch = 0
         self.agent_radio = None
         self.agent_request_id = None
         self.voice_override=None
@@ -416,17 +417,29 @@ class VoiceSession:
                 await self.begin_research()
         elif kind == 'output_audio_buffer.started' and not self.recording and (
                 self.allow_output or time.monotonic() < self.continuation_until):
+            # A new transport chunk can start while the same speaker stream
+            # is still open. Invalidate its predecessor's deferred stop.
+            self.output_event_epoch += 1
             self.allow_output = True
             self.ready = False
             self.generation_done = False
             await self.begin_audio()
         elif kind == 'output_audio_buffer.stopped':
             # Separate RTC media/control channels may deliver the final packet later.
+            if not self.outputting:
+                return
+            self.output_event_epoch += 1
+            epoch = self.output_event_epoch
             turn = self.turn
             segment = self.audio_segment
-            await asyncio.sleep(.25)
-            if turn == self.turn and segment == self.audio_segment and self.outputting:
-                await self.end_audio()
+            stopped_at = time.monotonic()
+            while (turn == self.turn and segment == self.audio_segment and self.outputting
+                   and epoch == self.output_event_epoch):
+                remaining = max(stopped_at, self.last_voice) + .25 - time.monotonic()
+                if remaining <= 0:
+                    await self.end_audio()
+                    break
+                await asyncio.sleep(remaining)
         elif kind == 'response.done' and event.get('response', {}).get('id') == self.response_id:
             if event.get('response', {}).get('status') in ('failed', 'incomplete'):
                 if self.preview_mode:self.preview_problem('incomplete-audio',event.get('response',{}).get('error',{}))

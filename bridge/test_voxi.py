@@ -165,6 +165,37 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             await voice.on_event({'type': 'output_audio_buffer.stopped'})
         self.assertTrue(voice.outputting)
 
+    async def test_adjacent_rtc_chunks_keep_one_speaker_stream(self):
+        ws = Socket()
+        voice = VoiceSession(ws, 'unused')
+        voice.allow_output = True
+        await voice.on_event({'type': 'output_audio_buffer.started'})
+        async def next_chunk(_):
+            await voice.on_event({'type': 'output_audio_buffer.started'})
+        with patch('voxi.asyncio.sleep', side_effect=next_chunk):
+            await voice.on_event({'type': 'output_audio_buffer.stopped'})
+        self.assertTrue(voice.outputting)
+        self.assertEqual(ws.packets, [{'type': 'audio_start'}])
+
+    async def test_rtc_stop_waits_for_a_late_voiced_tail(self):
+        ws = Socket()
+        voice = VoiceSession(ws, 'unused')
+        clock = [100.]
+        waits = []
+        async def advance(delay):
+            waits.append(delay)
+            if len(waits) == 1:
+                voice.last_voice = clock[0] + .20
+            clock[0] += delay
+        voice.allow_output = True
+        with patch('voxi.time.monotonic', side_effect=lambda: clock[0]), patch('voxi.asyncio.sleep', side_effect=advance):
+            voice.last_voice = clock[0]
+            await voice.begin_audio()
+            await voice.on_event({'type': 'output_audio_buffer.stopped'})
+        self.assertEqual(len(waits), 2)
+        self.assertAlmostEqual(clock[0], 100.45)
+        self.assertEqual([packet['type'] for packet in ws.packets], ['audio_start', 'audio_end', 'ready'])
+
     async def test_research_timeout_reports_failure_and_ignores_old_turn(self):
         ws = Socket(); ws.close = AsyncMock()
         voice = VoiceSession(ws, 'unused'); voice.turn = 2
