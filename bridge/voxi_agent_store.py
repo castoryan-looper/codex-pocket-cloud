@@ -61,6 +61,10 @@ class AgentStore:
           model TEXT NOT NULL,workspace TEXT NOT NULL,secret BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS usage(task_id TEXT PRIMARY KEY,input_tokens INTEGER,output_tokens INTEGER,total_tokens INTEGER);
         CREATE TABLE IF NOT EXISTS thread_usage(thread_id TEXT PRIMARY KEY,total_tokens INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS voice_usage(
+          user_id TEXT NOT NULL,response_id TEXT NOT NULL,kind TEXT NOT NULL,
+          input_tokens INTEGER,output_tokens INTEGER,total_tokens INTEGER NOT NULL,
+          PRIMARY KEY(user_id,response_id));
         ''')
         columns={r['name'] for r in self.db.execute('PRAGMA table_info(tasks)')}
         for name,definition in [('engine',"TEXT NOT NULL DEFAULT 'codex'"),('connection_id','TEXT')]:
@@ -88,7 +92,7 @@ class AgentStore:
             raise ValueError(f'最多可配置 {CHANNEL_LIMIT} 个频道')
         result, slots = [], set()
         for index, c in enumerate(channels):
-            if not isinstance(c, dict) or not {'name','mode'} <= c.keys() or c.keys() - {'name','mode','connectionId','slot'}:
+            if not isinstance(c, dict) or not {'name','mode'} <= c.keys() or c.keys() - {'name','mode','connectionId','slot','voice'}:
                 raise ValueError('频道需要名称和模式')
             slot = c.get('slot', index)
             if type(slot) is not int or not 0 <= slot < CHANNEL_LIMIT or slot in slots:
@@ -98,6 +102,9 @@ class AgentStore:
                 raise ValueError('频道名称或模式无效')
             route = {'name': c['name'].strip(), 'mode': c['mode']}
             if 'slot' in c: route['slot'] = slot
+            if 'voice' in c:
+                voice = validate_voice(c['voice'], inherit=True)
+                if voice: route['voice'] = voice
             if c['mode'] in ('openclaw', 'model'):
                 if not isinstance(c.get('connectionId'),str) or not 1<=len(c['connectionId'])<=64:
                     raise ValueError('请为频道选择已配置的接入')
@@ -232,9 +239,13 @@ class AgentStore:
     def set_usage(self, ident, usage):
         if not isinstance(usage, dict): return
         def count(key):
-            n=usage.get(key); return n if type(n) is int and n >= 0 else None
+            n=usage.get(key); return n if type(n) is int and 0 <= n <= 10**12 else None
         with self.db:
-            self.db.execute('INSERT OR REPLACE INTO usage VALUES(?,?,?,?)', (ident,count('inputTokens'),count('outputTokens'),count('totalTokens')))
+            self.db.execute('''INSERT INTO usage VALUES(?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET
+              input_tokens=coalesce(excluded.input_tokens,usage.input_tokens),
+              output_tokens=coalesce(excluded.output_tokens,usage.output_tokens),
+              total_tokens=coalesce(excluded.total_tokens,usage.total_tokens)''',
+                            (ident,count('inputTokens'),count('outputTokens'),count('totalTokens')))
 
     def product_metrics(self):
         row = self.db.execute("""SELECT count(*) AS tasks,
@@ -245,6 +256,34 @@ class AgentStore:
           FROM tasks""").fetchone()
         covered, tokens = self.db.execute('SELECT count(*),sum(total_tokens) FROM thread_usage').fetchone()
         return {**dict(row),'threadsWithUsage':covered,'totalTokens':tokens}
+
+    def user_usage(self, user):
+        rows = self.db.execute('''SELECT t.engine,
+          count(*) AS tasks, count(u.total_tokens) AS measured,
+          sum(u.input_tokens) AS inputTokens, sum(u.output_tokens) AS outputTokens,
+          sum(u.total_tokens) AS totalTokens
+          FROM tasks t LEFT JOIN usage u ON t.id=u.task_id
+          WHERE t.user_id=? GROUP BY t.engine ORDER BY t.engine''', (user,)).fetchall()
+        voice = self.db.execute('''SELECT kind,count(*) AS responses,sum(total_tokens) AS totalTokens,
+          sum(input_tokens) AS inputTokens,sum(output_tokens) AS outputTokens
+          FROM voice_usage WHERE user_id=? GROUP BY kind ORDER BY kind''',(user,)).fetchall()
+        totals = [r['totalTokens'] for r in [*rows,*voice] if r['totalTokens'] is not None]
+        return {'totalTokens':sum(totals) if totals else None,
+                'tasks':sum(r['tasks'] for r in rows),'measuredTasks':sum(r['measured'] for r in rows),
+                'engines':[dict(r) for r in rows],'voice':[dict(r) for r in voice]}
+
+    def record_voice_usage(self, user, response_id, kind, usage):
+        if not isinstance(response_id,str) or not 1<=len(response_id)<=200 or not isinstance(usage,dict):
+            return
+        def count(key):
+            value=usage.get(key)
+            return value if type(value) is int and 0<=value<=10**12 else None
+        total=count('total_tokens')
+        if total is None:
+            return
+        with self.db:
+            self.db.execute('INSERT OR IGNORE INTO voice_usage VALUES(?,?,?,?,?,?)',
+                            (user,response_id,kind,count('input_tokens'),count('output_tokens'),total))
 
     def record_thread_usage(self, thread, total):
         if not isinstance(total, dict):

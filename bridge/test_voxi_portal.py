@@ -2,6 +2,7 @@ import copy
 import json
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -129,6 +130,70 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.radio.memory.owned_snapshot(user['id'])['devices'],[])
         self.assertEqual(self.radio.memory.owner('esp32-111111111111'),self.a)
         self.assertEqual(self.radio.memory.owner('esp32-222222222222'),self.b)
+
+    async def test_context_pairing_is_scoped_and_removed_chats_do_not_resync(self):
+        response, secret = await self.call({'action':'context_authorize','source':'codex','name':'家庭电脑'})
+        self.assertEqual(response.status,200)
+        payload={'id':'local-chat','title':'Voxi modem',
+                 'updated':int(time.time()*1000),'messages':[{'role':'user','text':'检查 Voxi modem。Bearer hidden-test-token-12345'}]}
+        async def push(enabled):
+            response=await self.client.post('/voxi/portal',json={'action':'context_ingest','token':secret['token'],
+                'enabledUsers':enabled,'chat':payload},headers={'Authorization':'Bearer internal-only'})
+            return response,await response.json()
+        response,_=await push([self.b])
+        self.assertEqual(response.status,400)
+        response,_=await self.call({'action':'context_ingest','token':secret['token'],'enabledUsers':[self.a],'chat':payload})
+        self.assertEqual(response.status,400)
+        response,result=await push([self.a])
+        self.assertEqual(response.status,200)
+        self.assertTrue(result['changed'])
+        _,result=await push([self.a])
+        self.assertFalse(result['changed'])
+        _,owner=await self.call({'action':'context_list'})
+        _,foreign=await self.call({'action':'context_list'},self.b)
+        self.assertEqual(foreign['chats'],[])
+        self.assertNotIn(secret['token'],json.dumps(owner))
+        ident=owner['chats'][0]['id']
+        response,_=await self.call({'action':'context_detail','id':ident},self.b)
+        self.assertEqual(response.status,400)
+        _,details=await self.call({'action':'context_detail','id':ident})
+        self.assertNotIn('hidden-test-token',json.dumps(details))
+        await self.call({'action':'context_pin','id':ident})
+        context=self.radio.agent.context
+        self.assertIn('Voxi modem',context.reference(self.a,'继续上次的任务'))
+        self.assertEqual(context.reference(self.b,'继续上次的任务'),'')
+        await self.call({'action':'context_remove','id':ident})
+        _,result=await push([self.a])
+        self.assertFalse(result['changed'])
+        await self.call({'action':'context_revoke','id':owner['connectors'][0]['id']})
+        response,_=await push([self.a])
+        self.assertEqual(response.status,400)
+
+    async def test_channel_voice_priority_and_per_user_reported_usage(self):
+        store=self.radio.agent.store
+        store.save_settings({**store.settings(),'enabled':True})
+        store.save_preferences(self.a,{'fastPrompt':'','voice':'ember'})
+        response,_=await self.call({'action':'channels','channels':[
+            {'slot':12,'name':'播报','mode':'agent','voice':'maple'},
+            {'slot':15,'name':'普通','mode':'fast'}]})
+        self.assertEqual(response.status,200)
+        voice=VoiceSession(SimpleNamespace(closed=False),'unused')
+        voice.agent_radio=self.radio;voice.memory_user=self.a
+        self.assertEqual(voice.selected_voice({'voice':'cove'},12),'maple')
+        self.assertEqual(voice.selected_voice({'voice':'cove'},15),'ember')
+        voice.voice_override='spruce'
+        self.assertEqual(voice.selected_voice({'voice':'cove'},12),'spruce')
+        first,_=store.submit(self.a,None,12,'counted','One')
+        store.submit(self.a,None,12,'unmetered','Two')
+        store.set_usage(first['id'],{'totalTokens':31})
+        store.set_usage(self.task['id'],{'totalTokens':800})
+        for _ in range(2):
+            store.record_voice_usage(self.a,'response-1','fast',{'total_tokens':19})
+        _,snapshot=await self.call({'action':'snapshot'})
+        self.assertEqual(snapshot['usage']['totalTokens'],50)
+        self.assertEqual(snapshot['usage']['measuredTasks'],1)
+        self.assertEqual(snapshot['usage']['tasks'],2)
+        self.assertEqual(snapshot['usage']['voice'][0]['responses'],1)
 
     async def test_user_endpoint_requires_internal_bearer_and_rejects_browser_origin(self):
         for headers in ({},{'Authorization':'Bearer device-user-token'},{'Authorization':'Bearer internal-only','Origin':'https://example.com'}):

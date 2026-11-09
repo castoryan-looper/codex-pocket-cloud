@@ -23,7 +23,8 @@ class UserPortal:
                 'modelConnections':hub.models.public(uid),'modelProviders':PROVIDERS,'channelLimit':CHANNEL_LIMIT,
                 'voiceSettings':r.voice_preview.enrich(catalog(r.settings.snapshot()['voice'],hub.store.preferences(uid)['voice'])),
                 'tasks':[hub.store.public_task(t) for t in hub.store.list_tasks(uid)],
-                'capabilities':{'openclaw':True,'userPortal':1}}
+                'usage':hub.store.user_usage(uid),
+                'capabilities':{'openclaw':True,'userPortal':1,'channelVoices':True,'contextSync':True}}
 
     async def changed_context(self, uid):
         r=self.radio;r.memory_revision[uid]=r.memory_revision.get(uid,0)+1
@@ -39,10 +40,14 @@ class UserPortal:
             if len(raw)>131072:raise ValueError('请求过大')
             body=json.loads(raw)
             if not isinstance(body,dict):raise ValueError('请求无效')
+            action=body.get('action');hub=r.agent
+            if action=='context_ingest':
+                if 'actorUserId' in body:raise ValueError('网页会话不能模拟同步连接器')
+                result=hub.context.ingest(body.get('token'),body.get('enabledUsers'),body.get('chat'))
+                return web.json_response(result,headers={'Cache-Control':'no-store'})
             uid=body.get('actorUserId')
             if not isinstance(uid,str) or not re.fullmatch(r'[a-f0-9]{32}',uid) or not r.memory.user(uid):raise ValueError('账户未绑定有效用户档案')
             if 'userId' in body and body['userId']!=uid:raise ValueError('不能操作其他用户')
-            action=body.get('action');hub=r.agent
             if action=='snapshot':pass
             elif action=='profile':
                 r.memory.change({'action':'profile','userId':uid,'name':body.get('name'),'profile':body.get('profile'),'enabled':body.get('enabled')})
@@ -70,6 +75,8 @@ class UserPortal:
             elif action=='test_model':
                 return web.json_response(await hub.models.probe(uid,body.get('connectionId')),headers={'Cache-Control':'no-store'})
             elif action=='delete_model':hub.models.delete(uid,body.get('connectionId'))
+            elif action in ('context_import','context_authorize','context_list','context_revoke','context_detail','context_remove','context_pin'):
+                return web.json_response(hub.context.manage(uid,body),headers={'Cache-Control':'no-store'})
             elif action=='submit':
                 task,_=hub.submit(uid,None,body.get('channel'),body.get('requestId'),body.get('text'))
                 return web.json_response({'task':task},headers={'Cache-Control':'no-store'})

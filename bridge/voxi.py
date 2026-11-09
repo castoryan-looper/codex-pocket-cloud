@@ -347,10 +347,14 @@ class VoiceSession:
                 await self.send({'type': 'error', 'message': 'Codex native voice session closed; check account support'})
                 await self.ws.close()
 
-    def selected_voice(self, settings):
+    def selected_voice(self, settings, channel=None):
+        if self.voice_override:
+            return validate_voice(self.voice_override)
+        route = (self.agent_radio.route(self, channel)
+                 if self.agent_radio and self.agent_radio.agent else None)
         personal = (self.agent_radio.agent.store.preferences(self.memory_user).get('voice')
                     if self.agent_radio and self.agent_radio.agent and self.memory_user else None)
-        return validate_voice(self.voice_override or personal or settings['voice'])
+        return validate_voice((route or {}).get('voice') or personal or settings['voice'])
 
     async def switch_channel(self, channel):
         began = time.monotonic()
@@ -362,7 +366,7 @@ class VoiceSession:
             route = self.agent_radio.channel_info(self, channel)
             settings = self.settings_source.snapshot() if self.settings_source else self.settings
             if (route.get('channelMode') in ('agent', 'disabled')
-                    and settings == self.settings and self.selected_voice(settings) == self.voice):
+                    and settings == self.settings and self.selected_voice(settings, channel) == self.voice):
                 self.channel = channel
                 await self.send({'type': 'ready', 'channel': channel})
                 reused = True
@@ -504,7 +508,10 @@ class VoiceSession:
                     break
                 await asyncio.sleep(remaining)
         elif kind == 'response.done' and event.get('response', {}).get('id') == self.response_id:
-            if event.get('response', {}).get('status') in ('failed', 'incomplete'):
+            response=event.get('response',{})
+            if self.radio and not self.preview_mode:
+                self.radio.record_voice_usage(self,response)
+            if response.get('status') in ('failed', 'incomplete'):
                 if self.preview_mode:self.preview_problem('incomplete-audio',event.get('response',{}).get('error',{}))
                 await self.send({'type': 'error', 'message': 'Codex native voice response failed or was incomplete'})
                 await self.ws.close()
@@ -685,14 +692,22 @@ class VoiceSession:
                 self.pending_audio.clear()
                 await self.send({'type': 'idle', 'reason': 'too_short'})
                 return
-            if self.radio and self not in self.radio.voice_slots:
+            cold = self.radio and self not in self.radio.voice_slots
+            route = self.agent_radio.route(self) if self.agent_radio and self.agent_radio.agent else None
+            refresh = self.settings_source and (self.selected_voice(self.settings_source.snapshot()) != self.voice
+                       or self.agent_speech_only and (not route or route['mode']=='fast'))
+            if cold or refresh:
                 pcm = bytes(self.pending_audio)
                 self.pending_audio.clear()
                 self.ready = False
                 await self.send({'type': 'thinking'})
                 self.warming_turn = True
                 try:
-                    acquired = await self.radio.warm_voice(self, reuse_idle=True)
+                    if cold:
+                        acquired = await self.radio.warm_voice(self, reuse_idle=True)
+                    else:
+                        await self.start(self.channel)
+                        acquired = True
                 finally:
                     self.warming_turn = False
                 if not acquired:
@@ -700,6 +715,10 @@ class VoiceSession:
                     await self.send({'type': 'idle', 'reason': 'voice_capacity'})
                     return
                 self.pending_audio.extend(pcm)
+                if self.agent_radio and self.agent_radio.agent and self.recording_route != self.agent_radio.route(self):
+                    self.pending_audio.clear()
+                    await self.send({'type':'idle','reason':'channel_changed'})
+                    return
             if self.agent_radio and self.agent_radio.channel_info(self).get('channelMode') in ('agent','openclaw','disabled'):
                 self.ready=False
                 await self.send({'type':'thinking'})
@@ -837,6 +856,15 @@ class VoxiRadio:
         if self.memory:
             try: self.memory.record_voice(byte_count // 48)
             except Exception: LOG.warning('Voxi voice aggregate could not be saved')
+
+    def record_voice_usage(self, session, response):
+        uid=session.memory_user
+        if uid and self.agent and self.memory and self.memory.owner(session.memory_device)==uid:
+            try:
+                self.agent.store.record_voice_usage(uid,response.get('id'),
+                    'speech' if session.agent_speech_only else 'fast',response.get('usage'))
+            except Exception:
+                LOG.warning('Voxi voice usage could not be saved')
 
     async def overview(self, request):
         if request.headers.get('Origin') or not hmac.compare_digest(
@@ -1078,6 +1106,7 @@ class VoxiRadio:
                     if not profile:raise ValueError('用户档案不存在')
                     detail={'profile':profile,'devices':self.memory.user_devices(uid)}
                     if section=='memory':detail=self.memory.owned_snapshot(uid)
+                    if self.agent and section in ('profile','tasks'):detail['usage']=self.agent.store.user_usage(uid)
                     if section=='tasks':
                         detail['agent']=None
                         if self.agent:
