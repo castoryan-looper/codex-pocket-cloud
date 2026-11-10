@@ -28,6 +28,8 @@ PROVIDERS = {
                    'docs': 'https://openrouter.ai/docs/quickstart'},
     'dify-chat': {'name': 'Dify Cloud · 对话应用', 'category': 'app', 'defaultModel': 'chat', 'fixedModel': True,
                   'continuation': True, 'docs': 'https://docs.dify.ai/en/api-reference/guides/chatflow'},
+    'dify-agent': {'name': 'Dify Cloud · Agent', 'category': 'app', 'defaultModel': 'agent', 'fixedModel': True,
+                   'continuation': True, 'docs': 'https://docs.dify.ai/en/api-reference/guides/agent'},
     'dify-workflow': {'name': 'Dify Cloud · 工作流', 'category': 'app', 'defaultModel': 'query',
                       'modelLabel': '输入变量名', 'workspaceRequired': True, 'workspaceLabel': '输出变量名',
                       'defaultWorkspace': 'result', 'docs': 'https://docs.dify.ai/en/api-reference/guides/workflow'},
@@ -42,7 +44,8 @@ CHAT_ENDPOINTS = {
     'gemini': 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
     'openrouter': 'https://openrouter.ai/api/v1/chat/completions',
 }
-DIFY_MODES = {'dify-chat': {'chat', 'advanced-chat', 'agent-chat'}, 'dify-workflow': {'workflow'}}
+DIFY_MODES = {'dify-chat': {'chat', 'advanced-chat', 'agent-chat'}, 'dify-agent': {'agent'},
+              'dify-workflow': {'workflow'}}
 DIFY_API = 'https://api.dify.ai/v1'
 MAX_RESPONSE = 256 * 1024
 CHAT_USAGE = ('prompt_tokens', 'completion_tokens', 'total_tokens')
@@ -169,7 +172,7 @@ def dify_inputs(parameters, workflow_input):
     return defaults
 
 
-async def dify_result(response, output_variable):
+async def dify_result(response, output_variable, *, final_message=False):
     response_status(response)
     answer = []
     size = 0
@@ -195,9 +198,11 @@ async def dify_result(response, output_variable):
                     raise ValueError('Dify 工作流未返回配置的文本输出变量')
                 return result.strip(), token_counts(data, (None, None, 'total_tokens')), None
             if not output_variable and kind in ('message', 'agent_message', 'message_replace'):
+                if final_message and kind != 'message':
+                    continue
                 if not isinstance(event['answer'], str):
                     raise TypeError
-                if kind == 'message_replace':
+                if final_message or kind == 'message_replace':
                     answer.clear()
                 answer.append(event['answer'])
             if not output_variable and kind == 'message_end':
@@ -236,8 +241,8 @@ class ModelConnections:
             raise ValueError('请选择支持的模型服务')
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 64:
             raise ValueError('连接名称需要 1–64 个字符')
-        if provider == 'dify-chat':
-            model = 'chat'
+        if PROVIDERS[provider].get('fixedModel'):
+            model = PROVIDERS[provider]['defaultModel']
         if not isinstance(model, str) or not re.fullmatch(r'[a-zA-Z0-9_.:/-]{1,128}', model):
             raise ValueError('请填写有效的模型 ID')
         if provider == 'qwen':
@@ -360,7 +365,8 @@ class ModelConnections:
                     if task.get('thread_id'):
                         body['conversation_id'] = task['thread_id']
                 async with client.post(DIFY_API + path, headers=bearer(key), json=body, allow_redirects=False) as response:
-                    return await dify_result(response, record['workspace'] if workflow else None)
+                    return await dify_result(response, record['workspace'] if workflow else None,
+                                             final_message=record['provider'] == 'dify-agent')
         except (aiohttp.ClientError, asyncio.TimeoutError):
             raise ValueError('Dify 连接超时或中断，远端任务可能仍在执行') from None
 
