@@ -233,6 +233,8 @@ class VoiceSession:
         self.radio = None
         self.voice_lock = asyncio.Lock()
         self.warming_turn = False
+        self.control_first = False
+        self.voice_setup_error = None
         self.agent_request_id = None
         self.voice_override=None
         self.voice='cove'
@@ -252,6 +254,14 @@ class VoiceSession:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
         return task
+
+    def fail_voice_setup(self, error):
+        if not self.control_first or not self.warming_turn:
+            return False
+        self.voice_setup_error = error
+        if self.answer and not self.answer.done():
+            self.answer.set_exception(error)
+        return True
 
     async def send(self, packet):
         if self.warming_turn and packet.get('type') in ('connecting', 'ready'):
@@ -341,8 +351,11 @@ class VoiceSession:
         elif method in ('thread/realtime/error', 'thread/realtime/closed'):
             if self.preview_mode:self.preview_problem('upstream-error',params.get('error',params.get('message',params.get('reason',''))))
             LOG.warning('Native voice upstream %s reason=%s',method,diagnostic_reason(params.get('error',params.get('message',params.get('reason','')))))
+            failure=VoiceFailure('notification',params.get('code'),params.get('error',params.get('message',params.get('reason',''))))
+            if self.fail_voice_setup(failure):
+                return
             if self.answer and not self.answer.done():
-                self.answer.set_exception(VoiceFailure('notification', params.get('code'), params.get('error', params.get('message', params.get('reason', '')))))
+                self.answer.set_exception(failure)
             else:
                 await self.send({'type': 'error', 'message': 'Codex native voice session closed; check account support'})
                 await self.ws.close()
@@ -389,6 +402,7 @@ class VoiceSession:
     async def start(self, channel=0):
         from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration
         await self.stop()
+        self.answer = self.voice_setup_error = None
         self.channel = channel
         if self.settings_source: self.settings = self.settings_source.snapshot()
         self.voice=self.selected_voice(self.settings)
@@ -404,7 +418,7 @@ class VoiceSession:
             'ephemeral': True, 'developerInstructions': '只朗读提供的试听句子，不调用工具，不执行任务。' if self.preview_mode else VOICE_TASK_INSTRUCTIONS,
             'config': {'web_search': 'disabled' if self.preview_mode else 'live', 'features.shell_tool': False}
         }))['thread']['id']
-        self.peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        peer = self.peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         self.input_track=create_input_track()
         self.peer.addTrack(self.input_track)
         self.events = self.peer.createDataChannel('oai-events')
@@ -423,7 +437,9 @@ class VoiceSession:
             if track.kind == 'audio': self.spawn(self.receive_audio(track))
         @self.peer.on('connectionstatechange')
         async def state_changed():
-            if self.peer and self.peer.connectionState == 'failed':
+            if self.peer is peer and peer.connectionState == 'failed':
+                if self.fail_voice_setup(RuntimeError('WebRTC connection failed')):
+                    return
                 await self.send({'type': 'error', 'message': 'WebRTC connection failed; check server UDP egress'})
                 await self.ws.close()
         offer = await self.peer.createOffer()
@@ -457,6 +473,8 @@ class VoiceSession:
         self.phase = 'session-configuration'
         # Do not announce READY until the backend accepts the Frameless Bidi session configuration.
         for _ in range(200):
+            if self.voice_setup_error:
+                raise self.voice_setup_error
             if self.ready:
                 self.phase = 'ready'
                 return
@@ -520,6 +538,8 @@ class VoiceSession:
         elif kind == 'error':
             detail=event.get('error') if isinstance(event.get('error'),dict) else event
             if detail.get('code') in ('response_cancel_not_active', 'input_audio_buffer_commit_empty'): return
+            if self.fail_voice_setup(VoiceFailure('notification',detail.get('code'),detail)):
+                return
             if self.preview_mode:self.preview_problem('control-rejected',detail)
             await self.send({'type': 'error', 'message': 'Codex voice rejected an audio/control event'})
             await self.ws.close()
@@ -703,7 +723,11 @@ class VoiceSession:
                 await self.send({'type': 'thinking'})
                 self.warming_turn = True
                 try:
-                    if cold:
+                    if self.control_first:
+                        acquired = await self.radio.prepare_cellular_voice(self, cold)
+                        if acquired is None:
+                            return
+                    elif cold:
                         acquired = await self.radio.warm_voice(self, reuse_idle=True)
                     else:
                         await self.start(self.channel)
@@ -851,6 +875,25 @@ class VoxiRadio:
             self.voice_slots.add(session)
         await session.start(session.channel)
         return True
+
+    async def prepare_cellular_voice(self, session, cold):
+        try:
+            if cold:
+                return await asyncio.wait_for(self.warm_voice(session, reuse_idle=True),15)
+            await asyncio.wait_for(session.start(session.channel),15)
+            return True
+        except Exception as error:
+            self.retry_after = max(self.retry_after,time.monotonic()+5)
+            detail = str(error) if isinstance(error,VoiceFailure) else diagnostic_reason(error)
+            LOG.warning('Cellular voice setup failed sessionId=%s phase=%s error=%s reason=%s',
+                        session.session_id,session.phase,type(error).__name__,detail)
+            try:
+                await session.stop()
+            finally:
+                self.voice_slots.discard(session)
+            session.ready=True
+            await session.send({'type':'idle','reason':'voice_unavailable'})
+            return None
 
     def record_voice(self, byte_count):
         if self.memory:
@@ -1157,6 +1200,7 @@ class VoxiRadio:
             raise web.HTTPForbidden()
         ws = web.WebSocketResponse(heartbeat=20,max_msg_size=8192,writer_limit=32768)
         session = VoiceSession(ws, self.binary)
+        session.control_first = request.headers.get('X-Voxi-Link')=='cellular-v1'
         if request.headers.get('X-Voxi-Channels') == 'blocks-v1':
             session.channel_limit = CHANNEL_LIMIT
         session.settings_source = self.settings
@@ -1172,7 +1216,7 @@ class VoxiRadio:
         try:
             await ws.prepare(request)
             async with session.voice_lock:
-                if not await self.warm_voice(session):
+                if session.control_first or not await self.warm_voice(session):
                     await session.cold_ready()
             if self.agent and self.agent.store.settings()['enabled']:
                 self.agent.start()

@@ -531,6 +531,29 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 for socket in clients:await socket.close()
                 self.assertEqual(len(radio.voice_slots),0)
 
+    async def test_cellular_control_is_ready_before_voice_and_survives_setup_failure(self):
+        radio=VoxiRadio(SimpleNamespace(config={'device_token':'test'}),'unused')
+        app=web.Application();app.router.add_get('/voxi',radio.websocket)
+        with patch.object(VoiceSession,'start',side_effect=RuntimeError('fixture')) as start:
+            async with TestClient(TestServer(app)) as client:
+                headers={'Authorization':'Bearer test','X-Voxi-Link':'cellular-v1'}
+                socket=await client.ws_connect('/voxi',headers=headers)
+                self.assertEqual((await socket.receive_json(timeout=2))['type'],'channel_catalog')
+                self.assertEqual((await socket.receive_json(timeout=2))['type'],'ready')
+                start.assert_not_awaited()
+                await socket.send_json({'type':'ptt_down'})
+                for expected in ('flush','recording'):
+                    self.assertEqual((await socket.receive_json(timeout=2))['type'],expected)
+                await socket.send_bytes(bytes(4800))
+                await socket.send_json({'type':'ptt_up'})
+                self.assertEqual((await socket.receive_json(timeout=2))['type'],'thinking')
+                self.assertEqual(await socket.receive_json(timeout=2),{'type':'idle','reason':'voice_unavailable'})
+                start.assert_awaited_once()
+                self.assertEqual(len(radio.voice_slots),0)
+                await socket.send_json({'type':'channel','channel':1})
+                self.assertEqual(await socket.receive_json(timeout=2),{'type':'ready','channel':1})
+                self.assertFalse(socket.closed)
+
     async def test_failed_voice_setup_enters_cooldown_without_restarting_cli(self):
         radio=VoxiRadio(SimpleNamespace(config={'device_token':'test'}),'unused')
         app=web.Application();app.router.add_get('/voxi',radio.websocket)
