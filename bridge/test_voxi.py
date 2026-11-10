@@ -27,6 +27,22 @@ class Channel:
 
 
 class VoiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_speech_preserves_text_and_marks_mandarin_without_delegating(self):
+        voice=VoiceSession(Socket(),'unused')
+        voice.thread='agent-voice'
+        voice.agent_speech_only=True
+        voice.rpc=SimpleNamespace(call=AsyncMock())
+        voice.watch_response=AsyncMock()
+        for script,language in [('已启用 GitHub MCP。','zh-CN'),('The result is ready.','original'),
+                                ('結果を確認しました。','original')]:
+            await voice.say_agent(script)
+            method,params=voice.rpc.call.await_args.args
+            self.assertEqual(method,'thread/realtime/appendSpeech')
+            self.assertEqual(json.loads(params['text']),{'languageHint':language,'text':script})
+        await voice.notification({'method':'thread/realtime/itemAdded','params':{
+            'threadId':voice.thread,'item':{'type':'handoff_request'}}})
+        self.assertFalse(voice.research_pending)
+
     async def test_channel_catalog_is_owner_scoped_bounded_and_deduplicated(self):
         owner = 'device-owner'
         routes = [{'name': '𠮷' * 32, 'mode': 'fast'} for _ in range(4)]
@@ -378,6 +394,14 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(thread['config']['features.shell_tool'])
             self.assertEqual(thread['sandbox'], 'read-only')
             self.assertEqual(voice.phase,'ready')
+            calls.clear()
+            voice.agent_radio.channel_info=lambda _:{'channelMode':'agent','name':'Voxi Agent'}
+            with patch('voxi.VoiceRpc',Rpc),patch.object(RTCPeerConnection,'setRemoteDescription',new=AsyncMock()):
+                await voice.start(1)
+            params=next(params for method,params in calls if method=='thread/realtime/start')
+            self.assertTrue(params['clientManagedHandoffs'])
+            self.assertIn('Mandarin Chinese',params['prompt'])
+            self.assertNotIn('天文学',params['prompt'])
         finally:await voice.stop()
 
     async def test_buffer_until_release_and_submit_v3_audio_with_silence(self):
