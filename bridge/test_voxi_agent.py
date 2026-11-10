@@ -322,6 +322,15 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.radio.agent.store.list_tasks(self.uid)[0]['prompt'],'检查项目')
         self.assertIn('任务已保存',voice.say_agent.call_args.args[0])
         self.assertEqual(socket.send_json.call_args.args[0]['type'],'task_state')
+        self.assertTrue(self.radio.agent.store.list_tasks(self.uid)[0]['radio_reply_pending'])
+        voice.agent_request_id='voice-r-2'
+        self.radio.transcribe_memory=lambda pcm:'查一下今年的比赛结果'
+        await self.radio.agent_voice(voice,b'pcm')
+        self.assertEqual(self.radio.agent.store.list_tasks(self.uid)[0]['prompt'],'查一下今年的比赛结果')
+        voice.agent_request_id='voice-r-3'
+        self.radio.transcribe_memory=lambda pcm:'新任务，查一下今年的比赛结果'
+        await self.radio.agent_voice(voice,b'pcm')
+        self.assertEqual(len(self.radio.agent.store.list_tasks(self.uid)),3)
     async def test_native_ack_failure_closes_voice_without_losing_task(self):
         cfg=copy.deepcopy(DEFAULTS);cfg['enabled']=True;self.radio.agent.store.save_settings(cfg)
         socket=SimpleNamespace(closed=False,send_json=AsyncMock())
@@ -340,12 +349,13 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         hub.store.save_settings([DEFAULTS['channels'][0],{'name':'代码频道','mode':'agent','skills':['code-review']}],self.uid)
         running,_=hub.store.submit(self.uid,'esp32-111111111111',1,'original','长任务')
         hub.store.update(running['id'],state='awaiting_approval',summary='等待远程调用确认')
-        hub.store.submit(self.uid,'esp32-111111111111',1,'queued','误入队列的进度查询')
+        hub.store.submit(self.uid,None,1,'queued','后来从网页发起的任务')
         socket=SimpleNamespace(closed=False,send_json=AsyncMock())
         voice=VoiceSession(socket,'unused')
         voice.agent_radio=self.radio;voice.channel=1;voice.memory_user=self.uid;voice.memory_device='esp32-111111111111'
         voice.say_agent=AsyncMock()
-        for utterance in ('请问现在做到哪里了？','任务进展如何？','查看进度','要继续等吗'):
+        for utterance in ('请问现在做到哪里了？','任务进展如何？','查看进度','要继续等吗',
+                          '所以刚刚那个任务，好了没？','嗯，刚才那个呢？','给我说说刚才的结果。','长任务'):
             self.radio.transcribe_memory=lambda _:utterance
             await self.radio.agent_voice(voice,b'fixture')
             self.assertIn('暂停在确认步骤',voice.say_agent.call_args.args[0])
@@ -357,6 +367,72 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('MCP，尚未启用',spoken)
         self.assertNotIn('OpenAI 官方文档',spoken)
         self.assertEqual(len(hub.store.list_tasks(self.uid)),2)
+
+    async def test_agent_completion_waits_for_idle_and_survives_reconnect_until_relay_ack(self):
+        hub=self.radio.agent
+        hub.store.save_settings({**DEFAULTS,'enabled':True})
+        ident='esp32-111111111111'
+        answer='已核对，两条记录指向同一个任务。'
+        task,_=hub.store.submit(self.uid,ident,1,'auto-result','核对记录',radio_reply=True)
+        hub.store.submit(self.uid,None,1,'web-only','另一个网页任务')
+
+        def connect(channel):
+            socket=SimpleNamespace(closed=False,send_json=AsyncMock())
+            session=VoiceSession(socket,'unused')
+            session.agent_radio=session.radio=self.radio
+            session.memory_user,session.memory_device=self.uid,ident
+            session.channel,session.ready,session.agent_speech_only=channel,True,True
+            session.agent_relay_ack=True
+            session.rpc=SimpleNamespace(call=AsyncMock(),close=AsyncMock())
+            self.radio.active.add(session);self.radio.voice_slots.add(session)
+            return session
+
+        voice=connect(1)
+        voice.recording=True
+        await hub.change(task['id'],state='completed',result=answer)
+        self.assertIsNone(voice.agent_delivery_job)
+        voice.recording=False
+        await voice.send({'type':'ready','channel':1})
+        await voice.agent_delivery_job
+        self.assertEqual(json.loads(voice.rpc.call.call_args.args[1]['text'])['text'],answer)
+        await voice.end_audio()
+        nonce=voice.agent_reply_ack[1]
+        await voice.control({'type':'agent_reply_sent','replyId':'wrong'})
+        self.assertTrue(hub.store.task(task['id'])['radio_reply_pending'])
+        voice.ws.closed=True
+        await voice.stop()
+        self.radio.voice_slots.discard(voice)
+        self.radio.active.discard(voice)
+
+        replacement=connect(0)
+        try:
+            await replacement.send({'type':'ready','channel':0})
+            self.assertIsNone(replacement.agent_delivery_job)
+            replacement.channel=1
+            self.radio.voice_slots.discard(replacement)
+            async def warm(session,cold):
+                self.assertIs(session,replacement)
+                self.assertTrue(cold)
+                self.assertTrue(session.warming_turn)
+                self.radio.voice_slots.add(session)
+                session.ready=True
+                return True
+            self.radio.prepare_cellular_voice=AsyncMock(side_effect=warm)
+            await replacement.send({'type':'ready','channel':1})
+            await replacement.agent_delivery_job
+            self.radio.prepare_cellular_voice.assert_awaited_once()
+            self.assertEqual(json.loads(replacement.rpc.call.call_args.args[1]['text'])['text'],answer)
+            await replacement.end_audio()
+            self.assertNotEqual(replacement.agent_reply_ack[1],nonce)
+            await replacement.control({'type':'agent_reply_sent','replyId':replacement.agent_reply_ack[1]})
+            self.assertFalse(hub.store.task(task['id'])['radio_reply_pending'])
+            await replacement.send({'type':'ready','channel':1})
+            self.assertIsNone(replacement.agent_delivery_job)
+            self.assertEqual(replacement.rpc.call.await_count,1)
+        finally:
+            await replacement.stop()
+            self.radio.voice_slots.discard(replacement)
+            self.radio.active.discard(replacement)
 
     async def test_result_queries_match_the_announced_task_and_older_result_is_explicit(self):
         hub=self.radio.agent

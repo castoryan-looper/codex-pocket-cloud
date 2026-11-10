@@ -221,7 +221,7 @@ class OpenClawAPITests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(c['pairingToken'],json.dumps(snap))
                 channels=copy.deepcopy(cfg['channels']);channels[1]={'name':'Home','mode':'openclaw','connectionId':c['connectionId']}
                 await post({'action':'channels','userId':uid,'channels':channels})
-                info=radio.channel_info(SimpleNamespace(memory_user=uid,channel=1))
+            info=radio.channel_info(SimpleNamespace(memory_user=uid,memory_device=None,channel=1))
                 self.assertEqual(info['channelMode'],'agent');self.assertEqual(info['agentProvider'],'openclaw')
                 snap=await post({'action':'reset_channels','userId':uid});self.assertNotIn(uid,snap['channelOverrides'])
                 await post({'action':'delete_openclaw','userId':uid,'connectionId':c['connectionId']})

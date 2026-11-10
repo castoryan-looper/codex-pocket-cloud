@@ -71,8 +71,9 @@ class AgentStore:
         ''')
         columns={r['name'] for r in self.db.execute('PRAGMA table_info(tasks)')}
         for name,definition in [('engine',"TEXT NOT NULL DEFAULT 'codex'"),('connection_id','TEXT'),
-                                ('runtime_tools',"TEXT NOT NULL DEFAULT ''")]:
+                                ('runtime_tools',"TEXT NOT NULL DEFAULT ''"),('radio_reply_pending','INTEGER NOT NULL DEFAULT 0')]:
             if name not in columns:self.db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {definition}')
+        self.db.execute('CREATE INDEX IF NOT EXISTS task_radio_replies ON tasks(user_id,device_id,channel,created) WHERE radio_reply_pending=1')
         for task in self.db.execute("SELECT id FROM tasks WHERE state NOT IN ('queued','completed','failed','cancelled','interrupted','delivery_unknown')").fetchall():
             self.update(task['id'], state='interrupted', summary='服务已重启；未自动重放任务，请核对结果后继续')
         with self.db:
@@ -160,12 +161,14 @@ class AgentStore:
                               (ident, user) if user else (ident,)).fetchone()
         return dict(row) if row else None
 
-    def list_tasks(self, user=None, channel=None, limit=100, *, route=None, progress=False, completed_result=False):
+    def list_tasks(self, user=None, channel=None, limit=100, *, route=None, progress=False, completed_result=False, device=None):
         clauses, args = [], []
         if user:
             clauses.append('user_id=?'); args.append(user)
         if channel is not None:
             clauses.append('channel=?'); args.append(channel)
+        if device is not None:
+            clauses.append('device_id=?'); args.append(device)
         if route is not None:
             clauses.extend(('engine=?', 'connection_id IS ?'))
             args.extend((route_engine(route), route.get('connectionId')))
@@ -176,6 +179,18 @@ class AgentStore:
                  "WHEN state='queued' THEN 1 ELSE 2 END, CASE WHEN state='queued' THEN created END, created DESC"
                  if progress else 'created DESC')
         return [dict(r) for r in self.db.execute(query + ' ORDER BY ' + order + ', id DESC LIMIT ?', (*args, min(200, limit)))]
+
+    def pending_radio_reply(self, user, device, channel, route):
+        row = self.db.execute('''SELECT * FROM tasks WHERE user_id=? AND device_id=? AND channel=?
+            AND engine=? AND connection_id IS ? AND radio_reply_pending=1 AND state IN ('completed','failed','cancelled')
+            ORDER BY created,id LIMIT 1''',
+            (user, device, channel, route_engine(route), route.get('connectionId'))).fetchone()
+        return dict(row) if row else None
+
+    def mark_radio_reply_sent(self, ident, user, device):
+        with self.db:
+            self.db.execute('UPDATE tasks SET radio_reply_pending=0 WHERE id=? AND user_id=? AND device_id=?',
+                            (ident,user,device))
 
     def portal_tasks(self, user, before=None):
         cursor = self.task(before, user) if before else None
@@ -205,7 +220,7 @@ class AgentStore:
         states = ','.join('?' for _ in LIVE)
         return self.db.execute(f'SELECT 1 FROM tasks WHERE user_id=? AND state IN ({states}) LIMIT 1', (user, *LIVE)).fetchone() is not None
 
-    def submit(self, user, device, channel, request_id, prompt, thread=None, *, engine='codex', connection=None, runtime_tools=''):
+    def submit(self, user, device, channel, request_id, prompt, thread=None, *, engine='codex', connection=None, runtime_tools='', radio_reply=False):
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
             raise ValueError('需要 1–128 字符的请求编号')
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 8000 or type(channel) is not int or not 0 <= channel < CHANNEL_LIMIT:
@@ -220,8 +235,8 @@ class AgentStore:
         ident, now = uuid.uuid4().hex, time.time()
         with self.db:
             if engine in EXTERNAL_AGENT_LABELS and not thread:thread='voxi-'+user+'-'+ident
-            self.db.execute('INSERT INTO tasks(id,user_id,device_id,channel,request_id,prompt,state,summary,result,thread_id,turn_id,created,updated,engine,connection_id,runtime_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                            (ident,user,device,channel,request_id,prompt.strip(),'queued','任务已保存，等待执行','',thread,None,now,now,engine,connection,runtime_tools))
+            self.db.execute('INSERT INTO tasks(id,user_id,device_id,channel,request_id,prompt,state,summary,result,thread_id,turn_id,created,updated,engine,connection_id,runtime_tools,radio_reply_pending) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                            (ident,user,device,channel,request_id,prompt.strip(),'queued','任务已保存，等待执行','',thread,None,now,now,engine,connection,runtime_tools,int(bool(radio_reply and device))))
             self.db.execute('INSERT INTO events(task_id,state,summary,created) VALUES(?,?,?,?)', (ident,'queued','任务已保存，等待执行',now))
         return self.task(ident), True
 
