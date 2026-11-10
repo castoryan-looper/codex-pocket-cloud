@@ -1051,7 +1051,7 @@ class VoxiRadio:
                 settings = body.get('settings')
                 if action == 'settings_patch':
                     current = self.agent.store.settings()
-                    if not isinstance(settings, dict) or not settings or settings.keys() - current.keys():
+                    if not isinstance(settings, dict) or not settings or settings.keys() - (current.keys() - {'channels'}):
                         raise ValueError('助手配置字段无效')
                     settings = {**current, **settings}
                 self.agent.check_routes(settings.get('channels') if isinstance(settings, dict) else None)

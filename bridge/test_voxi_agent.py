@@ -67,6 +67,19 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.settings(USER)['channels'][1]['name'],'我的项目')
         self.assertEqual(self.store.settings(OTHER)['channels'][1]['name'],'Voxi Agent')
 
+    def test_old_shared_channels_yield_to_fixed_defaults_and_preserve_personal_channels(self):
+        legacy = {**DEFAULTS, 'enabled': True, 'instructions': '旧版自定义规则',
+                  'channels': [{'name': '旧默认助手', 'mode': 'agent'}]}
+        with self.store.db:
+            self.store.db.execute('INSERT INTO config VALUES (?, ?)', ('settings', json.dumps(legacy)))
+        custom = [{'slot': 7, 'name': '我的助手', 'mode': 'agent', 'voice': 'cove'}]
+        self.store.save_settings(custom, USER)
+        self.assertEqual(self.store.settings(OTHER),
+                         {**legacy, 'channels': [{'name': '快问', 'mode': 'fast'}, {'name': 'Voxi Agent', 'mode': 'agent'}]})
+        self.assertEqual(self.store.settings(USER)['channels'], custom)
+        self.store.reset_channels(USER)
+        self.assertEqual(self.store.settings(USER)['channels'], self.store.settings(OTHER)['channels'])
+
 
 class HubTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -273,9 +286,10 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200)
         self.assertEqual(self.radio.agent.store.settings(),
                          {**original, 'enabled': True, 'instructions': '先给简洁结论。'})
-        response = await self.client.post('/voxi/agent', headers=self.headers,
-                                          json={'action': 'settings_patch', 'settings': {'unknown': True}})
-        self.assertEqual(response.status, 400)
+        for patch in ({'unknown': True}, {'channels': []}):
+            response = await self.client.post('/voxi/agent', headers=self.headers,
+                                              json={'action': 'settings_patch', 'settings': patch})
+            self.assertEqual(response.status, 400)
     async def test_voice_dispatch_saves_before_ack_without_sending_pcm_to_realtime(self):
         cfg=copy.deepcopy(DEFAULTS);cfg['enabled']=True;self.radio.agent.store.save_settings(cfg)
         socket=SimpleNamespace(closed=False,send_json=AsyncMock())
