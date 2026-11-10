@@ -187,6 +187,7 @@ class AgentHub:
             params={'cwd':str(cwd),'approvalPolicy':'on-request','sandbox':'workspace-write',
                     'developerInstructions':DEVELOPER_INSTRUCTIONS+'\n'+cfg['instructions'],
                     'config':{'mcp_servers':codex_mcp_config(selected)}}
+            params['developerInstructions']+='\n遵循用户或频道明确指定的回复语言。没有指定时，用用户本次任务的语言写最终结果，中文任务使用简体中文。'
             if GITHUB_ID in selected:
                 grant,mcp=self.capabilities.grant(task['user_id'])
                 params['config']['mcp_servers']['voxi_github_readonly']=mcp
