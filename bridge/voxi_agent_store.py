@@ -31,7 +31,7 @@ DEFAULTS = {
     'instructions': '你是 Voxi Agent。持续完成用户明确委托的工作。只播报必要状态，最终先给简短结论，再给详细结果。',
     'channels': [
         {'name': '快问', 'mode': 'fast'}, {'name': 'Voxi Agent', 'mode': 'agent'},
-        {'name': '备用 2', 'mode': 'disabled'}, {'name': '备用 3', 'mode': 'disabled'}],
+    ],
 }
 
 
@@ -80,6 +80,8 @@ class AgentStore:
     def settings(self, user=None):
         row = self.db.execute('SELECT value FROM config WHERE key=?', ('settings',)).fetchone()
         value = json.loads(row['value']) if row else copy.deepcopy(DEFAULTS)
+        # Legacy deployments stored editable shared channels in this record.
+        value['channels'] = copy.deepcopy(DEFAULTS['channels'])
         if user:
             override = self.db.execute('SELECT value FROM config WHERE key=?', ('channels:' + user,)).fetchone()
             if override:
@@ -141,7 +143,8 @@ class AgentStore:
                 raise ValueError('单任务最长时间需要 60–7200 秒')
             if not isinstance(value['model'], str) or len(value['model']) > 100 or not isinstance(value['instructions'], str) or len(value['instructions']) > 8000:
                 raise ValueError('模型名称或指令过长')
-            value = {**value, 'channels': self.validate_channels(value['channels'])}
+            if value['channels'] != DEFAULTS['channels']:
+                raise ValueError('初始频道固定为快问和 Voxi Agent，请在个人空间管理自定义频道')
             key = 'settings'
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO config VALUES(?,?)', (key, json.dumps(value, ensure_ascii=False)))
