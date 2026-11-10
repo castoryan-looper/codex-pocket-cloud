@@ -166,6 +166,35 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['role'],'user');self.assertEqual(data['profile']['id'],self.a)
         self.assertEqual([d['id'] for d in data['devices']],['esp32-111111111111'])
 
+    async def test_task_pages_show_full_owned_answers_times_and_reported_usage(self):
+        store=self.radio.agent.store
+        answer='完整回答\n'+ '🙂'*64000
+        tasks=[]
+        for i in range(3):
+            task,_=store.submit(self.a,None,1,f'ledger-{i}',f'我的问题 {i}')
+            finished=store.update(task['id'],state='completed',result=answer)['updated']
+            store.update(task['id'],result=answer)
+            tasks.append((task,finished))
+        store.set_usage(tasks[2][0]['id'],{'inputTokens':35,'outputTokens':0})
+
+        before=None
+        for task,finished in reversed(tasks):
+            response,page=await self.call({'action':'tasks','before':before})
+            self.assertEqual(response.status,200)
+            self.assertLess(len(json.dumps(page)),1048576)
+            self.assertEqual([row['id'] for row in page['tasks']],[task['id']])
+            row=page['tasks'][0]
+            self.assertEqual(row['prompt'],task['prompt'])
+            self.assertEqual(row['result'],answer)
+            self.assertEqual(row['created'],task['created'])
+            self.assertEqual(row['finishedAt'],finished)
+            self.assertEqual(row['usage'],{'input_tokens':35,'output_tokens':0,'total_tokens':None}
+                             if task['id']==tasks[2][0]['id'] else None)
+            before=page['nextBefore']
+        self.assertIsNone(before)
+        response,_=await self.call({'action':'tasks','before':self.task['id']})
+        self.assertEqual(response.status,400)
+
     async def test_cross_owner_and_administrator_actions_are_rejected(self):
         for body in ({'action':'snapshot','userId':self.b}, {'action':'detail','taskId':self.task['id']},
                      {'action':'cancel','taskId':self.task['id']}, {'action':'test_openclaw','connectionId':self.conn['connectionId']},

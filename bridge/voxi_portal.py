@@ -49,6 +49,11 @@ class UserPortal:
             if not isinstance(uid,str) or not re.fullmatch(r'[a-f0-9]{32}',uid) or not r.memory.user(uid):raise ValueError('账户未绑定有效用户档案')
             if 'userId' in body and body['userId']!=uid:raise ValueError('不能操作其他用户')
             if action=='snapshot':pass
+            elif action=='tasks':
+                before=body.get('before')
+                if before is not None and (not isinstance(before,str) or not re.fullmatch(r'[a-f0-9]{32}',before)):
+                    raise ValueError('任务分页游标无效')
+                return web.json_response(hub.store.portal_tasks(uid,before),headers={'Cache-Control':'no-store'})
             elif action=='profile':
                 r.memory.change({'action':'profile','userId':uid,'name':body.get('name'),'profile':body.get('profile'),'enabled':body.get('enabled')})
                 await self.changed_context(uid)
