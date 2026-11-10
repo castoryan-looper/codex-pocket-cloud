@@ -217,6 +217,32 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         response=await self.client.post('/voxi/agent',headers=self.headers,json={'action':'detail','userId':OTHER,'taskId':task['id']})
         self.assertEqual(response.status,400)
 
+    async def test_admin_model_connection_is_verified_owner_scoped_and_write_only(self):
+        other=self.radio.memory.create_user('Another user')['id']
+        key='never-a-real-model-api-key'
+        body={'action':'connect_model','userId':self.uid,'provider':'deepseek','name':'DeepSeek','model':'deepseek-flash','key':key}
+        async def post(value):
+            return await self.client.post('/voxi/agent',headers=self.headers,json=value)
+        self.assertEqual((await self.client.post('/voxi/agent',json=body)).status,403)
+        with patch.object(self.radio.agent.models,'complete',new_callable=AsyncMock) as check:
+            self.assertEqual((await post({**body,'userId':OTHER})).status,400)
+            response=await post(body);self.assertEqual(response.status,200)
+            ident=(await response.json())['connectionId']
+            probe={'action':'test_model','userId':self.uid,'connectionId':ident}
+            self.assertEqual((await post({**probe,'userId':other})).status,400)
+            self.assertEqual((await post(probe)).status,200)
+            self.assertEqual(check.await_count,2)
+        response=await self.client.get('/voxi/agent',headers=self.headers)
+        self.assertNotIn(key,await response.text())
+        self.assertEqual((await response.json())['modelConnections'][0]['user_id'],self.uid)
+        routes=[{'slot':0,'name':'快问','mode':'fast'},{'slot':1,'name':'DeepSeek','mode':'model','connectionId':ident}]
+        self.assertEqual((await post({'action':'channels','userId':other,'channels':routes})).status,400)
+        self.assertEqual((await post({'action':'channels','userId':self.uid,'channels':routes})).status,200)
+        remove={**probe,'action':'delete_model'}
+        self.assertEqual((await post(remove)).status,400)
+        self.assertEqual((await post({'action':'reset_channels','userId':self.uid})).status,200)
+        self.assertEqual((await post(remove)).status,200)
+
     async def test_admin_user_detail_is_scoped_to_owner_and_selected_section(self):
         device='esp32-111111111111';other_device='esp32-222222222222'
         other=self.radio.memory.bind(other_device)

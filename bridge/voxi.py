@@ -1074,6 +1074,11 @@ class VoxiRadio:
                 elif action=='test_openclaw':
                     return web.json_response(await self.agent.openclaw.probe(uid,body.get('connectionId')),headers={'Cache-Control':'no-store'})
                 elif action=='delete_openclaw':self.agent.openclaw.delete(uid,body.get('connectionId'))
+                elif action=='connect_model':
+                    return web.json_response(await self.agent.models.create(uid,body),headers={'Cache-Control':'no-store'})
+                elif action=='test_model':
+                    return web.json_response(await self.agent.models.probe(uid,body.get('connectionId')),headers={'Cache-Control':'no-store'})
+                elif action=='delete_model':self.agent.models.delete(uid,body.get('connectionId'))
                 elif action=='detail':
                     task=self.agent.store.task(body.get('taskId'),uid)
                     if not task:raise ValueError('任务不存在')
