@@ -1142,6 +1142,12 @@ class VoxiRadio:
                 action=body.get('action')
                 if action=='directory':
                     return web.json_response({'profiles':self.memory.user_directory()},headers={'Cache-Control':'no-store'})
+                if action in ('check_delete_user','delete_user'):
+                    if not isinstance(uid,str) or body.get('confirmUserId')!=uid:raise ValueError('请输入完整用户 ID 确认删除')
+                    if self.agent and self.agent.store.has_active_tasks(uid):raise ValueError('请先结束或取消此用户的后台任务')
+                    check_only=action=='check_delete_user'
+                    self.memory.delete_user(uid,check_only=check_only)
+                    return web.json_response({'ok':True,'userId':uid},headers={'Cache-Control':'no-store'})
                 if action=='user_detail':
                     section=body.get('section')
                     if section not in ('profile','devices','memory','tasks'):raise ValueError('用户页面无效')
