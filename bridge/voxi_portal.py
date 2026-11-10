@@ -9,7 +9,6 @@ import re
 from aiohttp import web
 from voxi_agent_store import CHANNEL_LIMIT
 from voxi_models import PROVIDERS
-from voxi_channel_tools import channel_tools_catalog
 from voxi_voices import catalog,validate_voice
 
 
@@ -24,8 +23,8 @@ class UserPortal:
                 'modelConnections':hub.models.public(uid),'modelProviders':PROVIDERS,'channelLimit':CHANNEL_LIMIT,
                 'voiceSettings':r.voice_preview.enrich(catalog(r.settings.snapshot()['voice'],hub.store.preferences(uid)['voice'])),
                 'tasks':[hub.store.public_task(t) for t in hub.store.list_tasks(uid)],
-                'usage':hub.store.user_usage(uid),'channelTools':channel_tools_catalog(),
-                'capabilities':{'openclaw':True,'museCode':True,'userPortal':1,'channelVoices':True,'contextSync':True}}
+                'usage':hub.store.user_usage(uid),'channelTools':hub.capabilities.catalog(uid),
+                'capabilities':{'openclaw':True,'museCode':True,'capabilityLibrary':1,'userPortal':1,'channelVoices':True,'contextSync':True}}
 
     async def changed_context(self, uid):
         r=self.radio;r.memory_revision[uid]=r.memory_revision.get(uid,0)+1
@@ -74,6 +73,11 @@ class UserPortal:
             elif action=='test_openclaw':
                 return web.json_response(await hub.openclaw.probe(uid,body.get('connectionId')),headers={'Cache-Control':'no-store'})
             elif action=='delete_openclaw':hub.openclaw.delete(uid,body.get('connectionId'))
+            elif isinstance(action,str) and action.startswith('capability_'):
+                result=await hub.capabilities.manage(uid,body)
+                if action in ('capability_github_connect','capability_github_remove'):
+                    await r.publish_channel_catalog(uid)
+                return web.json_response(result,headers={'Cache-Control':'no-store'})
             elif action=='connect_model':
                 return web.json_response(await hub.models.create(uid,body),headers={'Cache-Control':'no-store'})
             elif action=='test_model':

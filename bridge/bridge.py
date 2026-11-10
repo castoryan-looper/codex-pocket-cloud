@@ -1396,6 +1396,9 @@ class Pocket:
         app.router.add_post('/voxi/agent', self.voxi_radio.agent_configuration)
         from voxi_portal import UserPortal
         app.router.add_post('/voxi/portal', UserPortal(self.voxi_radio).handle)
+        if self.voxi_radio.agent:
+            self.voxi_radio.agent.capabilities.port = getattr(self.args,'http_port',8787)
+            app.router.add_post('/voxi/capability-mcp',self.voxi_radio.agent.capabilities.mcp)
         app.router.add_post('/voxi/voice-preview', self.voxi_radio.voice_preview.handle)
         async def agent_startup(_):
             if self.voxi_radio.agent:self.voxi_radio.agent.start()

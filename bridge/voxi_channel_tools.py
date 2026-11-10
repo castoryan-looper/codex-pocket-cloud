@@ -1,4 +1,8 @@
-"""Server-owned workflow and MCP catalog for personal Voxi channels."""
+"""Built-in workflows and channel tool validation."""
+import re
+
+IMPORTED_SKILL_ID = re.compile(r"skill-[a-f0-9]{32}")
+GITHUB_ID = "github-readonly"
 
 SKILLS = {
     'research': ('资料调研', '列出证据、出处和仍待确认的结论。',
@@ -39,8 +43,10 @@ def validate_channel_personalization(channel):
         result['role'] = role
     for field, catalog in (('skills', SKILLS), ('mcp', MCP_SERVERS)):
         items = channel.get(field, [])
-        if (not isinstance(items, list) or len(items) > len(catalog)
-                or any(not isinstance(item, str) or item not in catalog for item in items)
+        if (not isinstance(items, list) or len(items) > 16
+                or any(not isinstance(item, str) or not (item in catalog or
+                       (field == 'skills' and IMPORTED_SKILL_ID.fullmatch(item)) or
+                       (field == 'mcp' and item == GITHUB_ID)) for item in items)
                 or len(items) != len(set(items))):
             raise ValueError('请选择 Voxi 提供的 Skill 或 MCP 工具')
         if items:
@@ -50,13 +56,18 @@ def validate_channel_personalization(channel):
     return result
 
 
-def agent_personalization(route):
+def agent_personalization(route, imported=None):
     notes = []
     if route.get('role'):
         notes.append('用户为当前频道设置的角色与工作偏好：\n' + route['role'])
     for key in route.get('skills', []):
-        name, _, instructions = SKILLS[key]
-        notes.append(f'可按任务需要使用工作流程「{name}」：{instructions}')
+        if key in SKILLS:
+            name, _, instructions = SKILLS[key]
+            notes.append(f'可按任务需要使用工作流程「{name}」：{instructions}')
+        else:
+            item = (imported or {})[key]
+            resources = '\n\n'.join(path+'\n'+text for path,text in item['references'].items())
+            notes.append('用户启用的 Skill：'+item['name']+'\n来源：'+item['source']+'\n'+item['instructions']+'\n'+resources)
     return '\n\n'.join(notes)
 
 
