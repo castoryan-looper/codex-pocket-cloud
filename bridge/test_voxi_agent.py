@@ -334,5 +334,29 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(socket.closed)
         self.assertEqual(len(self.radio.agent.store.list_tasks(self.uid)),1)
 
+    async def test_spoken_inventory_and_progress_use_current_channel_state_without_queueing(self):
+        hub=self.radio.agent
+        hub.store.save_settings({**DEFAULTS,'enabled':True})
+        hub.store.save_settings([DEFAULTS['channels'][0],{'name':'代码频道','mode':'agent','skills':['code-review']}],self.uid)
+        running,_=hub.store.submit(self.uid,'esp32-111111111111',1,'original','长任务')
+        hub.store.update(running['id'],state='awaiting_approval',summary='等待远程调用确认')
+        hub.store.submit(self.uid,'esp32-111111111111',1,'queued','误入队列的进度查询')
+        socket=SimpleNamespace(closed=False,send_json=AsyncMock())
+        voice=VoiceSession(socket,'unused')
+        voice.agent_radio=self.radio;voice.channel=1;voice.memory_user=self.uid;voice.memory_device='esp32-111111111111'
+        voice.say_agent=AsyncMock()
+        for utterance in ('请问现在做到哪里了？','任务进展如何？','查看进度','要继续等吗'):
+            self.radio.transcribe_memory=lambda _:utterance
+            await self.radio.agent_voice(voice,b'fixture')
+            self.assertIn('暂停在确认步骤',voice.say_agent.call_args.args[0])
+            self.assertEqual(socket.send_json.call_args.args[0]['taskId'],running['id'])
+        self.radio.transcribe_memory=lambda _:'Voxi Agent 有什么 Skill 或者 MCP？'
+        await self.radio.agent_voice(voice,b'fixture')
+        spoken=voice.say_agent.call_args.args[0]
+        self.assertIn('代码审查',spoken)
+        self.assertIn('MCP，尚未启用',spoken)
+        self.assertNotIn('OpenAI 官方文档',spoken)
+        self.assertEqual(len(hub.store.list_tasks(self.uid)),2)
+
 
 if __name__=='__main__':unittest.main()

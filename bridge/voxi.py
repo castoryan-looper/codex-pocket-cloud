@@ -28,6 +28,61 @@ from voice_recovery import offer_audio_nack, configure_audio_recovery
 from voxi_voices import validate_voice
 LOG = logging.getLogger('pocket.voxi')
 CHANNEL_LABEL_WIDTH, CHANNEL_LABEL_HEIGHT = 120, 16
+PROGRESS_QUERY = re.compile(
+    r'(?:请问|请|麻烦)?(?:帮我)?(?:查看进度|查(?:看|询|一下|下)?(?:任务)?(?:的)?(?:进度|进展)|'
+    r'(?:现在|任务|刚才(?:的)?任务)?(?:任务)?(?:的)?(?:进度|进展)(?:怎么样|如何|到哪(?:里|一步)?了)?|'
+    r'(?:刚才(?:的)?任务|任务|它)?(?:现在)?(?:怎么样了|做到哪(?:里|一步)?了|跑完了(?:吗)?|完成了(?:吗)?|'
+    r'还在(?:跑|执行|处理)(?:吗)?|还要等(?:吗)?|要(?:不要)?继续等(?:吗)?))(?:啊|呢|吗)?'
+)
+RESULT_QUERY = re.compile(r'(?:请|帮我)?(?:读(?:一下|下)?(?:任务)?结果|查看(?:任务)?结果|任务结果)')
+CAPABILITY_QUERY = re.compile(
+    r'(?:请问|请|麻烦|帮我)?(?:voxiagent|voxi|你|这个频道|当前频道|本频道)?(?:现在|当前)?'
+    r'(?:有(?:什么|哪些)|(?:启用|开启|开|支持|可用|能用)(?:了)?哪些|列出|看看)'
+    r'(?:已(?:经)?启用的)?(?:skills?|技能|mcp工具|mcp|工具)'
+    r'(?:(?:或者|或是|或|和|与|以及|、)(?:skills?|技能|mcp工具|mcp|工具))?(?:呢|啊|吗)?'
+)
+
+
+def voice_query_key(text):
+    return re.sub(r'\s+', '', unicodedata.normalize('NFKC',text).lower()).strip('，。！？!?.,;；')
+
+
+def task_progress_speech(task, read_result=False):
+    state=task['state']
+    if state=='completed':
+        if read_result:
+            return task['result'] or '任务已完成。云端没有保存可播报的文本结果。'
+        return '任务已完成。'+('你可以说，读结果。' if task['result'] else '详情请看网页的我的任务。')
+    if state=='queued':
+        return '任务已进入队列，尚未开始执行。'
+    if state=='awaiting_approval':
+        return '任务暂停在确认步骤。请打开网页的我的任务，核对并处理待确认的操作。'
+    if state=='needs_input':
+        return '任务在等你补充信息。请在网页的我的任务查看问题。'
+    if state=='cancelling':
+        return '已发送停止请求，正在等执行器确认。'
+    if state in ('submitting','running'):
+        elapsed=max(0,int(time.time()-task['updated']))
+        label='任务正在提交。' if state=='submitting' else '任务仍处于执行中。'
+        summary=task['summary'].strip('。 ')
+        if summary:
+            label+='最近一次更新，'+summary+'。'
+        if elapsed>=20:
+            amount=f'{elapsed//60} 分钟' if elapsed>=60 else f'{elapsed} 秒'
+            label+=f'约 {amount} 没有新的进度更新。'
+        return label
+    label={'failed':'任务失败。','cancelled':'任务已停止。','interrupted':'任务已中断。',
+           'delivery_unknown':'任务结果尚未确认。'}.get(state,'任务状态需要核对。')
+    return label+task['summary']
+
+
+def channel_capability_speech(route, catalog):
+    parts=[]
+    for field,label in (('skills','Skill'),('mcp','MCP')):
+        chosen=set(route.get(field,[]))
+        names=[item['name'] for item in catalog[field] if item['id'] in chosen]
+        parts.append(f'{label}，'+('、'.join(names)+'。' if names else '尚未启用。'))
+    return '当前频道是'+route['name']+'。'+''.join(parts)+'你可以在网页的频道与助手中调整。'
 
 
 @lru_cache(maxsize=128)
@@ -995,17 +1050,23 @@ class VoxiRadio:
             current=channel_routes(settings['channels']).get(channel,MISSING_CHANNEL)
             if not settings['enabled'] or session.channel != channel or route != current:
                 await session.say_agent('频道设置已变化，请确认后重新说一遍。');return
-            self.memory.record(uid,session.memory_device,session.agent_request_id,text)
             normalized=text.strip().rstrip('。！？!?')
-            tasks=self.agent.store.list_tasks(uid,channel,1,route=route)
-            task=tasks[0] if tasks else None
-            if normalized in ('查看进度','查询进度','任务进度','读结果','查看结果','任务结果'):
+            query=voice_query_key(text)
+            if route['mode']=='agent' and CAPABILITY_QUERY.fullmatch(query):
+                await session.say_agent(channel_capability_speech(route,self.agent.capabilities.catalog(uid))[:900])
+                return
+            result_query=bool(RESULT_QUERY.fullmatch(query))
+            if result_query or PROGRESS_QUERY.fullmatch(query):
+                tasks=self.agent.store.list_tasks(uid,channel,1,route=route,progress=True)
+                task=tasks[0] if tasks else None
                 if task:
                     await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
-                    spoken=task['result'] if normalized in ('读结果','查看结果','任务结果') and task['result'] else task['summary']
-                    await session.say_agent(spoken[:900])
+                    await session.say_agent(task_progress_speech(task,result_query)[:900])
                 else:await session.say_agent('这个频道还没有任务。')
                 return
+            self.memory.record(uid,session.memory_device,session.agent_request_id,text)
+            tasks=self.agent.store.list_tasks(uid,channel,1,route=route)
+            task=tasks[0] if tasks else None
             if normalized in ('取消任务','停止任务'):
                 if not task:await session.say_agent('当前没有任务。');return
                 result=await self.agent.action(uid,task['id'],'cancel')
