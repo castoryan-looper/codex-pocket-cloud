@@ -215,10 +215,11 @@ class AgentHub:
             raise
         except Exception:
             if self.store.task(ident)['state'] not in TERMINAL:
-                await self.change(ident,state='delivery_unknown' if submitted else 'failed',
-                                  summary='提交结果尚未确认，请核对后再继续' if submitted else
-                                  '无法启动已启用 MCP 的执行器，请稍后重试或检查频道工具' if connecting_tools else
-                                  '执行器未就绪，请检查服务器登录或模型配置')
+                if submitted:
+                    await self.change(ident,state='delivery_unknown',summary='提交结果尚未确认，请核对后再继续')
+                else:
+                    summary='无法启动已启用 MCP 的执行器，请稍后重试或检查频道工具' if connecting_tools else '执行器未就绪，请检查服务器登录或模型配置'
+                    await self.change(ident,state='failed',summary=summary)
 
     def for_thread(self, thread):
         if not thread:return None
