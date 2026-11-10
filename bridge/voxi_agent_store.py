@@ -159,7 +159,7 @@ class AgentStore:
                               (ident, user) if user else (ident,)).fetchone()
         return dict(row) if row else None
 
-    def list_tasks(self, user=None, channel=None, limit=100, *, route=None, progress=False):
+    def list_tasks(self, user=None, channel=None, limit=100, *, route=None, progress=False, completed_result=False):
         clauses, args = [], []
         if user:
             clauses.append('user_id=?'); args.append(user)
@@ -168,6 +168,8 @@ class AgentStore:
         if route is not None:
             clauses.extend(('engine=?', 'connection_id IS ?'))
             args.extend((route_engine(route), route.get('connectionId')))
+        if completed_result:
+            clauses.append("state='completed' AND trim(result)<>''")
         query = 'SELECT * FROM tasks' + (' WHERE ' + ' AND '.join(clauses) if clauses else '')
         order = ("CASE WHEN state IN ('submitting','running','needs_input','awaiting_approval','cancelling') THEN 0 "
                  "WHEN state='queued' THEN 1 ELSE 2 END, CASE WHEN state='queued' THEN created END, created DESC"

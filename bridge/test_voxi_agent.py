@@ -358,5 +358,26 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('OpenAI 官方文档',spoken)
         self.assertEqual(len(hub.store.list_tasks(self.uid)),2)
 
+    async def test_natural_result_queries_play_saved_answer_over_newer_queued_task(self):
+        hub=self.radio.agent
+        hub.store.save_settings({**DEFAULTS,'enabled':True})
+        saved,_=hub.store.submit(self.uid,'esp32-111111111111',1,'search','查询限制')
+        answer='实际限制是每个频道最多启用三个导入的 Skill。'
+        hub.store.update(saved['id'],state='completed',result=answer,summary='查询完成')
+        socket=SimpleNamespace(closed=False,send_json=AsyncMock())
+        voice=VoiceSession(socket,'unused')
+        voice.agent_radio=self.radio;voice.channel=1;voice.memory_user=self.uid;voice.memory_device='esp32-111111111111'
+        voice.say_agent=AsyncMock()
+        self.radio.transcribe_memory=lambda _:'查看进度'
+        await self.radio.agent_voice(voice,b'fixture')
+        self.assertEqual(voice.say_agent.call_args.args[0],answer)
+        queued,_=hub.store.submit(self.uid,'esp32-111111111111',1,'queued-question','另外查一件事')
+        for phrase in ('你刚才查到了什么？','结果是什么','把刚才查到的结果直接告诉我','直接回答刚才的问题','读结果'):
+            self.radio.transcribe_memory=lambda _:phrase
+            await self.radio.agent_voice(voice,b'fixture')
+            self.assertEqual(voice.say_agent.call_args.args[0],answer+' 这是最近一条已完成任务的结果。')
+            self.assertEqual(socket.send_json.call_args.args[0]['taskId'],queued['id'])
+        self.assertEqual(len(hub.store.list_tasks(self.uid)),2)
+
 
 if __name__=='__main__':unittest.main()

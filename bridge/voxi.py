@@ -41,7 +41,14 @@ PROGRESS_QUERY = re.compile(
     r'(?:刚才(?:的)?任务|任务|它)?(?:现在)?(?:怎么样了|做到哪(?:里|一步)?了|跑完了(?:吗)?|完成了(?:吗)?|'
     r'还在(?:跑|执行|处理)(?:吗)?|还要等(?:吗)?|要(?:不要)?继续等(?:吗)?))(?:啊|呢|吗)?'
 )
-RESULT_QUERY = re.compile(r'(?:请|帮我)?(?:读(?:一下|下)?(?:任务)?结果|查看(?:任务)?结果|任务结果)')
+RESULT_QUERY = re.compile(
+    r'(?:请问|请|麻烦)?(?:帮我)?(?:直接)?(?:'
+    r'(?:读|播报|查看|说|告诉我)(?:一下|下)?(?:刚才的|刚才查到的|查到的|任务的|任务)?(?:结果|结论|答案)|'
+    r'(?:刚才|这次|现在)?(?:你)?(?:刚才)?查(?:到|出)(?:了)?(?:什么(?:结果)?(?:了)?|结果了(?:吗)?|吗)|'
+    r'(?:刚才(?:的)?|这次(?:的)?|任务(?:的)?|查到的)?(?:结果|结论|答案)(?:是什么|怎么样|出来了吗)?|'
+    r'把(?:刚才(?:查到)?的|查到的|任务的)?(?:结果|结论|答案)(?:直接)?(?:告诉我|读给我听|念给我听|说给我听|说出来)|'
+    r'(?:回答|直接回答)(?:一下)?刚才的问题)(?:吧|呢|啊|吗)?'
+)
 CAPABILITY_QUERY = re.compile(
     r'(?:请问|请|麻烦|帮我)?(?:voxiagent|voxi|你|这个频道|当前频道|本频道)?(?:现在|当前)?'
     r'(?:有(?:什么|哪些)|(?:启用|开启|开|支持|可用|能用)(?:了)?哪些|列出|看看)'
@@ -62,12 +69,23 @@ def agent_speech_message(text):
                       ensure_ascii=False,separators=(',',':'))
 
 
-def task_progress_speech(task, read_result=False):
+def completed_task_speech(result, *, previous=False):
+    text=result.strip()
+    if not text:
+        return '任务已完成。云端没有保存可播报的文本结果。'
+    suffix='这是最近一条已完成任务的结果。' if previous else ''
+    if len(text)+len(suffix)>900:
+        suffix+='完整结果请看网页。'
+        cut=text[:900-len(suffix)-1]
+        last=max(cut.rfind(mark) for mark in ('。','！','？','\n'))
+        text=cut[:last+1].strip() if last>=len(cut)//2 else cut.rstrip()+'…'
+    return text+(' '+suffix if suffix else '')
+
+
+def task_progress_speech(task):
     state=task['state']
     if state=='completed':
-        if read_result:
-            return task['result'] or '任务已完成。云端没有保存可播报的文本结果。'
-        return '任务已完成。'+('你可以说，读结果。' if task['result'] else '详情请看网页的我的任务。')
+        return completed_task_speech(task['result'])
     if state=='queued':
         return '任务已进入队列，尚未开始执行。'
     if state=='awaiting_approval':
@@ -1079,8 +1097,16 @@ class VoxiRadio:
                 tasks=self.agent.store.list_tasks(uid,channel,1,route=route,progress=True)
                 task=tasks[0] if tasks else None
                 if task:
+                    # Result requests may read the last completed answer even while
+                    # another task is queued. Keep the device status on the active task.
+                    completed=self.agent.store.list_tasks(uid,channel,1,route=route,completed_result=True) if result_query else []
                     await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
-                    await session.say_agent(task_progress_speech(task,result_query)[:900])
+                    spoken=(completed_task_speech(completed[0]['result'],previous=completed[0]['id']!=task['id'])
+                            if completed else task_progress_speech(task))
+                    answer=completed[0] if completed else task
+                    LOG.info('Voxi task voice reply taskId=%s state=%s source=%s',
+                             answer['id'][:8],answer['state'],'stored_result' if answer['state']=='completed' and answer['result'] else 'state')
+                    await session.say_agent(spoken[:900])
                 else:await session.say_agent('这个频道还没有任务。')
                 return
             self.memory.record(uid,session.memory_device,session.agent_request_id,text)
@@ -1109,7 +1135,7 @@ class VoxiRadio:
                     while time.monotonic()<deadline:
                         task=self.agent.store.task(result['id'],uid)
                         if task['state']=='completed':
-                            await session.say_agent(task['result'][:900]);return
+                            await session.say_agent(completed_task_speech(task['result']));return
                         if task['state'] in ('failed','cancelled','interrupted','delivery_unknown'):
                             await session.say_agent(task['summary']);return
                         await asyncio.sleep(.15)
