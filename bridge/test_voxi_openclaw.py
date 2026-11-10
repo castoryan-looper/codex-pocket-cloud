@@ -45,6 +45,39 @@ class OpenClawTests(unittest.IsolatedAsyncioTestCase):
     async def poll(self, c, **extra):
         return await self.hub.openclaw.relay({'connectionId':c['connectionId'],'relayToken':c['pairingToken'],'status':'ready','op':'poll',**extra})
 
+    async def test_muse_has_scoped_lease_results_and_continuation(self):
+        connection=self.hub.openclaw.create_muse(USER,'Project')
+        ident=connection['connectionId']
+        channels=[DEFAULTS['channels'][0],{'name':'Muse Code','mode':'muse','connectionId':ident}]
+        self.hub.check_routes(channels,USER)
+        with self.assertRaises(ValueError):self.hub.check_routes(channels,OTHER)
+        with self.assertRaises(ValueError):self.hub.check_routes([channels[0],{**channels[1],'mode':'openclaw'}],USER)
+        with self.assertRaises(ValueError):await self.poll(connection)
+        self.hub.store.save_settings(channels,USER)
+        self.assertEqual(self.hub.openclaw.public(USER)[0]['engine'],'muse')
+        await self.poll(connection,relayEngine='muse')
+        self.assertTrue((await self.hub.openclaw.probe(USER,ident))['ok'])
+        task,_=self.hub.submit(USER,None,1,'first-muse','Review files')
+        await until(lambda:self.hub.store.task(task['id'])['state']=='submitting')
+        job=(await self.poll(connection,relayEngine='muse'))['job']
+        self.assertEqual(job['text'],'Review files')
+        self.assertFalse(job['resume'])
+        self.assertIsNone((await self.poll(connection,relayEngine='muse'))['job'])
+        result={'relayEngine':'muse','op':'result','taskId':task['id'],'state':'completed','result':'Reviewed',
+                'usage':{'inputTokens':5,'outputTokens':3,'totalTokens':8}}
+        self.assertTrue((await self.poll(connection,**result))['ok'])
+        self.assertTrue((await self.poll(connection,**result))['ok'])
+        self.assertEqual(self.hub.store.user_usage(USER)['totalTokens'],8)
+        follow=await self.hub.action(USER,task['id'],'continue',request_id='follow-muse',text='Keep going')
+        await until(lambda:self.hub.store.task(follow['id'])['state']=='submitting')
+        resumed=(await self.poll(connection,relayEngine='muse'))['job']
+        self.assertEqual(resumed['session'],job['session'])
+        self.assertTrue(resumed['resume'])
+        await self.hub.action(USER,follow['id'],'cancel')
+        stop=await self.poll(connection,relayEngine='muse',busy=True,taskId=follow['id'])
+        self.assertEqual(stop['stop'],follow['id'])
+        self.assertFalse(self.rpc_calls)
+
     async def fixture(self):
         async def models(request):
             self.requests.append((request.path,dict(request.headers),None))

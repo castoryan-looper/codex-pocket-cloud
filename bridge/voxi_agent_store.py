@@ -17,6 +17,7 @@ from voxi_channel_tools import validate_channel_personalization
 
 TERMINAL = {'completed', 'failed', 'cancelled', 'interrupted', 'delivery_unknown'}
 LIVE = {'queued', 'submitting', 'running', 'needs_input', 'awaiting_approval', 'cancelling'}
+EXTERNAL_AGENT_LABELS = {'openclaw': 'OpenClaw', 'muse': 'Muse Code'}
 CHANNEL_LIMIT = 16
 MISSING_CHANNEL = {'name': '', 'mode': 'disabled'}
 
@@ -26,7 +27,7 @@ def channel_routes(channels):
 
 
 def route_engine(route):
-    return {'agent': 'codex', 'openclaw': 'openclaw', 'model': 'model'}.get(route['mode'])
+    return {'agent': 'codex', 'openclaw': 'openclaw', 'muse': 'muse', 'model': 'model'}.get(route['mode'])
 DEFAULTS = {
     'enabled': False, 'model': '', 'maxConcurrent': 2, 'maxTaskSeconds': 1800,
     'instructions': '你是 Voxi Agent。持续完成用户明确委托的工作。只播报必要状态，最终先给简短结论，再给详细结果。',
@@ -102,7 +103,7 @@ class AgentStore:
             if type(slot) is not int or not 0 <= slot < CHANNEL_LIMIT or slot in slots:
                 raise ValueError('频道编号无效或重复')
             slots.add(slot)
-            if not isinstance(c['name'], str) or not 1 <= len(c['name'].strip()) <= 32 or c['mode'] not in ('fast', 'agent', 'openclaw', 'model', 'disabled'):
+            if not isinstance(c['name'], str) or not 1 <= len(c['name'].strip()) <= 32 or c['mode'] not in ('fast', 'agent', 'openclaw', 'muse', 'model', 'disabled'):
                 raise ValueError('频道名称或模式无效')
             route = {'name': c['name'].strip(), 'mode': c['mode']}
             route.update(validate_channel_personalization(c))
@@ -110,7 +111,7 @@ class AgentStore:
             if 'voice' in c:
                 voice = validate_voice(c['voice'], inherit=True)
                 if voice: route['voice'] = voice
-            if c['mode'] in ('openclaw', 'model'):
+            if c['mode'] in (*EXTERNAL_AGENT_LABELS, 'model'):
                 if not isinstance(c.get('connectionId'),str) or not 1<=len(c['connectionId'])<=64:
                     raise ValueError('请为频道选择已配置的接入')
                 route['connectionId'] = c['connectionId']
@@ -188,7 +189,7 @@ class AgentStore:
             raise ValueError('任务队列已满，请等待已有任务完成')
         ident, now = uuid.uuid4().hex, time.time()
         with self.db:
-            if engine=='openclaw' and not thread:thread='voxi-'+user+'-'+ident
+            if engine in EXTERNAL_AGENT_LABELS and not thread:thread='voxi-'+user+'-'+ident
             self.db.execute('INSERT INTO tasks(id,user_id,device_id,channel,request_id,prompt,state,summary,result,thread_id,turn_id,created,updated,engine,connection_id,runtime_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                             (ident,user,device,channel,request_id,prompt.strip(),'queued','任务已保存，等待执行','',thread,None,now,now,engine,connection,runtime_tools))
             self.db.execute('INSERT INTO events(task_id,state,summary,created) VALUES(?,?,?,?)', (ident,'queued','任务已保存，等待执行',now))

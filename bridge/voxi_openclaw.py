@@ -1,7 +1,7 @@
-"""OpenClaw's documented Responses API; direct HTTPS or outbound home connector.
+"""External agent routing: OpenClaw Responses API and outbound connector leases.
 
 No runtime credential is sent to devices. Claimed work is never reissued after
-an ambiguous disconnect. External tool approvals stay in OpenClaw's own UI.
+an ambiguous disconnect. Muse Code and OpenClaw share the queue but have distinct connector scopes.
 """
 import asyncio
 import hashlib
@@ -16,7 +16,11 @@ from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp.abc import AbstractResolver
-from voxi_agent_store import LIVE, TERMINAL
+from voxi_agent_store import LIVE, TERMINAL, EXTERNAL_AGENT_LABELS
+
+
+def connection_engine(transport):
+    return 'muse' if transport=='muse-relay' else 'openclaw'
 
 
 def endpoint(value):
@@ -48,21 +52,31 @@ class OpenClaw:
           id TEXT PRIMARY KEY,user_id TEXT NOT NULL,name TEXT NOT NULL,transport TEXT NOT NULL,
           url TEXT NOT NULL,agent TEXT NOT NULL,secret TEXT NOT NULL,seen REAL,status TEXT NOT NULL)''')
 
-    def connection(self, ident, user=None):
+    def connection(self, ident, user=None, engine=None):
         r=self.store.db.execute('SELECT * FROM openclaw_connections WHERE id=?',(ident,)).fetchone()
-        return dict(r) if r and (user is None or r['user_id']==user) else None
+        if not r or (user is not None and r['user_id']!=user):return None
+        if engine is not None and connection_engine(r['transport'])!=engine:return None
+        return dict(r)
 
     def public(self, user=None):
         result=[]
         for r in self.store.db.execute('SELECT * FROM openclaw_connections'+(' WHERE user_id=?' if user else '')+' ORDER BY name',(user,) if user else ()):
             v={k:r[k] for k in ('id','user_id','name','transport','url','agent','seen','status')}
-            if r['transport']=='relay' and (not r['seen'] or time.time()-r['seen']>30):v['status']='offline'
+            v['engine']=connection_engine(r['transport'])
+            if r['transport']!='https' and (not r['seen'] or time.time()-r['seen']>30):v['status']='offline'
             v['configured']=True;result.append(v)
         return result
 
+    def create_muse(self, user, name):
+        return self._create(user,name,'muse-relay','','main','')
+
     def create(self, user, name, transport, url='', agent='main', token=''):
+        if transport not in ('https','relay'):raise ValueError('连接方式无效')
+        return self._create(user,name,transport,url,agent,token)
+
+    def _create(self, user, name, transport, url, agent, token):
         if not isinstance(name,str) or not 1<=len(name.strip())<=64:raise ValueError('请填写连接名称')
-        if transport not in ('https','relay') or not isinstance(agent,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',agent):
+        if not isinstance(agent,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',agent):
             raise ValueError('连接方式或 Agent ID 无效')
         ident=secrets.token_hex(16);pair=None
         if transport=='https':
@@ -82,14 +96,15 @@ class OpenClaw:
         # References must be removed first, including the hidden template/other profiles.
         configs=[self.store.settings()]+[self.store.settings(u) for u in self.store.channel_overrides()]
         if any(c.get('connectionId')==ident for cfg in configs for c in cfg['channels']):raise ValueError('请先解除频道绑定，再删除连接')
-        if any(t['connection_id']==ident and t['state'] in LIVE for t in self.store.list_tasks(limit=200)):raise ValueError('该连接还有执行中的任务')
+        if self.store.db.execute('SELECT 1 FROM tasks WHERE connection_id=? AND state IN ('+','.join('?' for _ in LIVE)+') LIMIT 1',(ident,*LIVE)).fetchone():
+            raise ValueError('该连接还有执行中的任务')
         with self.store.db:self.store.db.execute('DELETE FROM openclaw_connections WHERE id=?',(ident,))
 
     def check_routes(self, channels, user=None):
         for c in self.store.validate_channels(channels):
-            if c['mode']=='openclaw':
-                if not user:raise ValueError('公共模板只能使用快问、Voxi Agent 或未启用；OpenClaw 按用户绑定')
-                if not self.connection(c['connectionId'],user):raise ValueError('OpenClaw 连接不属于此用户')
+            if c['mode'] in EXTERNAL_AGENT_LABELS:
+                if not user:raise ValueError('外部 Agent 需要在个人账户内绑定')
+                if not self.connection(c['connectionId'],user,c['mode']):raise ValueError('外部 Agent 连接与此频道不匹配')
 
     def token(self, c):
         raw=bytes.fromhex(c['secret'])
@@ -102,14 +117,14 @@ class OpenClaw:
     def headers(self, c):return {'Authorization':'Bearer '+self.token(c),'x-openclaw-agent-id':c['agent']}
 
     def available(self, task):
-        if task['engine']!='openclaw':return True
-        c=self.connection(task['connection_id'],task['user_id'])
-        return not c or c['transport']!='relay' or bool(c['status']=='ready' and c['seen'] and time.time()-c['seen']<30)
+        if task['engine'] not in EXTERNAL_AGENT_LABELS:return True
+        c=self.connection(task['connection_id'],task['user_id'],task['engine'])
+        return not c or c['transport']=='https' or bool(c['status']=='ready' and c['seen'] and time.time()-c['seen']<30)
 
     async def probe(self, user, ident):
         c=self.connection(ident,user)
         if not c:raise ValueError('连接不存在或不属于当前用户')
-        if c['transport']=='relay':
+        if c['transport']!='https':
             return {'ok':bool(c['seen'] and time.time()-c['seen']<30 and c['status']=='ready'),'status':next(x['status'] for x in self.public() if x['id']==ident)}
         status='unreachable'
         try:
@@ -124,19 +139,20 @@ class OpenClaw:
         return {'ok':status=='ready','status':status}
 
     async def run(self, task):
-        ident=task['id'];c=self.connection(task['connection_id'],task['user_id'])
+        ident=task['id'];c=self.connection(task['connection_id'],task['user_id'],task['engine'])
+        label=EXTERNAL_AGENT_LABELS[task['engine']]
         if not c:
-            await self.hub.change(ident,state='failed',summary='绑定的 OpenClaw 连接已不可用');return
+            await self.hub.change(ident,state='failed',summary=f'绑定的 {label} 连接已不可用');return
         timeout=self.store.settings(task['user_id'])['maxTaskSeconds']
-        if c['transport']=='relay':
+        if c['transport']!='https':
             deadline=time.monotonic()+timeout
-            await self.hub.change(ident,state='submitting',summary='任务已保存，等待家中 OpenClaw 连接器接收')
+            await self.hub.change(ident,state='submitting',summary=f'任务已保存，等待 {label} 连接器接收')
             while self.store.task(ident)['state'] not in TERMINAL:
                 current=self.store.task(ident);c=self.connection(c['id'])
                 if time.monotonic()>deadline:
-                    await self.hub.change(ident,state='delivery_unknown' if current['state']=='running' else 'failed',summary='等待 OpenClaw 超时；请在 OpenClaw 核对执行状态');return
+                    await self.hub.change(ident,state='delivery_unknown' if current['state']=='running' else 'failed',summary=f'等待 {label} 超时，请核对执行状态');return
                 if current['state']=='running' and (not c or not c['seen'] or time.time()-c['seen']>45):
-                    await self.hub.change(ident,state='delivery_unknown',summary='家中连接器已离线；任务未重新派发，请核对 OpenClaw');return
+                    await self.hub.change(ident,state='delivery_unknown',summary=f'连接器已离线；任务未重新派发，请核对 {label}');return
                 if current['state']=='submitting' and (not c or not c['seen'] or time.time()-c['seen']>30):
                     await self.hub.change(ident,state='queued',summary='连接器在接收前离线，等待重新上线');return
                 await asyncio.sleep(.3)
@@ -181,30 +197,39 @@ class OpenClaw:
                 await self.hub.change(ident,state='delivery_unknown' if submitted else 'failed',summary='OpenClaw 连接未确认，请核对实例状态；未自动重试')
 
     async def relay(self, body):
-        c=self.connection(body.get('connectionId'))
+        engine=body.get('relayEngine','openclaw')
+        if engine not in EXTERNAL_AGENT_LABELS:raise ValueError('连接类型无效')
+        c=self.connection(body.get('connectionId'),engine=engine)
         token=body.get('relayToken','')
-        if not c or c['transport']!='relay' or not isinstance(token,str) or not hmac.compare_digest(c['secret'],hashlib.sha256(token.encode()).hexdigest()):
+        if not c or c['transport']=='https' or not isinstance(token,str) or not hmac.compare_digest(c['secret'],hashlib.sha256(token.encode()).hexdigest()):
             raise ValueError('连接凭据无效或已撤销')
+        label=EXTERNAL_AGENT_LABELS[engine]
         status=body.get('status')
         if status not in ('ready','unauthorized','endpoint_disabled','unreachable'):raise ValueError('连接状态无效')
         with self.store.db:self.store.db.execute('UPDATE openclaw_connections SET seen=?,status=? WHERE id=?',(time.time(),status,c['id']))
         if body.get('op')=='result':
             task=self.store.task(body.get('taskId'),c['user_id'])
-            if task and task['engine']=='openclaw' and task['connection_id']==c['id'] and task['state'] in ('completed','failed') and task['state']==body.get('state') and task['result']==body.get('result'):
+            if task and task['engine']==engine and task['connection_id']==c['id'] and task['state'] in ('completed','failed','delivery_unknown') and task['state']==body.get('state') and task['result']==body.get('result'):
                 return {'ok':True}  # Result retries acknowledge, never re-execute.
-            if not task or task['engine']!='openclaw' or task['connection_id']!=c['id'] or task['state'] not in ('running','delivery_unknown','interrupted'):
+            if not task or task['engine']!=engine or task['connection_id']!=c['id'] or task['state'] not in ('running','delivery_unknown','interrupted'):
                 raise ValueError('任务没有分配到此连接，或已结束')
             state=body.get('state');text=body.get('result','')
             if state not in ('completed','failed','delivery_unknown') or not isinstance(text,str) or len(text)>64000:raise ValueError('结果无效')
-            await self.hub.change(task['id'],state=state,result=text,summary=(' '.join(text.split())[:180] or 'OpenClaw 任务完成') if state=='completed' else 'OpenClaw 执行未完成；请前往 OpenClaw 核对')
+            self.store.set_usage(task['id'],body.get('usage'))
+            await self.hub.change(task['id'],state=state,result=text,summary=(' '.join(text.split())[:180] or f'{label} 任务完成') if state=='completed' else f'{label} 执行未完成；请在主机核对')
             return {'ok':True}
         if body.get('op')!='poll':raise ValueError('连接器操作无效')
+        if engine=='muse' and body.get('busy'):
+            task=self.store.task(body.get('taskId'),c['user_id'])
+            if task and task['engine']==engine and task['connection_id']==c['id'] and task['state'] in TERMINAL:
+                return {'job':None,'stop':task['id']}
         # One claim per connector, persisted before returning any prompt.
         tasks=self.store.list_tasks(c['user_id'],limit=200)
         if status=='ready' and not body.get('busy') and not any(t['connection_id']==c['id'] and t['state']=='running' for t in tasks):
             for t in reversed(tasks):
-                if t['engine']=='openclaw' and t['connection_id']==c['id'] and t['state']=='submitting' and t['id'] in self.hub.active:
-                    await self.hub.change(t['id'],state='running',summary='家中 OpenClaw 正在执行；工具确认请前往 OpenClaw')
+                if t['engine']==engine and t['connection_id']==c['id'] and t['state']=='submitting' and t['id'] in self.hub.active:
+                    await self.hub.change(t['id'],state='running',summary=f'{label} 正在执行')
                     return {'job':{'id':t['id'],'session':t['thread_id'],'text':t['prompt'],'agent':c['agent'],
-                                   'timeout':self.store.settings(c['user_id'])['maxTaskSeconds']}}
+                                   'timeout':self.store.settings(c['user_id'])['maxTaskSeconds'],
+                                   **({'resume':t['thread_id']!='voxi-'+t['user_id']+'-'+t['id']} if engine=='muse' else {})}}
         return {'job':None}
