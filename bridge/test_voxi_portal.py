@@ -50,6 +50,16 @@ class ProviderContractTests(unittest.TestCase):
 
 
 class DifyContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_agent_uses_final_message_instead_of_repeating_streamed_text(self):
+        async def events():
+            for event in ({'event': 'agent_message', 'answer': 'Hello'},
+                          {'event': 'agent_thought', 'thought': 'private'},
+                          {'event': 'message', 'answer': 'Hello!'},
+                          {'event': 'message_end', 'conversation_id': 'dify-thread'}):
+                yield b'data: ' + json.dumps(event).encode() + b'\n'
+        response = SimpleNamespace(status=200, content=events())
+        self.assertEqual(await dify_result(response, None, final_message=True), ('Hello!', None, 'dify-thread'))
+
     async def test_workflow_requires_text_input_and_successful_terminal_with_configured_output(self):
         parameters = {'user_input_form': [
             {'paragraph': {'variable': 'query', 'required': True}},
