@@ -22,7 +22,7 @@ from collections import deque
 
 from aiohttp import web, WSMsgType
 from voxi_config import VoiceSettings, effective_prompt, VOICE_TASK_INSTRUCTIONS
-from voxi_agent_store import CHANNEL_LIMIT, MISSING_CHANNEL, channel_routes, route_engine
+from voxi_agent_store import CHANNEL_LIMIT, LIVE, MISSING_CHANNEL, channel_routes, route_engine
 from voxi_memory import MemoryStore, device_id
 from voice_recovery import offer_audio_nack, configure_audio_recovery
 from voxi_voices import validate_voice
@@ -50,6 +50,23 @@ RESULT_QUERY = re.compile(
     r'(?:回答|直接回答)(?:一下)?刚才的问题)(?:吧|呢|啊|吗)?'
 )
 PREVIOUS_RESULT_QUERY = re.compile(r'(?:请|帮我)?(?:读|播报|查看|告诉我)(?:一下)?(?:上一条|上一个|最近(?:一条|一个)?)已完成(?:的)?任务(?:的)?(?:结果|结论|答案)(?:吧|呢|啊|吗)?')
+TASK_FOLLOWUP = re.compile(
+    r'(?:刚[才刚]|上(?:一(?:个|条|次)|个)(?:任务|结果|回答)|上次(?:任务|你|我)|'
+    r'(?:这个|那个|之前的|前面那个|我(?:刚[才刚])?让你做的)(?:任务|事)|'
+    r'任务(?:的)?(?:结果|结论|答复|进度|进展))'
+)
+TASK_QUESTION_END = re.compile(r'(?:吗|呢|没|没有|了|了吗|如何|怎么样|是什么|什么了|到哪(?:里|一步)?|多久|告诉我|给我听)$')
+TASK_SHORT_STATUS = re.compile(
+    r'^(?:请问|嗯|所以|那|它|现在|任务|你)*(?:(?:做完|跑完|好|搞定|完成|结束|查完|查到|出结果|有结果)了?'
+    r'(?:没|没有|吗|呢)|(?:还要等|还要|还有)多久(?:能(?:完成|出结果))?|什么时候(?:能|可以)(?:完成|出结果))$'
+)
+TASK_READ_REQUEST = re.compile(
+    r'^(?:请|麻烦|帮我|给我)*(?:再|直接)?(?:读|念|播报|复述|告诉我|看|查|说|汇报)'
+    r'(?:一下|下|说|读|一遍)?(?:刚[才刚](?:查到)?的|这个(?:任务)?的|当前(?:任务)?的|任务的?|上(?:次|一个任务)的)?'
+    r'(?:结果|答案|进度|进展|刚[才刚]那个)(?:吧|啊|呢)?$'
+)
+TASK_REFERENCE = re.compile(r'^(?:请问|那|所以|嗯)*(?:刚[才刚](?:的)?(?:那个(?:任务)?|那条(?:任务)?|那件事)|我刚[才刚](?:交给你|给你|让你做)的任务)(?:呢|啊|吧)?$')
+NEW_TASK = re.compile(r'^(?:(?:请|帮我)\s*)?(?:新任务|另一个任务|换个任务)[：:，,\s]*')
 CAPABILITY_QUERY = re.compile(
     r'(?:请问|请|麻烦|帮我)?(?:voxiagent|voxi|你|这个频道|当前频道|本频道)?(?:现在|当前)?'
     r'(?:有(?:什么|哪些)|(?:启用|开启|开|支持|可用|能用)(?:了)?哪些|列出|看看)'
@@ -60,6 +77,13 @@ CAPABILITY_QUERY = re.compile(
 
 def voice_query_key(text):
     return re.sub(r'\s+', '', unicodedata.normalize('NFKC',text).lower()).strip('，。！？!?.,;；')
+
+
+def task_followup(query):
+    # Match questions about existing work, even when ASR adds fillers or punctuation.
+    query = re.sub(r'[，,。.!?！？：:、]', '', query)
+    return bool(TASK_REFERENCE.fullmatch(query) or TASK_READ_REQUEST.fullmatch(query) or TASK_SHORT_STATUS.fullmatch(query) or
+                (len(query) <= 80 and TASK_QUESTION_END.search(query) and TASK_FOLLOWUP.search(query)))
 
 
 def agent_speech_message(text):
@@ -325,6 +349,9 @@ class VoiceSession:
         self.control_first = False
         self.voice_setup_error = None
         self.agent_request_id = None
+        self.agent_delivery_job = None
+        self.agent_reply = self.agent_reply_ack = None
+        self.agent_relay_ack = False
         self.voice_override=None
         self.voice='cove'
         self.agent_speech_only=False
@@ -358,7 +385,11 @@ class VoiceSession:
             return
         if packet.get('type') == 'ready' and self.agent_radio:
             packet = {**packet, **self.agent_radio.channel_info(self)}
-        if not self.ws.closed: await self.ws.send_json(packet)
+        if not self.ws.closed:
+            await self.ws.send_json(packet)
+            if self.radio and (packet.get('type') == 'ready' or
+                               (packet.get('type') == 'idle' and packet.get('reason') in ('too_short','channel_changed'))):
+                self.radio.schedule_agent_reply(self)
 
     async def send_channel_catalog(self):
         if not self.agent_radio or self.preview_mode or self.ws.closed:
@@ -680,7 +711,13 @@ class VoiceSession:
         self.outputting = False
         self.allow_output = self.research_pending
         self.generation_done = False
-        await self.send({'type': 'audio_end'})
+        packet={'type':'audio_end'}
+        if self.agent_reply:
+            self.agent_reply_ack,self.agent_reply=self.agent_reply,None
+            if self.agent_relay_ack:packet['agentReply']=self.agent_reply_ack[1]
+        await self.send(packet)
+        if self.agent_reply_ack and not self.agent_relay_ack:
+            self.confirm_agent_reply(self.agent_reply_ack[1])
         if self.research_pending:
             await self.send({'type': 'thinking'})
         else:
@@ -771,7 +808,9 @@ class VoiceSession:
 
     async def control(self, event):
         kind = event.get('type')
-        if kind == 'played': self.played = max(0,min(60000,int(event.get('ms',0))))
+        if kind == 'agent_reply_sent' and self.agent_relay_ack:
+            if self.confirm_agent_reply(event.get('replyId')):self.agent_radio.schedule_agent_reply(self)
+        elif kind == 'played': self.played = max(0,min(60000,int(event.get('ms',0))))
         elif kind == 'channel':
             channel = event.get('channel')
             if type(channel) is int and 0 <= channel < self.channel_limit: await self.switch_channel(channel)
@@ -894,10 +933,17 @@ class VoiceSession:
         if len(data)%2 or self.bytes > 30*48000: raise ValueError('Invalid/overlong PCM')
         self.pending_audio.extend(data)
 
+    def confirm_agent_reply(self, reply_id):
+        if not self.agent_reply_ack or reply_id != self.agent_reply_ack[1]:
+            return False
+        self.agent_radio.agent.store.mark_radio_reply_sent(self.agent_reply_ack[0],self.memory_user,self.memory_device)
+        self.agent_reply_ack=None
+        return True
 
     async def stop(self):
         self.ready = self.recording = self.allow_output = self.outputting = False
         self.agent_speech_only = False
+        self.agent_reply = self.agent_reply_ack = None
         # Ignore closure notifications from the old peer while changing channel.
         self.thread = self.item = self.response_id = None
         self.lookback.clear()
@@ -952,7 +998,7 @@ class VoxiRadio:
     def can_park(self, session):
         return (session in self.active and not session.ws.closed and session.ready
                 and not (session.recording or session.allow_output or session.outputting
-                         or session.research_pending or session.voice_lock.locked())
+                         or session.research_pending or session.agent_reply_ack or session.voice_lock.locked())
                 and session.continuation_until <= time.monotonic())
 
     async def warm_voice(self, session, *, reuse_idle=False):
@@ -1037,11 +1083,17 @@ class VoxiRadio:
         if route is None:return {}
         channel = session.channel if channel is None else channel
         engine=route_engine(route)
-        latest=self.agent.store.list_tasks(session.memory_user,channel,1,route=route) if session.memory_user and engine else []
-        task=latest[0] if latest else None
+        task=self.focused_agent_task(session,channel,route) if session.memory_user and engine else None
         return {'name':route['name'],'channelMode':'agent' if engine else route['mode'],
                 'agentProvider':engine or 'codex','agentTasks':True,
                 'taskId':task['id'] if task else '', 'taskState':task['state'] if task else ''}
+
+    def focused_agent_task(self, session, channel, route):
+        store=self.agent.store
+        uid=session.memory_user
+        own=store.list_tasks(uid,channel,1,route=route,device=session.memory_device) if session.memory_device else []
+        tasks=own or store.list_tasks(uid,channel,1,route=route)
+        return tasks[0] if tasks else None
 
     def channel_catalog(self, session):
         config = self.agent.store.settings(session.memory_user) if self.agent else None
@@ -1067,7 +1119,73 @@ class VoxiRadio:
                 cfg = self.agent.store.settings(session.memory_user)
                 route = channel_routes(cfg['channels']).get(session.channel, MISSING_CHANNEL)
                 if route_engine(route) == task['engine'] and route.get('connectionId') == task['connection_id']:
-                    await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
+                    focused=self.focused_agent_task(session,session.channel,route)
+                    if focused and focused['id']==task['id']:
+                        await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
+                    if task['state'] in ('completed','failed','cancelled') and task['device_id']==session.memory_device:
+                        self.schedule_agent_reply(session)
+
+    def agent_reply_to_send(self, session):
+        if (not self.agent or not self.memory or not session.ready or session.ws.closed
+                or session.recording or session.allow_output or session.outputting
+                or session.agent_reply or session.agent_reply_ack or not session.memory_user
+                or self.memory.owner(session.memory_device)!=session.memory_user):
+            return None
+        route=self.route(session)
+        if not route or not route_engine(route):return None
+        task=self.agent.store.pending_radio_reply(session.memory_user,session.memory_device,session.channel,route)
+        if task and any(ref and ref[0]==task['id'] for peer in self.active if not peer.ws.closed
+                        for ref in (peer.agent_reply,peer.agent_reply_ack)):
+            return None
+        return task
+
+    def schedule_agent_reply(self, session):
+        if session.agent_delivery_job or not self.agent_reply_to_send(session):
+            return
+
+        async def deliver():
+            try:
+                # Give an already starting PTT a chance to take the voice lock.
+                await asyncio.sleep(.25)
+                async with session.voice_lock:
+                    task=self.agent_reply_to_send(session)
+                    if not task:return
+                    cold=session not in self.voice_slots
+                    refresh=not session.agent_speech_only or session.selected_voice(self.settings.snapshot())!=session.voice
+                    if cold or refresh:
+                        session.ready=False
+                        await session.send({'type':'busy'})
+                        session.warming_turn=True
+                        try:acquired=await self.prepare_cellular_voice(session,cold)
+                        finally:session.warming_turn=False
+                        if not acquired:
+                            if acquired is False:
+                                session.ready=True
+                                await session.send({'type':'idle','reason':'voice_capacity'})
+                            return
+                        task=self.agent_reply_to_send(session)
+                        if not task:
+                            await session.send({'type':'ready','channel':session.channel})
+                            return
+                    await self.speak_agent_task(session,task)
+            except Exception as error:
+                LOG.warning('Voxi automatic task reply failed sessionId=%s error=%s',session.session_id,type(error).__name__)
+            finally:
+                session.agent_delivery_job=None
+        # Session warm-up replaces its media tasks, so the delivery worker is
+        # owned by the device websocket rather than that media task group.
+        session.agent_delivery_job=asyncio.create_task(deliver())
+
+    async def speak_agent_task(self, session, task, *, previous=False):
+        # Reserve before sending any frames so another socket cannot also announce it.
+        if (task['radio_reply_pending'] and task['state'] in ('completed','failed','cancelled')
+                and task['device_id']==session.memory_device):
+            session.agent_reply=(task['id'],secrets.token_hex(12))
+        await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
+        spoken=completed_task_speech(task['result'],previous=True) if previous else task_progress_speech(task)
+        LOG.info('Voxi task voice reply taskId=%s state=%s source=%s',task['id'][:8],task['state'],
+                 'stored_result' if task['state']=='completed' and task['result'] else 'state')
+        await session.say_agent(spoken[:900])
 
     async def agent_voice(self, session, pcm):
         try:
@@ -1088,57 +1206,59 @@ class VoxiRadio:
             current=channel_routes(settings['channels']).get(channel,MISSING_CHANNEL)
             if not settings['enabled'] or session.channel != channel or route != current:
                 await session.say_agent('频道设置已变化，请确认后重新说一遍。');return
+            new_task=NEW_TASK.match(text)
+            if new_task:
+                text=text[new_task.end():].strip()
+                if not text:
+                    await session.say_agent('请说出新任务的内容。');return
             normalized=text.strip().rstrip('。！？!?')
             query=voice_query_key(text)
-            if route['mode']=='agent' and CAPABILITY_QUERY.fullmatch(query):
+            if not new_task and route['mode']=='agent' and CAPABILITY_QUERY.fullmatch(query):
                 await session.say_agent(channel_capability_speech(route,self.agent.capabilities.catalog(uid))[:900])
                 return
             previous_result=bool(PREVIOUS_RESULT_QUERY.fullmatch(query))
             result_query=previous_result or bool(RESULT_QUERY.fullmatch(query))
-            if result_query or PROGRESS_QUERY.fullmatch(query):
-                tasks=self.agent.store.list_tasks(uid,channel,1,route=route,progress=not result_query,
-                                                 completed_result=previous_result)
-                task=tasks[0] if tasks else None
+            store=self.agent.store
+            task=self.focused_agent_task(session,channel,route)
+            repeated=(task and task['device_id']==session.memory_device and
+                      (task['state'] in LIVE or task['radio_reply_pending']) and query==voice_query_key(task['prompt']))
+            if not new_task and (result_query or PROGRESS_QUERY.fullmatch(query) or task_followup(query) or repeated):
+                if previous_result:
+                    finished=store.list_tasks(uid,channel,1,route=route,completed_result=True)
+                    task=finished[0] if finished else None
                 if task:
-                    await session.send({'type':'task_state','taskId':task['id'],'state':task['state'],'summary':task['summary'][:120]})
-                    spoken=completed_task_speech(task['result'],previous=True) if previous_result else task_progress_speech(task)
-                    LOG.info('Voxi task voice reply taskId=%s state=%s source=%s',
-                             task['id'][:8],task['state'],'stored_result' if task['state']=='completed' and task['result'] else 'state')
-                    await session.say_agent(spoken[:900])
+                    await self.speak_agent_task(session,task,previous=previous_result)
                 elif previous_result:await session.say_agent('这个频道还没有已完成的任务结果。')
                 else:await session.say_agent('这个频道还没有任务。')
                 return
             self.memory.record(uid,session.memory_device,session.agent_request_id,text)
-            tasks=self.agent.store.list_tasks(uid,channel,1,route=route)
-            task=tasks[0] if tasks else None
-            if normalized in ('取消任务','停止任务'):
+            if not new_task and normalized in ('取消任务','停止任务'):
                 if not task:await session.say_agent('当前没有任务。');return
                 result=await self.agent.action(uid,task['id'],'cancel')
-                await session.say_agent(result['summary']);return
-            if normalized in ('同意执行','批准操作','拒绝操作') and task and task['state']=='awaiting_approval':
+                await self.speak_agent_task(session,store.task(result['id'],uid));return
+            if not new_task and normalized in ('同意执行','批准操作','拒绝操作'):
+                if not task or task['state']!='awaiting_approval':
+                    await session.say_agent('当前任务没有等待确认的操作。');return
                 approval=self.agent.store.approval(task['id'])
                 if approval and approval['method']=='voxi/remoteMcpApproval':
                     await session.say_agent('请在网页的我的任务中核对远程工具及参数后确认。');return
                 # Scope confirmation to the selected channel's actual pending request.
                 await self.agent.action(uid,task['id'],'decline' if normalized=='拒绝操作' else 'approve')
                 await session.say_agent('决定已提交。');return
-            if normalized.startswith('继续任务') and task:
+            if not new_task and normalized.startswith('继续任务'):
+                if not task:await session.say_agent('当前频道没有可继续的任务。');return
+                if task['state'] in LIVE:
+                    await self.speak_agent_task(session,task);return
                 result=await self.agent.action(uid,task['id'],'continue',request_id=session.agent_request_id,
-                                               text=normalized[4:].strip('，,：: ') or '继续完成此前尚未完成的任务；先核对已有结果，不重复执行已完成的操作。')
+                                               text=normalized[4:].strip('，,：: ') or '继续完成此前尚未完成的任务；先核对已有结果，不重复执行已完成的操作。',
+                                               radio_device=session.memory_device)
                 await session.send({'type':'task_state','taskId':result['id'],'state':result['state'],'summary':result['summary'][:120]})
             else:
-                result,_=self.agent.submit(uid,session.memory_device,channel,session.agent_request_id,text)
+                result,created=self.agent.submit(uid,session.memory_device,channel,session.agent_request_id,text,radio_reply=True)
+                if not created:
+                    await self.speak_agent_task(session,store.task(result['id'],uid));return
                 await session.send({'type':'task_state','taskId':result['id'],'state':result['state'],'summary':result['summary'][:120]})
-                if result['engine']=='model':
-                    deadline=time.monotonic()+6
-                    while time.monotonic()<deadline:
-                        task=self.agent.store.task(result['id'],uid)
-                        if task['state']=='completed':
-                            await session.say_agent(completed_task_speech(task['result']));return
-                        if task['state'] in ('failed','cancelled','interrupted','delivery_unknown'):
-                            await session.say_agent(task['summary']);return
-                        await asyncio.sleep(.15)
-            await session.say_agent('任务已保存，我会在后台处理。可以说查看进度、读结果，或者取消任务。')
+            await session.say_agent('任务已保存，完成后会在这个频道播报。你也可以问进度或说读结果。')
         except asyncio.CancelledError:raise
         except Exception:
             await session.say_agent('本次操作未能确认，请在管理后台检查任务状态后再重试。')
@@ -1346,6 +1466,7 @@ class VoxiRadio:
         ws = web.WebSocketResponse(heartbeat=20,max_msg_size=8192,writer_limit=32768)
         session = VoiceSession(ws, self.binary)
         session.control_first = request.headers.get('X-Voxi-Link')=='cellular-v1'
+        session.agent_relay_ack = request.headers.get('X-Voxi-Agent-Reply')=='sent-v1'
         if request.headers.get('X-Voxi-Channels') == 'blocks-v1':
             session.channel_limit = CHANNEL_LIMIT
         session.settings_source = self.settings
@@ -1391,6 +1512,9 @@ class VoxiRadio:
             with contextlib.suppress(Exception):
                 await session.send({'type': 'error', 'message': f'Native voice failed at {session.phase}: {detail}'})
         finally:
+            if session.agent_delivery_job:
+                session.agent_delivery_job.cancel()
+                await asyncio.gather(session.agent_delivery_job,return_exceptions=True)
             try:
                 async with session.voice_lock:
                     await session.stop()

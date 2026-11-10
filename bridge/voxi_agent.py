@@ -114,7 +114,7 @@ class AgentHub:
             if route['mode'] == 'model' and (not user or not self.models.connection(user, route['connectionId'])):
                 raise ValueError('请选择此用户已验证的模型接入')
 
-    def submit(self, user, device, channel, request_id, prompt, thread=None, *, original=None):
+    def submit(self, user, device, channel, request_id, prompt, thread=None, *, original=None, radio_reply=False):
         if not re.fullmatch(r'[a-f0-9]{32}',user or ''):raise ValueError('设备尚未绑定有效用户')
         settings=self.store.settings(user)
         if not settings['enabled']:raise ValueError('管理员尚未启用 Voxi Agent')
@@ -130,7 +130,7 @@ class AgentHub:
         if original and engine=='codex' and runtime_tools!=self.capabilities.runtime_signature(user,route.get('mcp',[])):
             raise ValueError('频道 MCP 配置已改变，请从此频道发起新任务')
         task,created=self.store.submit(user,device,channel,request_id,prompt,thread,engine=engine,
-                                       connection=connection,runtime_tools=runtime_tools)
+                                       connection=connection,runtime_tools=runtime_tools,radio_reply=radio_reply)
         self.start()
         return self.store.public_task(task,True),created
 
@@ -364,16 +364,17 @@ class AgentHub:
         state='needs_input' if pending and pending['method'].endswith('requestUserInput') else 'awaiting_approval' if pending else 'running'
         return await self.change(ident,state=state,summary='仍有请求需要处理' if pending else '正在继续执行')
 
-    async def action(self, user, ident, action, *, text=None, request_id=None, answers=None, approval_id=None):
+    async def action(self, user, ident, action, *, text=None, request_id=None, answers=None, approval_id=None, radio_device=None):
         async with self.action_locks[ident]:
-            return await self._action(user,ident,action,text=text,request_id=request_id,answers=answers,approval_id=approval_id)
+            return await self._action(user,ident,action,text=text,request_id=request_id,answers=answers,approval_id=approval_id,radio_device=radio_device)
 
-    async def _action(self, user, ident, action, *, text=None, request_id=None, answers=None, approval_id=None):
+    async def _action(self, user, ident, action, *, text=None, request_id=None, answers=None, approval_id=None, radio_device=None):
         task=self.store.task(ident,user)
         if not task:raise ValueError('任务不存在或不属于当前用户')
         if action=='continue':
             if task['state'] not in TERMINAL or not task['thread_id']:raise ValueError('任务尚未结束或没有可继续的会话')
-            return self.submit(user,task['device_id'],task['channel'],request_id,text,task['thread_id'],original=task)[0]
+            return self.submit(user,radio_device or task['device_id'],task['channel'],request_id,text,task['thread_id'],
+                               original=task,radio_reply=bool(radio_device))[0]
         if action=='cancel':
             if task['state'] in TERMINAL:return self.store.public_task(task,True)
             connection=self.openclaw.connection(task['connection_id'],user) if task['engine'] in EXTERNAL_AGENT_LABELS else None
