@@ -56,6 +56,7 @@ class AgentStore:
         CREATE TABLE IF NOT EXISTS events(
           seq INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL,state TEXT NOT NULL,
           summary TEXT NOT NULL,created REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS task_events ON events(task_id,state,seq);
         CREATE TABLE IF NOT EXISTS approvals(task_id TEXT PRIMARY KEY,request TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS secrets(provider TEXT PRIMARY KEY,ciphertext TEXT NOT NULL,updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS model_connections(
@@ -174,7 +175,31 @@ class AgentStore:
         order = ("CASE WHEN state IN ('submitting','running','needs_input','awaiting_approval','cancelling') THEN 0 "
                  "WHEN state='queued' THEN 1 ELSE 2 END, CASE WHEN state='queued' THEN created END, created DESC"
                  if progress else 'created DESC')
-        return [dict(r) for r in self.db.execute(query + ' ORDER BY ' + order + ' LIMIT ?', (*args, min(200, limit)))]
+        return [dict(r) for r in self.db.execute(query + ' ORDER BY ' + order + ', id DESC LIMIT ?', (*args, min(200, limit)))]
+
+    def portal_tasks(self, user, before=None):
+        cursor = self.task(before, user) if before else None
+        if before and not cursor:
+            raise ValueError('找不到上一页的任务，请重新打开任务列表')
+        boundary = ' AND (t.created,t.id)<(?,?)' if cursor else ''
+        args = (user, cursor['created'], cursor['id']) if cursor else (user,)
+        rows = self.db.execute('''SELECT t.*,u.input_tokens,u.output_tokens,u.total_tokens,
+            (SELECT e.created FROM events e WHERE e.task_id=t.id AND e.state=t.state ORDER BY e.seq LIMIT 1) AS state_at
+            FROM tasks t LEFT JOIN usage u ON t.id=u.task_id
+            WHERE t.user_id=?''' + boundary + ' ORDER BY t.created DESC,t.id DESC LIMIT 9', args).fetchall()
+        tasks, size = [], 0
+        for row in rows[:8]:
+            task = self.public_task(row)
+            usage = {key: row[key] for key in ('input_tokens', 'output_tokens', 'total_tokens')}
+            task.update(prompt=row['prompt'], result=row['result'],
+                        finishedAt=row['state_at'] if row['state'] in TERMINAL else None,
+                        usage=usage if any(count is not None for count in usage.values()) else None)
+            # Leave room for the page wrapper inside the gateway's 1 MiB response limit.
+            size += len(json.dumps(task)) + 2
+            if tasks and size > 980_000:
+                break
+            tasks.append(task)
+        return {'tasks': tasks, 'nextBefore': tasks[-1]['id'] if len(rows) > len(tasks) else None}
 
     def has_active_tasks(self, user):
         states = ','.join('?' for _ in LIVE)
