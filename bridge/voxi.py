@@ -1142,11 +1142,25 @@ class VoxiRadio:
                 action=body.get('action')
                 if action=='directory':
                     return web.json_response({'profiles':self.memory.user_directory()},headers={'Cache-Control':'no-store'})
+                if action=='device_admission':
+                    owner=self.memory.admit_device(body.get('deviceId'),body.get('proof'))
+                    return web.json_response({'userId':owner},headers={'Cache-Control':'no-store'})
+                if action=='register_device':
+                    identifier=body.get('deviceId')
+                    self.memory.register_device(uid,identifier,body.get('name',''),body.get('keyHash'))
+                    for session in tuple(self.active):
+                        if session.memory_device==identifier and session.ws.prepared:
+                            await session.ws.close(code=1008,message=b'Device registration updated')
+                    return web.json_response({'ok':True,'deviceId':identifier},headers={'Cache-Control':'no-store'})
                 if action in ('check_delete_user','delete_user'):
                     if not isinstance(uid,str) or body.get('confirmUserId')!=uid:raise ValueError('请输入完整用户 ID 确认删除')
                     if self.agent and self.agent.store.has_active_tasks(uid):raise ValueError('请先结束或取消此用户的后台任务')
                     check_only=action=='check_delete_user'
-                    self.memory.delete_user(uid,check_only=check_only)
+                    self.memory.delete_user(uid,check_only=check_only,retire_devices=body.get('retireDeviceIds'))
+                    if not check_only:
+                        for session in tuple(self.active):
+                            if session.memory_user==uid and session.ws.prepared:
+                                await session.ws.close(code=1008,message=b'User and device retired')
                     return web.json_response({'ok':True,'userId':uid},headers={'Cache-Control':'no-store'})
                 if action=='user_detail':
                     section=body.get('section')
@@ -1211,9 +1225,16 @@ class VoxiRadio:
             session.channel_limit = CHANNEL_LIMIT
         session.settings_source = self.settings
         identifier=device_id(request.headers.get('X-Voxi-Device-Id'))
+        registered_owner=request.headers.get('X-Voxi-Registered-Owner')
+        proof=request.headers.get('X-Voxi-Device-Proof')
         session.memory_device=identifier
-        try:session.memory_user=self.memory.bind(identifier) if self.memory else None
-        except Exception:session.memory_user=None;self.memory_error='设备用户绑定失败'
+        if registered_owner and (not identifier or not self.memory):raise web.HTTPForbidden()
+        try:session.memory_user=self.memory.bind(identifier,registered_owner=registered_owner,proof=proof) if self.memory else None
+        except ValueError:raise web.HTTPForbidden()
+        except Exception:
+            self.memory_error='设备用户绑定失败'
+            if registered_owner:raise web.HTTPServiceUnavailable()
+            session.memory_user=None
         session.memory_store=self.memory
         session.memory_capture=self.capture_memory
         session.agent_radio=self
@@ -1221,6 +1242,11 @@ class VoxiRadio:
         self.active.add(session)
         try:
             await ws.prepare(request)
+            if registered_owner:
+                try:
+                    if self.memory.admit_device(identifier,proof)!=registered_owner:raise ValueError()
+                except ValueError:
+                    await ws.close(code=1008,message=b'Device registration changed');return ws
             async with session.voice_lock:
                 if session.control_first or not await self.warm_voice(session):
                     await session.cold_ready()

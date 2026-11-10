@@ -16,6 +16,30 @@ A='esp32-111111111111'
 B='esp32-222222222222'
 
 class MemoryTests(unittest.TestCase):
+    def test_registered_devices_can_be_retired_and_explicitly_registered_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store=MemoryStore(directory);a=store.create_user('A')['id'];b=store.bind(B)
+            key='a'*64;new_key='b'*64
+            self.assertEqual(store.admit_device(B,'legacy'),b)
+            with self.assertRaisesRegex(ValueError,'未登记'):store.admit_device(A,'legacy')
+            store.register_device(a,A,'Test radio',key)
+            self.assertEqual(store.bind(A,registered_owner=a,proof=key),a)
+            with self.assertRaises(ValueError):store.bind(A,registered_owner=b,proof=key)
+            with self.assertRaises(ValueError):store.bind(A)
+            with self.assertRaises(ValueError):store.admit_device(A,'legacy')
+            with self.assertRaises(ValueError):store.register_device(b,A,'',new_key)
+            with self.assertRaisesRegex(ValueError,'绑定设备'):store.delete_user(a,retire_devices=[B])
+            self.assertEqual(store.owner(A),a);self.assertEqual(store.owner(B),b)
+            store.delete_user(a,retire_devices=[A]);store.delete_user(a,retire_devices=[A])
+            reopened=MemoryStore(directory)
+            self.assertEqual([d['id'] for d in reopened.registry()['devices']],[B])
+            with self.assertRaisesRegex(ValueError,'退役'):reopened.bind(A)
+            with self.assertRaises(ValueError):reopened.admit_device(A,key)
+            reopened.register_device(b,A,'',new_key)
+            with self.assertRaises(ValueError):reopened.admit_device(A,key)
+            self.assertEqual(reopened.admit_device(A,new_key),b)
+            self.assertNotIn('key_hash',reopened.user_devices(b)[0])
+
     def test_voice_counts_survive_restart_and_today_uses_beijing_midnight(self):
         with tempfile.TemporaryDirectory() as directory:
             store=MemoryStore(directory)
