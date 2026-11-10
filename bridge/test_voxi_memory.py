@@ -2,12 +2,14 @@ import asyncio
 import tempfile
 import sqlite3
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from voxi import VoxiRadio
+from voxi_agent_store import AgentStore
 from voxi_memory import MemoryStore, device_id
 
 A='esp32-111111111111'
@@ -83,6 +85,36 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(len(store.snapshot()['turns']),200);self.assertEqual(len(store.snapshot()['memories']),100)
 
 class MemoryApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_user_delete_guards_devices_and_live_tasks_and_preserves_history(self):
+        with tempfile.TemporaryDirectory() as directory, closing(AgentStore(directory)) as store:
+            radio=VoxiRadio(SimpleNamespace(config={'device_token':'private'},runtime=Path(directory)),'unused')
+            radio.agent=SimpleNamespace(store=store)
+            uid=radio.memory.bind(A);other=radio.memory.bind(B)
+            radio.memory.record(uid,A,'old-turn','我喜欢音乐。')
+            task,_=store.submit(uid,A,1,'test-delete','任务历史')
+            app=web.Application();app.router.add_post('/voxi/memory',radio.memory_configuration)
+            async with TestClient(TestServer(app)) as client:
+                headers={'Authorization':'Bearer private'}
+                body={'action':'delete_user','userId':uid,'confirmUserId':uid}
+                self.assertEqual((await client.post('/voxi/memory',json=body)).status,403)
+                self.assertEqual((await client.post('/voxi/memory',headers=headers,json={**body,'confirmUserId':other})).status,400)
+                response=await client.post('/voxi/memory',headers=headers,json=body)
+                self.assertIn('后台任务',(await response.json())['error'])
+                store.update(task['id'],state='completed')
+                response=await client.post('/voxi/memory',headers=headers,json=body)
+                self.assertIn('绑定设备',(await response.json())['error'])
+                radio.memory.change({'action':'rebind','userId':other,'deviceId':A})
+                self.assertEqual((await client.post('/voxi/memory',headers=headers,json={**body,'action':'check_delete_user'})).status,200)
+                self.assertIsNotNone(radio.memory.user(uid))
+                for _ in range(2):self.assertEqual((await client.post('/voxi/memory',headers=headers,json=body)).status,200)
+                reopened=MemoryStore(directory)
+                self.assertIsNone(reopened.user(uid));self.assertEqual(reopened.bind(A),other)
+                self.assertEqual([p['id'] for p in reopened.user_directory()],[other])
+                self.assertEqual(reopened.product_metrics()['users'],1)
+                self.assertEqual(reopened.snapshot()['turns'],[])
+                self.assertEqual(len(reopened.owned_snapshot(uid)['turns']),1)
+                self.assertEqual(store.task(task['id'],uid)['state'],'completed')
+
     async def test_auth_and_background_transcription_clear_race(self):
         with tempfile.TemporaryDirectory() as directory:
             radio=VoxiRadio(SimpleNamespace(config={'device_token':'private'},runtime=Path(directory)),'unused');uid=radio.memory.bind(A)

@@ -33,6 +33,8 @@ class MemoryStore:
         ''')
         if 'name' not in {r['name'] for r in self.db.execute('PRAGMA table_info(devices)')}:
             self.db.execute("ALTER TABLE devices ADD COLUMN name TEXT NOT NULL DEFAULT ''");self.db.commit()
+        if 'deleted' not in {r['name'] for r in self.db.execute('PRAGMA table_info(users)')}:
+            self.db.execute('ALTER TABLE users ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0');self.db.commit()
         if directory:self.db.close();self.db=None
     def __del__(self):
         if getattr(self,'db',None) is not None:self.db.close()
@@ -55,8 +57,19 @@ class MemoryStore:
         return row['user_id'] if row else None
     @database
     def user(self, uid):
-        row=self.db.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+        row=self.db.execute('SELECT id,name,profile,enabled FROM users WHERE id=? AND deleted=0',(uid,)).fetchone()
         return dict(row) if row else None
+
+    @database
+    def delete_user(self, uid, *, check_only=False):
+        if not isinstance(uid,str) or not re.fullmatch(r'[a-f0-9]{32}',uid):raise ValueError('用户 ID 无效')
+        with self.db:
+            if not check_only and self.db.execute('''UPDATE users SET deleted=1,enabled=0 WHERE id=?
+                    AND NOT EXISTS (SELECT 1 FROM devices WHERE user_id=users.id)''',(uid,)).rowcount:
+                return
+            if not self.db.execute('SELECT 1 FROM users WHERE id=?',(uid,)).fetchone():raise ValueError('用户不存在')
+            if self.db.execute('SELECT 1 FROM devices WHERE user_id=? LIMIT 1',(uid,)).fetchone():
+                raise ValueError('请先将此用户的绑定设备转移到其他用户')
     @database
     def create_user(self, name):
         if not isinstance(name,str) or not 1<=len(name.strip())<=80:raise ValueError('称呼需要1–80字符')
@@ -101,7 +114,7 @@ class MemoryStore:
     @database
     def user_directory(self):
         return [dict(row) for row in self.db.execute('''SELECT users.id,users.name,users.enabled,count(devices.id) AS deviceCount
-            FROM users LEFT JOIN devices ON devices.user_id=users.id GROUP BY users.id ORDER BY users.name,users.id''')]
+            FROM users LEFT JOIN devices ON devices.user_id=users.id WHERE users.deleted=0 GROUP BY users.id ORDER BY users.name,users.id''')]
 
     @database
     def user_devices(self, uid):
@@ -119,7 +132,7 @@ class MemoryStore:
     def product_metrics(self):
         now = time.time()
         day = int((now + 8 * 3600) // 86400)
-        users, enabled = self.db.execute('SELECT count(*),coalesce(sum(enabled),0) FROM users').fetchone()
+        users, enabled = self.db.execute('SELECT count(*),coalesce(sum(enabled),0) FROM users WHERE deleted=0').fetchone()
         devices, users_week = self.db.execute('''SELECT count(*),count(DISTINCT CASE WHEN last_seen>=? THEN user_id END)
             FROM devices''', (now-7*86400,)).fetchone()
         voice = self.db.execute('''SELECT min(day),sum(turns),sum(input_ms),
@@ -133,10 +146,10 @@ class MemoryStore:
                 'firstVoiceDay':(first * 86400 - 8 * 3600) if first is not None else None}
     @database
     def snapshot(self):
-        return {'users':[dict(r) for r in self.db.execute('SELECT * FROM users ORDER BY name')],
+        return {'users':[dict(r) for r in self.db.execute('SELECT id,name,profile,enabled FROM users WHERE deleted=0 ORDER BY name')],
                 'devices':[dict(r) for r in self.db.execute('SELECT * FROM devices ORDER BY last_seen DESC')],
-                'memories':[dict(r) for r in self.db.execute('SELECT * FROM memories ORDER BY created DESC')],
-                'turns':[dict(r) for r in self.db.execute('SELECT * FROM turns ORDER BY created DESC LIMIT 500')],
+                'memories':[dict(r) for r in self.db.execute('SELECT memories.* FROM memories JOIN users ON users.id=memories.user_id WHERE users.deleted=0 ORDER BY created DESC')],
+                'turns':[dict(r) for r in self.db.execute('SELECT turns.* FROM turns JOIN users ON users.id=turns.user_id WHERE users.deleted=0 ORDER BY created DESC LIMIT 500')],
                 'policy':'每用户保留最近200条用户转写、最多100条记忆；不保存录音。自动提取仅覆盖明确偏好，可能有转写误差，可编辑删除。新连接或切换频道加载最新记忆。'}
     @database
     def change(self, body, *, snapshot=True):
@@ -168,6 +181,8 @@ class MemoryStore:
             elif action=='rebind':
                 identifier=device_id(body.get('deviceId'))
                 if not identifier or not self.owner(identifier):raise ValueError('设备不存在')
-                self.db.execute('UPDATE devices SET user_id=? WHERE id=?',(uid,identifier))
+                if not self.db.execute('''UPDATE devices SET user_id=? WHERE id=?
+                        AND EXISTS (SELECT 1 FROM users WHERE id=? AND deleted=0)''',(uid,identifier,uid)).rowcount:
+                    raise ValueError('目标用户不存在')
             else:raise ValueError('操作不支持')
         return self.snapshot() if snapshot else {}

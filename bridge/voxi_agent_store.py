@@ -164,6 +164,10 @@ class AgentStore:
         query = 'SELECT * FROM tasks' + (' WHERE ' + ' AND '.join(clauses) if clauses else '')
         return [dict(r) for r in self.db.execute(query + ' ORDER BY created DESC LIMIT ?', (*args, min(200, limit)))]
 
+    def has_active_tasks(self, user):
+        states = ','.join('?' for _ in LIVE)
+        return self.db.execute(f'SELECT 1 FROM tasks WHERE user_id=? AND state IN ({states}) LIMIT 1', (user, *LIVE)).fetchone() is not None
+
     def submit(self, user, device, channel, request_id, prompt, thread=None, *, engine='codex', connection=None):
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
             raise ValueError('需要 1–128 字符的请求编号')
