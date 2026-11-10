@@ -314,7 +314,9 @@ class AgentStore:
         if not path.exists():
             connections=self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='openclaw_connections'").fetchone()
             encrypted_connections=connections and self.db.execute("SELECT count(*) FROM openclaw_connections WHERE transport='https'").fetchone()[0]
-            if self.db.execute('SELECT count(*) FROM secrets').fetchone()[0] or encrypted_connections or self.db.execute('SELECT 1 FROM model_connections LIMIT 1').fetchone():
+            github_table=self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='capability_github'").fetchone()
+            github_credentials=github_table and self.db.execute('SELECT 1 FROM capability_github LIMIT 1').fetchone()
+            if self.db.execute('SELECT count(*) FROM secrets').fetchone()[0] or encrypted_connections or github_credentials or self.db.execute('SELECT 1 FROM model_connections LIMIT 1').fetchone():
                 raise ValueError('凭据加密密钥缺失，请恢复备份，不能重新生成')
             try:
                 with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:

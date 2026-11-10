@@ -1166,9 +1166,12 @@ class VoxiRadio:
                 if action in ('check_delete_user','delete_user'):
                     if not isinstance(uid,str) or body.get('confirmUserId')!=uid:raise ValueError('请输入完整用户 ID 确认删除')
                     if self.agent and self.agent.store.has_active_tasks(uid):raise ValueError('请先结束或取消此用户的后台任务')
+                    capabilities=getattr(self.agent,'capabilities',None)
+                    if capabilities and uid in capabilities.checking:raise ValueError('请等待该账户的能力库操作完成')
                     check_only=action=='check_delete_user'
                     self.memory.delete_user(uid,check_only=check_only,retire_devices=body.get('retireDeviceIds'))
                     if not check_only:
+                        if capabilities:capabilities.delete_user(uid)
                         for session in tuple(self.active):
                             if session.memory_user==uid and session.ws.prepared:
                                 await session.ws.close(code=1008,message=b'User and device retired')

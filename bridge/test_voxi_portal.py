@@ -10,6 +10,9 @@ from unittest.mock import AsyncMock, patch
 from aiohttp import web
 from aiohttp.test_utils import TestClient,TestServer
 from voxi import VoxiRadio, VoiceSession
+from test_voxi_agent import Rpc
+from test_voxi_openclaw import until
+from voxi_capabilities import GITHUB_ID, GITHUB_TOOLS, SKILL_STARTER
 from voxi_portal import UserPortal
 from voxi_agent_store import DEFAULTS
 from voxi_models import CHAT_ENDPOINTS, DIFY_API, dify_inputs, dify_result, model_request, model_result
@@ -338,3 +341,95 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_endpoint_requires_internal_bearer_and_rejects_browser_origin(self):
         for headers in ({},{'Authorization':'Bearer device-user-token'},{'Authorization':'Bearer internal-only','Origin':'https://example.com'}):
             r=await self.client.post('/voxi/portal',json={'actorUserId':self.a,'action':'snapshot'},headers=headers);self.assertEqual(r.status,403)
+
+    async def test_capability_authorization_probe_voice_dispatch_and_revocation(self):
+        hub=self.radio.agent
+        cfg=copy.deepcopy(DEFAULTS);cfg['enabled']=True;hub.store.save_settings(cfg)
+        commit='1'*40
+        source='https://github.com/owner/repo/blob/'+commit+'/review/SKILL.md'
+        imported={'name':'review','description':'Review safely','source':source,'commit':commit,
+                  'publisher':'owner','license':'MIT','instructions':'Use the project diff.',
+                  'references':{'references/rubric.md':'Look for regressions.'}}
+        key='github_pat_'+'x'*40
+        calls=[]
+        @asynccontextmanager
+        async def session(client, actual):
+            self.assertEqual(actual,key)
+            yield {'authorization':'fixture'}
+
+        async def reply(client, headers, method, params, ident=None):
+            calls.append((method,params))
+            if method=='tools/list':
+                return {'tools':[{'name':name,'inputSchema':{'type':'object'}} for name in GITHUB_TOOLS]},None
+            if params['name']=='pull_request_read' and params['arguments']['pullNumber']==1:
+                return {'isError':True},None
+            return {'content':[{'type':'text','text':'verified fixture'}]},None
+
+        with patch('voxi_capabilities.import_skill',AsyncMock(return_value=imported)), \
+                patch('voxi_capabilities.github_session',session), patch('voxi_capabilities.github_message',reply):
+            r, preview=await self.call({'action':'capability_skill_preview','url':SKILL_STARTER})
+            self.assertEqual(r.status,200,preview)
+            self.assertEqual(preview['references'],['references/rubric.md'])
+            r, state=await self.call({'action':'capability_skill_add','url':source,'commit':commit})
+            self.assertEqual(r.status,200,state)
+            skill=state['skills'][0]['id']
+            channels=[DEFAULTS['channels'][0],{'name':'代码审查','mode':'agent','skills':[skill],'mcp':[GITHUB_ID]}]
+            r,_=await self.call({'action':'channels','channels':channels},self.b)
+            self.assertEqual(r.status,400)
+            r, state=await self.call({'action':'capability_github_connect','repository':'owner/repo','token':key})
+            self.assertEqual(r.status,200,state)
+            self.assertNotIn(key,json.dumps(state))
+            self.assertNotIn(key.encode(),hub.capabilities.github(self.a)['secret'])
+            self.assertIsNone(state['github']['tested'])
+            r,_=await self.call({'action':'channels','channels':channels})
+            self.assertEqual(r.status,400)
+            r,_=await self.call({'action':'capability_github_test','path':'README.md','pullNumber':1})
+            self.assertEqual(r.status,400)
+            self.assertIsNone(hub.capabilities.github(self.a)['tested'])
+            r,state=await self.call({'action':'capability_github_test','path':'README.md','pullNumber':2})
+            self.assertEqual(r.status,200,state)
+            self.assertTrue(state['github']['tested'])
+            r,state=await self.call({'action':'channels','channels':channels})
+            self.assertEqual(r.status,200,state)
+            self.assertEqual(state['channels'][1]['mcp'],[GITHUB_ID])
+
+            # Drive the same post-transcription voice dispatcher used by MiniCam.
+            rpcs=[]
+            def rpc_factory(notify):
+                rpc=Rpc(notify);rpcs.append(rpc);return rpc
+            hub.rpc_factory=rpc_factory
+            socket=SimpleNamespace(closed=False,send_json=AsyncMock())
+            voice=VoiceSession(socket,'unused')
+            voice.agent_radio=self.radio;voice.channel=1;voice.memory_user=self.a
+            voice.memory_device='esp32-111111111111';voice.agent_request_id='capability-voice'
+            voice.say_agent=AsyncMock()
+            self.radio.transcribe_memory=lambda _: '审查测试仓库的 PR 2'
+            await self.radio.agent_voice(voice,b'fixture')
+            await until(lambda: bool(rpcs) and any(method=='turn/start' and 'Look for regressions.' in str(p)
+                                                   for method,p in rpcs[0].calls))
+            params=next(p for method,p in rpcs[0].calls if method=='thread/start'
+                        and 'voxi_github_readonly' in p['config']['mcp_servers'])
+            config=params['config']['mcp_servers']['voxi_github_readonly']
+            self.assertNotIn(key,json.dumps(config))
+            grant=config['http_headers']['X-Voxi-MCP-Grant']
+            turn=next(p for method,p in rpcs[0].calls if method=='turn/start' and 'Look for regressions.' in str(p))
+            self.assertIn('Look for regressions.',json.dumps(turn,ensure_ascii=False))
+
+            app=web.Application();app.router.add_post('/mcp',hub.capabilities.mcp)
+            async with TestClient(TestServer(app)) as client:
+                async def call(method, params=None, with_grant=True):
+                    return await client.post('/mcp',json={'id':1,'jsonrpc':'2.0','method':method,'params':params or {}},
+                        headers={'X-Voxi-MCP-Grant':grant} if with_grant else {})
+                denied=await call('tools/list',with_grant=False)
+                self.assertEqual(denied.status,403)
+                catalog=await(await call('tools/list')).json()
+                self.assertEqual({tool['name'] for tool in catalog['result']['tools']},set(GITHUB_TOOLS))
+                args={'owner':'owner','repo':'repo','path':'README.md'}
+                bad=await(await call('tools/call',{'name':'get_file_contents','arguments':{**args,'repo':'another'}})).json()
+                self.assertTrue(bad['result']['isError'])
+                good=await(await call('tools/call',{'name':'get_file_contents','arguments':args})).json()
+                self.assertEqual(good['result']['content'][0]['text'],'verified fixture')
+                r,_=await self.call({'action':'capability_github_remove'})
+                self.assertEqual(r.status,200)
+                self.assertEqual((await call('tools/list')).status,403)
+                self.assertNotIn(GITHUB_ID,hub.store.settings(self.a)['channels'][1].get('mcp',[]))
