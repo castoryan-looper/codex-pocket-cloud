@@ -1,4 +1,5 @@
 import copy
+from contextlib import asynccontextmanager
 import json
 from pathlib import Path
 import tempfile
@@ -11,6 +12,65 @@ from aiohttp.test_utils import TestClient,TestServer
 from voxi import VoxiRadio, VoiceSession
 from voxi_portal import UserPortal
 from voxi_agent_store import DEFAULTS
+from voxi_models import CHAT_ENDPOINTS, DIFY_API, dify_inputs, dify_result, model_request, model_result
+
+
+class ProviderContractTests(unittest.TestCase):
+    def test_model_protocols_use_fixed_hosts_and_provider_specific_payloads(self):
+        for provider in (*CHAT_ENDPOINTS, 'openai', 'anthropic', 'qwen'):
+            with self.subTest(provider=provider):
+                url, headers, body = model_request(
+                    {'provider': provider, 'model': 'test/model', 'workspace': 'ws-fixture'}, 'fixture', 'Hello', 100)
+                self.assertTrue(url.startswith('https://'))
+                self.assertEqual(body['model'], 'test/model')
+                if provider == 'openai':
+                    self.assertTrue(url.endswith('/responses'))
+                    self.assertFalse(body['store'])
+                    self.assertEqual(body['max_output_tokens'], 100)
+                elif provider == 'anthropic':
+                    self.assertTrue(url.endswith('/messages'))
+                    self.assertEqual(headers['x-api-key'], 'fixture')
+                    self.assertNotIn('Authorization', headers)
+                else:
+                    self.assertTrue(url.endswith('/chat/completions'))
+                    self.assertFalse(body['stream'])
+                    self.assertEqual(body['messages'], [{'role': 'user', 'content': 'Hello'}])
+                    self.assertEqual(body['max_completion_tokens' if provider == 'minimax' else 'max_tokens'], 100)
+
+    def test_native_responses_extract_text_and_usage_only_from_completed_output(self):
+        value = {'status': 'completed', 'output': [{'type': 'reasoning'}, {'type': 'message', 'content': [
+            {'type': 'output_text', 'text': 'Hello'}]}],
+            'usage': {'input_tokens': 6, 'output_tokens': 2, 'total_tokens': 8}}
+        self.assertEqual(model_result('openai', value), ('Hello', {'inputTokens': 6, 'outputTokens': 2, 'totalTokens': 8}))
+        with self.assertRaises(ValueError):
+            model_result('openai', {**value, 'status': 'incomplete'})
+        value = {'stop_reason': 'end_turn', 'content': [{'type': 'thinking'}, {'type': 'text', 'text': 'Hello'}],
+                 'usage': {'input_tokens': 1, 'cache_read_input_tokens': 5, 'output_tokens': 2}}
+        self.assertEqual(model_result('anthropic', value), ('Hello', {'inputTokens': 6, 'outputTokens': 2, 'totalTokens': 8}))
+
+
+class DifyContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_workflow_requires_text_input_and_successful_terminal_with_configured_output(self):
+        parameters = {'user_input_form': [
+            {'paragraph': {'variable': 'query', 'required': True}},
+            {'text-input': {'variable': 'language', 'required': True, 'default': 'zh'}},
+        ]}
+        self.assertEqual(dify_inputs(parameters, 'query'), {'language': 'zh'})
+        with self.assertRaises(ValueError):
+            dify_inputs(parameters, 'missing')
+
+        async def events(*payloads):
+            for payload in payloads:
+                yield b'data: ' + json.dumps(payload).encode() + b'\n'
+
+        node = {'event': 'node_finished', 'data': {'outputs': {'result': 'not final'}}}
+        end = {'event': 'workflow_finished', 'data': {'status': 'succeeded', 'outputs': {'result': 'Done'},
+                                                     'total_tokens': 11}}
+        response = SimpleNamespace(status=200, content=events(node, end))
+        self.assertEqual(await dify_result(response, 'result'), ('Done', {'totalTokens': 11}, None))
+        response = SimpleNamespace(status=200, content=events(node))
+        with self.assertRaisesRegex(ValueError, '提前关闭'):
+            await dify_result(response, 'result')
 
 
 class PortalTests(unittest.IsolatedAsyncioTestCase):
@@ -31,6 +91,59 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
     async def call(self,body,user=None):
         r=await self.client.post('/voxi/portal',json={'actorUserId':user or self.a,**body},headers={'Authorization':'Bearer internal-only'})
         return r,await r.json()
+
+    async def test_dify_validation_is_read_only_and_completed_chat_continues_for_same_owner(self):
+        hub = self.radio.agent
+        hub.store.save_settings({**hub.store.settings(), 'enabled': True})
+        posted = []
+
+        async def events(body):
+            posted.append(body)
+            for event in ({'event': 'message', 'answer': '你好'},
+                          {'event': 'workflow_finished', 'data': {'status': 'succeeded'}},
+                          {'event': 'message_end', 'conversation_id': 'dify-thread', 'metadata': {'usage': {'total_tokens': 9}}}):
+                yield b'data: ' + json.dumps(event).encode() + b'\n'
+
+        @asynccontextmanager
+        async def post(url, *, headers, json, allow_redirects):
+            self.assertEqual(url, DIFY_API + '/chat-messages')
+            self.assertEqual(headers, {'Authorization': 'Bearer fixture-app-key'})
+            self.assertFalse(allow_redirects)
+            yield SimpleNamespace(status=200, content=events(json))
+
+        fixture = SimpleNamespace(post=post)
+        @asynccontextmanager
+        async def client(_):
+            yield fixture
+
+        async def metadata(client, method, url, headers):
+            self.assertEqual(method, 'GET')
+            self.assertEqual(headers, {'Authorization': 'Bearer fixture-app-key'})
+            return {'mode': 'advanced-chat'} if url.endswith('/info') else {'user_input_form': []}
+
+        with patch.object(hub.models, 'client', client), patch('voxi_models.request_json', metadata), patch.object(hub, 'start'):
+            response, created = await self.call({'action':'connect_model', 'provider':'dify-chat', 'name':'研究助手', 'key':'fixture-app-key'})
+            self.assertEqual(response.status, 200)
+            self.assertEqual(posted, [])
+            ident = created['connectionId']
+            response, _ = await self.call({'action':'channels', 'channels':[
+                {'slot':1, 'name':'研究助手', 'mode':'model', 'connectionId':ident}]})
+            self.assertEqual(response.status, 200)
+            _, first = await self.call({'action':'submit', 'channel':1, 'requestId':'dify-one', 'text':'你好'})
+            await hub.run(first['task']['id'])
+            _, details = await self.call({'action':'detail', 'taskId':first['task']['id']})
+            self.assertEqual(details['task']['result'], '你好')
+            self.assertEqual(details['task']['usage']['total_tokens'], 9)
+            self.assertEqual(details['task']['threadId'], 'dify-thread')
+            body = {'action':'continue', 'taskId':first['task']['id'], 'requestId':'dify-two', 'text':'请继续'}
+            response, _ = await self.call(body, self.b)
+            self.assertEqual(response.status, 400)
+            response, second = await self.call(body)
+            self.assertEqual(response.status, 200)
+            await hub.run(second['task']['id'])
+            self.assertNotIn('conversation_id', posted[0])
+            self.assertEqual(posted[1]['conversation_id'], 'dify-thread')
+            self.assertEqual(posted[0]['user'], posted[1]['user'])
 
     async def test_user_snapshot_contains_only_owner_data_and_no_system_configuration(self):
         r,data=await self.call({'action':'snapshot'});self.assertEqual(r.status,200)
