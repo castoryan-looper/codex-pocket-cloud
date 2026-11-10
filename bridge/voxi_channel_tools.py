@@ -1,5 +1,6 @@
 """Built-in workflows and channel tool validation."""
 import re
+from voxi_remote_mcp import REMOTE_ID
 
 IMPORTED_SKILL_ID = re.compile(r"skill-[a-f0-9]{32}")
 GITHUB_ID = "github-readonly"
@@ -46,7 +47,7 @@ def validate_channel_personalization(channel):
         if (not isinstance(items, list) or len(items) > 16
                 or any(not isinstance(item, str) or not (item in catalog or
                        (field == 'skills' and IMPORTED_SKILL_ID.fullmatch(item)) or
-                       (field == 'mcp' and item == GITHUB_ID)) for item in items)
+                       (field == 'mcp' and (item == GITHUB_ID or REMOTE_ID.fullmatch(item)))) for item in items)
                 or len(items) != len(set(items))):
             raise ValueError('请选择 Voxi 提供的 Skill 或 MCP 工具')
         if items:

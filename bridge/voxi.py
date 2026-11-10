@@ -1011,6 +1011,9 @@ class VoxiRadio:
                 result=await self.agent.action(uid,task['id'],'cancel')
                 await session.say_agent(result['summary']);return
             if normalized in ('同意执行','批准操作','拒绝操作') and task and task['state']=='awaiting_approval':
+                approval=self.agent.store.approval(task['id'])
+                if approval and approval['method']=='voxi/remoteMcpApproval':
+                    await session.say_agent('请在网页的我的任务中核对远程工具及参数后确认。');return
                 # Scope confirmation to the selected channel's actual pending request.
                 await self.agent.action(uid,task['id'],'decline' if normalized=='拒绝操作' else 'approve')
                 await session.say_agent('决定已提交。');return
@@ -1088,7 +1091,10 @@ class VoxiRadio:
                 elif action=='detail':
                     task=self.agent.store.task(body.get('taskId'),uid)
                     if not task:raise ValueError('任务不存在')
-                    return web.json_response({'task':self.agent.store.public_task(task,True)},headers={'Cache-Control':'no-store'})
+                    detail=self.agent.store.public_task(task,True)
+                    if (detail.get('approval') or {}).get('method')=='voxi/remoteMcpApproval':
+                        detail['approval']={'method':'voxi/remoteMcpApproval','reason':'等待任务所有者在个人空间确认'}
+                    return web.json_response({'task':detail},headers={'Cache-Control':'no-store'})
                 elif action=='submit':
                     task,_=self.agent.submit(uid,None,body.get('channel'),body.get('requestId'),body.get('text'))
                     return web.json_response({'task':task},headers={'Cache-Control':'no-store'})

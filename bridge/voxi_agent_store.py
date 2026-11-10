@@ -243,6 +243,7 @@ class AgentStore:
                 params = request.get('params', {})
                 value['approval'] = {'method':request['method'],'command':params.get('command'),
                                      'reason':params.get('reason'),'questions':params.get('questions',[])}
+                if request['method']=='voxi/remoteMcpApproval':value['approval']['id']=request['id']
             usage = self.db.execute('SELECT input_tokens,output_tokens,total_tokens FROM usage WHERE task_id=?', (task['id'],)).fetchone()
             value['usage'] = dict(usage) if usage else None
         return value
@@ -316,7 +317,9 @@ class AgentStore:
             encrypted_connections=connections and self.db.execute("SELECT count(*) FROM openclaw_connections WHERE transport='https'").fetchone()[0]
             github_table=self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='capability_github'").fetchone()
             github_credentials=github_table and self.db.execute('SELECT 1 FROM capability_github LIMIT 1').fetchone()
-            if self.db.execute('SELECT count(*) FROM secrets').fetchone()[0] or encrypted_connections or github_credentials or self.db.execute('SELECT 1 FROM model_connections LIMIT 1').fetchone():
+            remote_table=self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='capability_remote'").fetchone()
+            remote_credentials=remote_table and self.db.execute('SELECT 1 FROM capability_remote LIMIT 1').fetchone()
+            if self.db.execute('SELECT count(*) FROM secrets').fetchone()[0] or encrypted_connections or github_credentials or remote_credentials or self.db.execute('SELECT 1 FROM model_connections LIMIT 1').fetchone():
                 raise ValueError('凭据加密密钥缺失，请恢复备份，不能重新生成')
             try:
                 with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:
