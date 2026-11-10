@@ -75,7 +75,7 @@ class UserPortal:
             elif action=='delete_openclaw':hub.openclaw.delete(uid,body.get('connectionId'))
             elif isinstance(action,str) and action.startswith('capability_'):
                 result=await hub.capabilities.manage(uid,body)
-                if action in ('capability_github_connect','capability_github_remove'):
+                if action in ('capability_github_connect','capability_github_remove','capability_remote_remove'):
                     await r.publish_channel_catalog(uid)
                 return web.json_response(result,headers={'Cache-Control':'no-store'})
             elif action=='connect_model':
@@ -93,7 +93,7 @@ class UserPortal:
                 if not task:raise ValueError('任务不存在或不可访问')
                 return web.json_response({'task':hub.store.public_task(task,True)},headers={'Cache-Control':'no-store'})
             elif action in ('cancel','approve','decline','answer','continue'):
-                task=await hub.action(uid,body.get('taskId'),action,text=body.get('text'),request_id=body.get('requestId'),answers=body.get('answers'))
+                task=await hub.action(uid,body.get('taskId'),action,text=body.get('text'),request_id=body.get('requestId'),answers=body.get('answers'),approval_id=body.get('approvalId'))
                 return web.json_response({'task':task},headers={'Cache-Control':'no-store'})
             else:raise ValueError('普通用户不能修改此项配置')
             return web.json_response(self.snapshot(uid),headers={'Cache-Control':'no-store'})

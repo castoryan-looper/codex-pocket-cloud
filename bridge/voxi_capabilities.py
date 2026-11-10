@@ -15,8 +15,8 @@ from aiohttp import web
 from cryptography.exceptions import InvalidTag
 
 from voxi_channel_tools import channel_tools_catalog, GITHUB_ID, IMPORTED_SKILL_ID
+from voxi_remote_mcp import RemoteLibrary, REMOTE_ID, REGISTRY, descriptors
 
-REGISTRY = 'https://registry.modelcontextprotocol.io/v0.1/servers'
 GITHUB_API = 'https://api.github.com'
 GITHUB_MCP = 'https://api.githubcopilot.com/mcp/readonly'
 GITHUB_ENTRY = 'io.github.github/github-mcp-server'
@@ -129,6 +129,8 @@ async def import_skill(client, value):
     source = f'https://github.com/{owner}/{repo}/blob/{commit}/{quote(path, safe="/")}'
     return {'name':name,'description':description[:400],'source':source,'commit':commit,
             'publisher':owner,'license':field('license')[:100],
+            'compatibility':field('compatibility')[:500],
+            'hasScripts':any(file.startswith(prefix+'scripts/') for file in files),
             'instructions':match[2].strip(),'references':dict(zip((file[len(prefix):] for file in names[1:]), blobs[1:]))}
 
 
@@ -193,6 +195,7 @@ class CapabilityLibrary:
           user_id TEXT PRIMARY KEY, repository TEXT NOT NULL, secret BLOB NOT NULL,
           revision TEXT NOT NULL, tools TEXT NOT NULL, tested REAL);
         ''')
+        self.remote = RemoteLibrary(store)
         self.checking = set()
         self.grants = {}
         self.grant_key = secrets.token_bytes(32)
@@ -218,11 +221,12 @@ class CapabilityLibrary:
         if github and github['tested']:
             catalog['mcp'].append({'id':GITHUB_ID,'name':'GitHub 只读',
                                    'description':'仅限 '+github['repository']+' 的文件和 PR'})
+        catalog['mcp'] += self.remote.catalog(user)
         return catalog
 
     def snapshot(self, user):
         github = self.github(user)
-        return {'starter':SKILL_STARTER,
+        return {'starter':SKILL_STARTER,'remoteVersion':1,'remotes':self.remote.list(user),
                 'skills':[{'id':ident, **{k:item[k] for k in ('name','description','source','commit','publisher')}}
                           for ident,item in self.skills(user).items()],
                 'github':{'repository':github['repository'],'tested':github['tested']} if github else None}
@@ -236,6 +240,8 @@ class CapabilityLibrary:
             if len(imported)>3 or sum(len(owned[ident]['instructions'])+sum(map(len,owned[ident]['references'].values()))
                                      for ident in imported)>64000:
                 raise ValueError('每个频道最多启用 3 个导入的 Skill，合计不超过 64000 字符')
+            for ident in route.get('mcp', []):
+                if REMOTE_ID.fullmatch(ident):self.remote.validate(user,ident)
             if GITHUB_ID in route.get('mcp', []):
                 github = self.github(user)
                 if not github or not github['tested']:
@@ -249,12 +255,15 @@ class CapabilityLibrary:
             raise ValueError('GitHub 授权无法读取，请重新授权') from None
 
     def runtime_signature(self, user, selected):
-        if GITHUB_ID not in selected:
-            return ','.join(selected)
-        row = self.github(user)
-        if not row or not row['tested']:
-            raise ValueError('GitHub MCP 尚未通过试跑或授权已撤销')
-        return ','.join(selected)+':'+row['revision']
+        parts=[','.join(selected)]
+        if GITHUB_ID in selected:
+            row = self.github(user)
+            if not row or not row['tested']:
+                raise ValueError('GitHub MCP 尚未通过试跑或授权已撤销')
+            parts.append(row['revision'])
+        for ident in selected:
+            if REMOTE_ID.fullmatch(ident):parts.append(self.remote.signature(self.remote.validate(user,ident)))
+        return ':'.join(parts)
 
     def grant(self, user):
         row = self.github(user)
@@ -291,6 +300,7 @@ class CapabilityLibrary:
         with self.store.db:
             self.store.db.execute('DELETE FROM capability_github WHERE user_id=?',(user,))
             self.store.db.execute('DELETE FROM capability_skills WHERE user_id=?',(user,))
+            self.store.db.execute('DELETE FROM capability_remote WHERE user_id=?',(user,))
 
     async def manage(self, user, body):
         action = body['action']
@@ -308,6 +318,9 @@ class CapabilityLibrary:
 
     async def change(self, user, body):
         action = body['action']
+        if action.startswith('capability_remote_'):
+            result=await self.remote.manage(user,body)
+            return result if action in ('capability_remote_details','capability_remote_schema') else {**result,**self.snapshot(user)}
         if action == 'capability_registry':
             query = body.get('query','github-mcp-server')
             if not isinstance(query,str) or not 1 <= len(query.strip()) <= 80:
@@ -319,7 +332,8 @@ class CapabilityLibrary:
                 server = item['server']
                 servers.append({'id':server['name'],'description':server.get('description','')[:300],
                                 'version':server['version'],'remote':bool(server.get('remotes')),
-                                'supported':server['name']==GITHUB_ENTRY})
+                                'supported':server['name']==GITHUB_ENTRY,
+                                'configurable':server['name']!=GITHUB_ENTRY and bool(descriptors(server))})
             return {'servers':servers}
         if action in ('capability_skill_preview','capability_skill_add'):
             if action == 'capability_skill_add' and not COMMIT.fullmatch(body.get('commit') or ''):
