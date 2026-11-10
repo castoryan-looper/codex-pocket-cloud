@@ -159,7 +159,7 @@ class AgentStore:
                               (ident, user) if user else (ident,)).fetchone()
         return dict(row) if row else None
 
-    def list_tasks(self, user=None, channel=None, limit=100, *, route=None):
+    def list_tasks(self, user=None, channel=None, limit=100, *, route=None, progress=False):
         clauses, args = [], []
         if user:
             clauses.append('user_id=?'); args.append(user)
@@ -169,7 +169,10 @@ class AgentStore:
             clauses.extend(('engine=?', 'connection_id IS ?'))
             args.extend((route_engine(route), route.get('connectionId')))
         query = 'SELECT * FROM tasks' + (' WHERE ' + ' AND '.join(clauses) if clauses else '')
-        return [dict(r) for r in self.db.execute(query + ' ORDER BY created DESC LIMIT ?', (*args, min(200, limit)))]
+        order = ("CASE WHEN state IN ('submitting','running','needs_input','awaiting_approval','cancelling') THEN 0 "
+                 "WHEN state='queued' THEN 1 ELSE 2 END, CASE WHEN state='queued' THEN created END, created DESC"
+                 if progress else 'created DESC')
+        return [dict(r) for r in self.db.execute(query + ' ORDER BY ' + order + ' LIMIT ?', (*args, min(200, limit)))]
 
     def has_active_tasks(self, user):
         states = ','.join('?' for _ in LIVE)
