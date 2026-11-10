@@ -25,7 +25,7 @@ class UserPortal:
                 'voiceSettings':r.voice_preview.enrich(catalog(r.settings.snapshot()['voice'],hub.store.preferences(uid)['voice'])),
                 'tasks':[hub.store.public_task(t) for t in hub.store.list_tasks(uid)],
                 'usage':hub.store.user_usage(uid),'channelTools':channel_tools_catalog(),
-                'capabilities':{'openclaw':True,'userPortal':1,'channelVoices':True,'contextSync':True}}
+                'capabilities':{'openclaw':True,'museCode':True,'userPortal':1,'channelVoices':True,'contextSync':True}}
 
     async def changed_context(self, uid):
         r=self.radio;r.memory_revision[uid]=r.memory_revision.get(uid,0)+1
@@ -67,6 +67,9 @@ class UserPortal:
             elif action=='rename_device':r.memory.change({'action':action,'userId':uid,'deviceId':body.get('deviceId'),'name':body.get('name')})
             elif action=='connect_openclaw':
                 result=hub.openclaw.create(uid,body.get('name'),body.get('transport'),body.get('url',''),body.get('agent','main'),body.get('token',''))
+                return web.json_response(result,headers={'Cache-Control':'no-store'})
+            elif action=='connect_muse':
+                result=hub.openclaw.create_muse(uid,body.get('name'))
                 return web.json_response(result,headers={'Cache-Control':'no-store'})
             elif action=='test_openclaw':
                 return web.json_response(await hub.openclaw.probe(uid,body.get('connectionId')),headers={'Cache-Control':'no-store'})

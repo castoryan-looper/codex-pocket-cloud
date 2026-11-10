@@ -13,7 +13,7 @@ import time
 from collections import defaultdict
 
 from harness import DEVELOPER_INSTRUCTIONS
-from voxi_agent_store import AgentStore, LIVE, TERMINAL, CHANNEL_LIMIT, channel_routes, MISSING_CHANNEL, route_engine
+from voxi_agent_store import AgentStore, LIVE, TERMINAL, CHANNEL_LIMIT, channel_routes, MISSING_CHANNEL, route_engine, EXTERNAL_AGENT_LABELS
 from voxi_models import ModelConnections, PROVIDERS
 from voxi_channel_tools import agent_personalization, codex_mcp_config
 from voxi_context import ContextLibrary
@@ -115,7 +115,8 @@ class AgentHub:
         engine=original['engine'] if original else route_engine(route)
         if not engine:raise ValueError('当前频道未配置助手或模型')
         connection=original['connection_id'] if original else route.get('connectionId')
-        if engine=='openclaw' and not self.openclaw.connection(connection,user):raise ValueError('请先接入 OpenClaw 并绑定到此频道')
+        if engine in EXTERNAL_AGENT_LABELS and not self.openclaw.connection(connection,user,engine):
+            raise ValueError(f'请先接入 {EXTERNAL_AGENT_LABELS[engine]} 并绑定到此频道')
         if engine=='model' and not self.models.connection(user,connection):raise ValueError('请先验证并绑定模型接入')
         runtime_tools=original.get('runtime_tools','') if original and engine=='codex' else ''
         if original and engine=='codex' and runtime_tools!=','.join(route.get('mcp',[])):
@@ -147,7 +148,7 @@ class AgentHub:
         try:
             task=self.store.task(ident)
             if task['state']!='queued':return
-            if task['engine']=='openclaw':
+            if task['engine'] in EXTERNAL_AGENT_LABELS:
                 await self.openclaw.run(task)
                 return
             if task['engine']=='model':
@@ -310,11 +311,14 @@ class AgentHub:
             return self.submit(user,task['device_id'],task['channel'],request_id,text,task['thread_id'],original=task)[0]
         if action=='cancel':
             if task['state'] in TERMINAL:return self.store.public_task(task,True)
-            connection=self.openclaw.connection(task['connection_id'],user) if task['engine']=='openclaw' else None
-            if task['state']=='queued' or (task['state']=='submitting' and connection and connection['transport']=='relay'):
+            connection=self.openclaw.connection(task['connection_id'],user) if task['engine'] in EXTERNAL_AGENT_LABELS else None
+            if task['state']=='queued' or (task['state']=='submitting' and connection and connection['transport']!='https'):
                 task=await self.change(ident,state='cancelled',summary='任务在开始前已取消')
-            elif task['engine']=='openclaw':
-                await self.change(ident,state='delivery_unknown',summary='已停止等待；直连已断开请求，家中连接器可能仍在执行，请在 OpenClaw 核对或停止')
+            elif task['engine'] in EXTERNAL_AGENT_LABELS:
+                label=EXTERNAL_AGENT_LABELS[task['engine']]
+                summary=('已请求 Muse Code 停止；请在主机核对执行状态' if task['engine']=='muse' else
+                         f'已停止等待；请在 {label} 所在主机核对或停止执行')
+                await self.change(ident,state='delivery_unknown',summary=summary)
                 job=self.active.get(ident)
                 if job:job.cancel()
             elif task['engine']=='model':
