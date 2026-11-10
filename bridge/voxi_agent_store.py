@@ -13,6 +13,7 @@ import sqlite3
 import time
 import uuid
 from voxi_voices import validate_voice
+from voxi_channel_tools import validate_channel_personalization
 
 TERMINAL = {'completed', 'failed', 'cancelled', 'interrupted', 'delivery_unknown'}
 LIVE = {'queued', 'submitting', 'running', 'needs_input', 'awaiting_approval', 'cancelling'}
@@ -67,7 +68,8 @@ class AgentStore:
           PRIMARY KEY(user_id,response_id));
         ''')
         columns={r['name'] for r in self.db.execute('PRAGMA table_info(tasks)')}
-        for name,definition in [('engine',"TEXT NOT NULL DEFAULT 'codex'"),('connection_id','TEXT')]:
+        for name,definition in [('engine',"TEXT NOT NULL DEFAULT 'codex'"),('connection_id','TEXT'),
+                                ('runtime_tools',"TEXT NOT NULL DEFAULT ''")]:
             if name not in columns:self.db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {definition}')
         for task in self.db.execute("SELECT id FROM tasks WHERE state NOT IN ('queued','completed','failed','cancelled','interrupted','delivery_unknown')").fetchall():
             self.update(task['id'], state='interrupted', summary='服务已重启；未自动重放任务，请核对结果后继续')
@@ -94,7 +96,7 @@ class AgentStore:
             raise ValueError(f'最多可配置 {CHANNEL_LIMIT} 个频道')
         result, slots = [], set()
         for index, c in enumerate(channels):
-            if not isinstance(c, dict) or not {'name','mode'} <= c.keys() or c.keys() - {'name','mode','connectionId','slot','voice'}:
+            if not isinstance(c, dict) or not {'name','mode'} <= c.keys() or c.keys() - {'name','mode','connectionId','slot','voice','role','skills','mcp'}:
                 raise ValueError('频道需要名称和模式')
             slot = c.get('slot', index)
             if type(slot) is not int or not 0 <= slot < CHANNEL_LIMIT or slot in slots:
@@ -103,6 +105,7 @@ class AgentStore:
             if not isinstance(c['name'], str) or not 1 <= len(c['name'].strip()) <= 32 or c['mode'] not in ('fast', 'agent', 'openclaw', 'model', 'disabled'):
                 raise ValueError('频道名称或模式无效')
             route = {'name': c['name'].strip(), 'mode': c['mode']}
+            route.update(validate_channel_personalization(c))
             if 'slot' in c: route['slot'] = slot
             if 'voice' in c:
                 voice = validate_voice(c['voice'], inherit=True)
@@ -171,7 +174,7 @@ class AgentStore:
         states = ','.join('?' for _ in LIVE)
         return self.db.execute(f'SELECT 1 FROM tasks WHERE user_id=? AND state IN ({states}) LIMIT 1', (user, *LIVE)).fetchone() is not None
 
-    def submit(self, user, device, channel, request_id, prompt, thread=None, *, engine='codex', connection=None):
+    def submit(self, user, device, channel, request_id, prompt, thread=None, *, engine='codex', connection=None, runtime_tools=''):
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
             raise ValueError('需要 1–128 字符的请求编号')
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 8000 or type(channel) is not int or not 0 <= channel < CHANNEL_LIMIT:
@@ -186,13 +189,13 @@ class AgentStore:
         ident, now = uuid.uuid4().hex, time.time()
         with self.db:
             if engine=='openclaw' and not thread:thread='voxi-'+user+'-'+ident
-            self.db.execute('INSERT INTO tasks(id,user_id,device_id,channel,request_id,prompt,state,summary,result,thread_id,turn_id,created,updated,engine,connection_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                            (ident,user,device,channel,request_id,prompt.strip(),'queued','任务已保存，等待执行','',thread,None,now,now,engine,connection))
+            self.db.execute('INSERT INTO tasks(id,user_id,device_id,channel,request_id,prompt,state,summary,result,thread_id,turn_id,created,updated,engine,connection_id,runtime_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                            (ident,user,device,channel,request_id,prompt.strip(),'queued','任务已保存，等待执行','',thread,None,now,now,engine,connection,runtime_tools))
             self.db.execute('INSERT INTO events(task_id,state,summary,created) VALUES(?,?,?,?)', (ident,'queued','任务已保存，等待执行',now))
         return self.task(ident), True
 
     def update(self, ident, **values):
-        allowed = {'state','summary','result','thread_id','turn_id'}
+        allowed = {'state','summary','result','thread_id','turn_id','runtime_tools'}
         if not values or not set(values) <= allowed:
             raise ValueError('无效任务更新')
         if 'state' in values and values['state'] not in LIVE | TERMINAL:
