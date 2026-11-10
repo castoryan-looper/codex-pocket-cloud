@@ -347,6 +347,7 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         voice.agent_radio=SimpleNamespace(
             agent=SimpleNamespace(store=SimpleNamespace(preferences=lambda _:{'fastPrompt':'通用偏好'})),
             channel_info=lambda _:{'channelMode':'fast','name':'技术快问'},
+            channel_catalog=lambda _:(),
             route=lambda *_:{'mode':'fast','role':'当前频道先举例'},
         )
         calls=[]
