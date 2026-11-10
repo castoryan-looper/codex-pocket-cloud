@@ -9,6 +9,7 @@ import re
 from aiohttp import web
 from voxi_agent_store import CHANNEL_LIMIT
 from voxi_models import PROVIDERS
+from voxi_channel_tools import channel_tools_catalog
 from voxi_voices import catalog,validate_voice
 
 
@@ -23,7 +24,7 @@ class UserPortal:
                 'modelConnections':hub.models.public(uid),'modelProviders':PROVIDERS,'channelLimit':CHANNEL_LIMIT,
                 'voiceSettings':r.voice_preview.enrich(catalog(r.settings.snapshot()['voice'],hub.store.preferences(uid)['voice'])),
                 'tasks':[hub.store.public_task(t) for t in hub.store.list_tasks(uid)],
-                'usage':hub.store.user_usage(uid),
+                'usage':hub.store.user_usage(uid),'channelTools':channel_tools_catalog(),
                 'capabilities':{'openclaw':True,'userPortal':1,'channelVoices':True,'contextSync':True}}
 
     async def changed_context(self, uid):

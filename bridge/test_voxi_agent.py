@@ -106,6 +106,29 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hub.store.task(task['id'])['state'],'completed')
         self.assertEqual(self.hub.store.task(task['id'])['result'],'完成，已验证')
         self.assertIn(USER,self.hub.rpc.calls[1][1]['cwd'])
+
+    async def test_channel_role_workflow_and_mcp_are_applied_and_tool_changes_require_new_thread(self):
+        channels=[{'slot':1,'name':'调研','mode':'agent','role':'请先列结论',
+                   'skills':['research'],'mcp':['openai-docs']}]
+        self.hub.store.save_settings(channels,USER)
+        task,_=self.hub.submit(USER,None,1,'personal-tools','检查文档')
+        task=await self.running(task['id'])
+        start=next(params for method,params in self.hub.rpc.calls if method=='thread/start')
+        self.assertTrue(start['config']['mcp_servers']['voxi_openai_docs']['enabled'])
+        self.assertEqual(start['approvalPolicy'],'on-request')
+        turn=next(params for method,params in self.hub.rpc.calls if method=='turn/start')
+        self.assertIn('请先列结论',turn['input'][0]['text'])
+        self.assertIn('可核对的来源',turn['input'][0]['text'])
+        self.assertEqual(turn['input'][1]['text'],'检查文档')
+        await self.complete(task)
+        other,_=self.hub.submit(OTHER,None,1,'other-tools','普通任务')
+        other=await self.running(other['id'])
+        other_start=[params for method,params in self.hub.rpc.calls if method=='thread/start'][-1]
+        self.assertFalse(other_start['config']['mcp_servers']['voxi_openai_docs']['enabled'])
+        await self.complete(other)
+        self.hub.store.save_settings([{**channels[0],'mcp':[]}],USER)
+        with self.assertRaisesRegex(ValueError,'MCP 配置已改变'):
+            await self.hub.action(USER,task['id'],'continue',text='继续',request_id='mcp-revoked')
     async def test_approval_stays_scoped_and_cancellation_waits_for_confirmation(self):
         task,_=self.hub.submit(USER,None,1,'request','edit file');task=await self.running(task['id'])
         request={'id':99,'method':'item/commandExecution/requestApproval','params':{'threadId':task['thread_id'],'command':'test command'}}

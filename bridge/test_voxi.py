@@ -344,6 +344,11 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         memory=MemoryStore();uid=memory.bind('esp32-111111111111');other=memory.bind('esp32-222222222222')
         memory.record(uid,'esp32-111111111111','one','我喜欢天文学');memory.record(other,'esp32-222222222222','two','我喜欢别人的秘密')
         voice.memory_store=memory;voice.memory_user=uid
+        voice.agent_radio=SimpleNamespace(
+            agent=SimpleNamespace(store=SimpleNamespace(preferences=lambda _:{'fastPrompt':'通用偏好'})),
+            channel_info=lambda _:{'channelMode':'fast','name':'技术快问'},
+            route=lambda _:{'mode':'fast','role':'当前频道先举例'},
+        )
         calls=[]
         class Rpc:
             def __init__(self,binary,notify):self.notify=notify
@@ -361,6 +366,8 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
                 await voice.start()
             params=next(params for method,params in calls if method=='thread/realtime/start')
             self.assertIn('天文学',params['prompt']);self.assertNotIn('别人的秘密',params['prompt'])
+            self.assertIn('当前频道先举例',params['prompt'])
+            self.assertIn('通用偏好',params['prompt'])
             self.assertEqual(params['version'],'v3')
             self.assertEqual(params['voice'],'cove')
             self.assertEqual(params['transport']['type'],'webrtc')

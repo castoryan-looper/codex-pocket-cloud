@@ -195,6 +195,23 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         _,data=await self.call({'action':'snapshot'});self.assertEqual(len(data['connections']),1)
         self.assertNotIn(c['pairingToken'],json.dumps(data))
 
+    async def test_channel_personalization_is_owner_scoped_and_rejects_unknown_tools(self):
+        channels=[{'name':'快问','mode':'fast','role':'私有角色'},
+                  {'name':'调研','mode':'agent','skills':['research'],'mcp':['openai-docs']}]
+        response,state=await self.call({'action':'channels','channels':channels})
+        self.assertEqual(response.status,200)
+        self.assertEqual(state['channels'],channels)
+        self.assertIn('skills',state['channelTools'])
+        self.assertNotIn('developers.openai.com/mcp',json.dumps(state['channelTools']))
+        _,other=await self.call({'action':'snapshot'},self.b)
+        self.assertNotIn('私有角色',str(other['channels']))
+        for bad in ([{**channels[0],'mcp':['openai-docs']}],
+                    [{**channels[1],'mcp':['https://localhost/admin']}],
+                    [{**channels[1],'skills':[{}]}]):
+            response,_=await self.call({'action':'channels','channels':bad})
+            self.assertEqual(response.status,400)
+        self.assertEqual(self.radio.agent.store.settings(self.a)['channels'],channels)
+
     async def test_verified_model_is_owned_and_executes_from_a_sparse_channel(self):
         hub=self.radio.agent
         secret='key-private-model-test'

@@ -243,6 +243,7 @@ class VoiceSession:
         self.channel_catalog_lock=asyncio.Lock()
         self.channel_limit=4
         self.recording_route=None
+        self.fast_role=''
         self.preview_mode=False
         self.preview_text=''
         self.preview_language=''
@@ -448,6 +449,7 @@ class VoiceSession:
         self.phase = 'webrtc-sdp'
         prompt = effective_prompt(self.settings, channel if channel < 4 else 0)
         route=self.agent_radio.channel_info(self) if self.agent_radio else {}
+        self.fast_role=''
         self.agent_speech_only = not self.preview_mode and route.get('channelMode') in ('agent', 'disabled')
         if route:
             if route['channelMode']=='fast':
@@ -455,6 +457,9 @@ class VoiceSession:
                 if self.memory_user and self.agent_radio.agent:
                     preference=self.agent_radio.agent.store.preferences(self.memory_user)['fastPrompt']
                     if preference:prompt+='\n当前用户的回答偏好：'+preference
+                    self.fast_role=(self.agent_radio.route(self) or {}).get('role','')
+                    if self.fast_role:
+                        prompt+='\n当前频道角色与回答偏好（与默认偏好冲突时优先使用频道偏好，仍须遵守快问边界）：\n'+self.fast_role
             else:
                 prompt='你是 Voxi 的任务语音播报入口。按提供的播报文本简洁朗读，不添加任务执行过程，不自行调用工具或声称完成其他工作。'
         if self.memory_store and self.memory_user:
@@ -716,6 +721,7 @@ class VoiceSession:
             route = self.agent_radio.route(self) if self.agent_radio and self.agent_radio.agent else None
             refresh = self.settings_source and (self.selected_voice(self.settings_source.snapshot()) != self.voice
                        or self.agent_speech_only and (not route or route['mode']=='fast'))
+            refresh = refresh or (route and route['mode']=='fast' and route.get('role','')!=self.fast_role)
             if cold or refresh:
                 pcm = bytes(self.pending_audio)
                 self.pending_audio.clear()
