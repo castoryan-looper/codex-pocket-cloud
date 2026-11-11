@@ -109,6 +109,27 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(len(store.snapshot()['turns']),200);self.assertEqual(len(store.snapshot()['memories']),100)
 
 class MemoryApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lifecycle_requires_auth_closes_only_changed_device_and_rejects_stale_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            radio=VoxiRadio(SimpleNamespace(config={'device_token':'private'},runtime=Path(directory)),'unused')
+            a=radio.memory.create_user('A')['id'];b=radio.memory.create_user('B')['id']
+            radio.memory.register_device(a,A,'Radio','a'*64)
+            class Socket:
+                prepared=True
+                closed=False
+                async def close(self,**kwargs):self.closed=True
+            changed=Socket();untouched=Socket();radio.active=[SimpleNamespace(memory_device=A,ws=changed),SimpleNamespace(memory_device=B,ws=untouched)]
+            app=web.Application();app.router.add_post('/voxi/memory',radio.memory_configuration)
+            async with TestClient(TestServer(app)) as client:
+                body={'action':'transfer_device','userId':b,'sourceUserId':a,'deviceId':A,'confirmDeviceId':A,'keyHash':'b'*64};headers={'Authorization':'Bearer private'}
+                self.assertEqual((await client.post('/voxi/memory',json=body)).status,403)
+                self.assertEqual((await client.post('/voxi/memory',headers=headers,json=body)).status,200)
+                self.assertTrue(changed.closed);self.assertFalse(untouched.closed)
+                self.assertEqual(radio.memory.admit_device(A,'b'*64),b)
+                self.assertEqual((await client.post('/voxi/memory',headers=headers,json=body)).status,400)
+                self.assertEqual((await client.post('/voxi/memory',headers=headers,json={'action':'retire_device','userId':b,'deviceId':A,'confirmDeviceId':A})).status,200)
+                with self.assertRaises(ValueError):radio.memory.admit_device(A,'b'*64)
+
     async def test_user_delete_guards_devices_and_live_tasks_and_preserves_history(self):
         with tempfile.TemporaryDirectory() as directory, closing(AgentStore(directory)) as store:
             radio=VoxiRadio(SimpleNamespace(config={'device_token':'private'},runtime=Path(directory)),'unused')
