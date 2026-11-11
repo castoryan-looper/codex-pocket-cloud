@@ -1394,6 +1394,13 @@ class VoxiRadio:
                         if session.memory_device==identifier and session.ws.prepared:
                             await session.ws.close(code=1008,message=b'Device registration updated')
                     return web.json_response({'ok':True,'deviceId':identifier},headers={'Cache-Control':'no-store'})
+                if action in ('transfer_device','retire_device'):
+                    identifier=body.get('deviceId')
+                    self.memory.manage_device(action,uid,identifier,body.get('confirmDeviceId'),source=body.get('sourceUserId'),key_hash=body.get('keyHash'))
+                    for session in tuple(self.active):
+                        if session.memory_device==identifier and session.ws.prepared:
+                            await session.ws.close(code=1008,message=b'Device ownership or registration changed')
+                    return web.json_response({'ok':True,'deviceId':identifier},headers={'Cache-Control':'no-store'})
                 if action in ('check_delete_user','delete_user'):
                     if not isinstance(uid,str) or body.get('confirmUserId')!=uid:raise ValueError('请输入完整用户 ID 确认删除')
                     if self.agent and self.agent.store.has_active_tasks(uid):raise ValueError('请先结束或取消此用户的后台任务')
